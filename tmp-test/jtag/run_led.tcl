@@ -1,0 +1,93 @@
+# Zynq-7020 (AC880) JTAG 直载脚本
+# 流程: 复位 -> ps7_init -> ps7_post_config -> 加载比特流 -> 下载 ELF -> 运行 -> 读心跳
+#
+# 用法: xsdb run_led.tcl
+
+set BIT "C:/Users/VeryS/Documents/fpgap/zynqs/AXI_GPIO_1/AXI_GPIO_1_SOFT/platform/hw/sdt/System_wrapper.bit"
+set PS7 "C:/Users/VeryS/Documents/fpgap/zynqs/AXI_GPIO_1/AXI_GPIO_1_SOFT/platform/hw/sdt/ps7_init.tcl"
+set ELF "C:/Users/VeryS/Documents/others/OpenXJ380/tmp-test/led/out/led.elf"
+
+proc step {m} { puts "\n>>> $m" }
+proc rd {a} {
+    if {[catch {mrd -force $a} v]} { return "ERR" }
+    return [string trim $v]
+}
+
+# ---------- 1. 连接 ----------
+step "connect"
+if {[catch {connect} e]} { puts "FAIL connect: $e"; exit 1 }
+puts "OK"
+
+# ---------- 2. 复位整个 PS ----------
+step "reset system"
+targets -set -filter {name =~ "APU"}
+rst -system
+after 2000
+puts "OK"
+
+# ---------- 3. PS 初始化（PLL / 时钟 / DDR / MIO）----------
+step "ps7_init"
+targets -set -filter {name =~ "APU"}
+if {[catch {source $PS7} e]} { puts "FAIL source ps7_init.tcl: $e"; exit 1 }
+if {[catch {ps7_init} e]}    { puts "FAIL ps7_init: $e"; exit 1 }
+puts "ps7_init OK"
+
+step "ps7_post_config (使能 PL 电平转换器 / FCLK)"
+if {[catch {ps7_post_config} e]} { puts "FAIL ps7_post_config: $e"; exit 1 }
+puts "ps7_post_config OK"
+puts "LVL_SHFTR_EN = [rd 0xF8000900]"
+
+# ---------- 4. 加载 PL 比特流 ----------
+step "load bitstream"
+puts "BIT = $BIT"
+targets -set -filter {name =~ "xc7z020"}
+if {[catch {fpga -f $BIT} e]} { puts "FAIL fpga: $e"; exit 1 }
+puts "bitstream OK"
+
+# ---------- 5. 下载并运行 ----------
+step "download + run ELF"
+puts "ELF = $ELF"
+targets -set -filter {name =~ "ARM*#0"}
+rst -processor
+if {[catch {dow $ELF} e]} { puts "FAIL dow: $e"; exit 1 }
+puts "dow OK"
+
+puts "PC = [lindex [rrd pc] 1]"
+con
+puts "running..."
+
+# ---------- 6. 读回心跳验证 ----------
+# 注意：程序开头有约 4~5 秒的上电自检延时（全亮/全灭/交替），
+# 所以这里必须轮询等待 magic 出现，不能用固定等待。
+step "verify heartbeat (OCM 0x00020000)"
+set magic 0
+set tries 0
+while {$tries < 30} {
+    after 1000
+    set magic [rd 0x00020000]
+    if {[string match "*4C45443*" $magic]} { break }
+    incr tries
+}
+set hb1 [rd 0x00020004]
+set hb2 [rd 0x00020008]
+set hb3 [rd 0x0002000C]
+set hb4 [rd 0x00020010]
+set hb5 [rd 0x00020014]
+set hb6 [rd 0x00020018]
+set hb7 [rd 0x0002001C]
+puts "HEARTBEAT[0] magic = $magic   (期望含 4C45443x)"
+puts "HEARTBEAT[1] step  = $hb1"
+puts "HEARTBEAT[2] plled = $hb2"
+puts "HEARTBEAT[3] sw    = $hb3"
+puts "HEARTBEAT[4] gt    = $hb4"
+puts "HEARTBEAT[5] psled = $hb5"
+puts "HEARTBEAT[6] DIRM0 = $hb6   (期望含 00000180)"
+puts "HEARTBEAT[7] OEN0  = $hb7   (期望含 00000180)"
+if {[string match "*4C45443*" $magic]} {
+    puts "\n>>> RESULT: RUNNING"
+} else {
+    puts "\n>>> RESULT: 未检测到心跳"
+}
+
+puts "\n>>> DONE - 程序持续运行中（不停机）"
+exit 0

@@ -497,12 +497,235 @@ def write_if_changed(path: Path, content: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# ARM32 (Zynq-7020 / Cortex-A9) build graph
+#
+# Kept separate from the x86_64 graph on purpose: the ARM port replaces the
+# boot path, the arch layer and the platform drivers wholesale, so the two
+# graphs share no compile rules.  Only the generator, the staging helper and
+# the phony target names are common.
+# ---------------------------------------------------------------------------
+
+ARM32_SOURCE_ROOT = "arch/arm32"
+ARM32_OBJ_ROOT = "out/arm32"
+ARM32_KERNEL = "out/kernel-arm.elf"
+
+# Zynq-7020 = dual Cortex-A9 / ARMv7-A / VFPv3.
+# hard-float is deliberate: it matches AMD's own standalone BSP
+# (cortexa9_toolchain.cmake uses -mfpu=vfpv3 -mfloat-abi=hard), so vendored
+# Xilinx sources and any prebuilt BSP archive stay ABI-compatible.
+ARM32_ARCH_FLAGS = (
+    "-mcpu=cortex-a9",
+    "-marm",
+    "-mfpu=vfpv3",
+    "-mfloat-abi=hard",
+    "-mno-unaligned-access",
+)
+
+ARM32_COMMON_FLAGS = (
+    "-ffreestanding",
+    "-nostdlib",
+    "-nostdinc",
+    "-fno-builtin",
+    "-fno-stack-protector",
+    "-fno-exceptions",
+    # AMD's BSP uses this too: stops the compiler from turning byte loops into
+    # memcpy/memset calls that a freestanding kernel does not provide.
+    "-fno-tree-loop-distribute-patterns",
+    "-Wall",
+    "-Wextra",
+    "-g",
+    "-I./arch/arm32/include",
+    "-MMD",
+    "-MP",
+)
+
+# Candidate install roots for the Vitis GNU toolchain, used only when the
+# compiler is not already on PATH.
+_VITIS_ARM_ROOTS = (
+    Path(r"C:\AMDDesignTools\2025.2\gnu\aarch32\nt\gcc-arm-none-eabi"),
+    Path(r"C:\Xilinx\Vitis\2025.2\gnu\aarch32\nt\gcc-arm-none-eabi"),
+    Path("/tools/Xilinx/Vitis/2025.2/gnu/aarch32/nt/gcc-arm-none-eabi"),
+)
+
+
+def resolve_arm_toolchain() -> tuple[str, str, str]:
+    """Return (cc, objcopy, libgcc_arg) for the ARM cross build.
+
+    Resolution order:
+      1. explicit ARM_CC / ARM_OBJCOPY / ARM_LIBGCC environment variables
+      2. a toolchain already on PATH (arm-none-eabi-gcc)
+      3. a known Vitis install root
+
+    About libgcc: ARM has no hardware integer division, so 32/64-bit division
+    emits __aeabi_uidiv / __aeabi_uldivmod calls that live in libgcc.  With
+    -nostdlib they are not pulled in automatically, so the link must add them.
+
+    The default is a plain `-lgcc`: the GCC driver resolves its own multilib
+    tree, and that matters here.  Xilinx's aarch32 toolchain has *no* ARM-state
+    hard-float multilib at all -- the only non-Thumb variants are armv5te -- so
+    for `-mcpu=cortex-a9 -marm -mfpu=vfpv3 -mfloat-abi=hard` the driver selects
+    `thumb/v7-a+fp/hard`.  Hardcoding the obvious-looking
+    `.../usr/lib/arm-xilinx-eabi/*/libgcc.a` instead picks a soft-float archive
+    and the link fails with:
+        "uses VFP register arguments, libgcc.a(_udivmoddi4.o) does not"
+    Set ARM_LIBGCC only when an explicit archive path is genuinely required.
+    """
+    cc = os.environ.get("ARM_CC", "")
+    objcopy = os.environ.get("ARM_OBJCOPY", "")
+    libgcc = os.environ.get("ARM_LIBGCC", "")
+
+    # 2. PATH lookup.  shutil.which returns None when absent, unlike
+    #    find_executable() which falls back to returning the bare name.
+    if not cc:
+        for name in ("arm-none-eabi-gcc", "arm-none-eabi-gcc.exe", "arm-xilinx-eabi-gcc"):
+            found = shutil.which(name)
+            if found:
+                cc = found
+                break
+
+    # 3. Known Vitis install roots.
+    if not cc:
+        for root in _VITIS_ARM_ROOTS:
+            for name in ("arm-none-eabi-gcc.exe", "arm-none-eabi-gcc"):
+                candidate = root / "bin" / name
+                if candidate.exists():
+                    cc = str(candidate)
+                    break
+            if cc:
+                break
+
+    if not cc:
+        raise SystemExit(
+            "ARM toolchain not found.\n"
+            "  Install one or set ARM_CC to the compiler, e.g.\n"
+            '    set ARM_CC=C:\\AMDDesignTools\\2025.2\\gnu\\aarch32\\nt\\gcc-arm-none-eabi\\bin\\arm-none-eabi-gcc.exe\n'
+            "  See docs/ZYNQ7020_PORT_PLAN.md section 6.7."
+        )
+
+    cc_path = Path(cc)
+    # <root>/bin/<cc>; a PATH lookup always yields an absolute path, so
+    # parent is meaningful here.
+    bin_dir = cc_path.parent
+
+    if not objcopy:
+        objcopy = "arm-none-eabi-objcopy"
+        for name in ("arm-none-eabi-objcopy.exe", "arm-none-eabi-objcopy"):
+            candidate = bin_dir / name
+            if candidate.exists():
+                objcopy = str(candidate)
+                break
+
+    # Default to driver-resolved libgcc rather than a hardcoded archive.
+    libgcc_arg = libgcc if libgcc else "-lgcc"
+
+    return cc, objcopy, libgcc_arg
+
+
+def arm32_graph(n: Ninja, out_path: Path) -> list[Path]:
+    """Emit the Zynq-7020 build graph and return its output targets."""
+    cc, _objcopy, libgcc_arg = resolve_arm_toolchain()
+
+    n.comment("ARM32 TOOLCHAIN - Vitis GNU toolchain (see docs/ZYNQ7020_PORT_PLAN.md 6.7)")
+    n.var("arm_cc", cc)
+    n.var("arm_libgcc", libgcc_arg)
+    n.var("arm_cflags", " ".join(ARM32_COMMON_FLAGS))
+    n.var("arm_arch_flags", " ".join(ARM32_ARCH_FLAGS))
+    n.var("arm_ldflags", f"-nostdlib -T {ARM32_SOURCE_ROOT}/boot/kernel.ld -Wl,-Map=out/kernel-arm.map")
+    n.line()
+
+    # Source discovery stays explicit: the ARM tree is small and every file in
+    # it is first-party, unlike the x86 side which sweeps kernel/driver/lib.
+    arm_c_sources = find_files(f"{ARM32_SOURCE_ROOT}/src", (".c",))
+    arm_s_sources = find_files(f"{ARM32_SOURCE_ROOT}/boot", (".S",))
+    arm_headers = find_files(f"{ARM32_SOURCE_ROOT}/include", (".h",))
+
+    n.comment("ARM32 FILES")
+    n.var_list("ARM32_C_SOURCES", arm_c_sources)
+    n.var_list("ARM32_S_SOURCES", arm_s_sources)
+    n.var_list("ARM32_HEADERS", arm_headers)
+    n.line()
+
+    n.comment("ARM32 RULES")
+    # NOTE: these rules deliberately avoid `mkdir -p $$(dirname $out)`.
+    # Native Windows Ninja calls CreateProcess directly, so shell builtins like
+    # `mkdir` and `dirname` are unavailable and every edge fails with
+    # "CreateProcess failed".  The object directories are therefore created by
+    # this generator instead (see below), keeping the rules shell-independent.
+    # `ninja clean` only deletes declared output files, not directories, so the
+    # tree survives a clean; a manual `rm -rf out` just needs a regeneration.
+    n.rule(
+        "arm32_cc",
+        "$arm_cc $arm_arch_flags $arm_cflags -std=gnu11 -O2 -MF $out.d -c $in -o $out",
+        log_desc("CC", "$in -> $out"),
+        depfile="$out.d",
+    )
+    # Assembly goes through the GNU driver so it sees the same -mcpu/-mfpu set.
+    n.rule(
+        "arm32_as",
+        "$arm_cc $arm_arch_flags -c $in -o $out",
+        log_desc("ASM", "$in -> $out"),
+    )
+    # libgcc is passed as an explicit path: the Xilinx tree is a multilib
+    # layout that -L/-lgcc does not resolve correctly.
+    n.rule(
+        "arm32_link",
+        "$arm_cc $arm_arch_flags $arm_ldflags -o $out $in $arm_libgcc",
+        log_desc("LD", "$out"),
+    )
+
+    n.comment("ARM32 ARTIFACTS - Zynq-7020 kernel ELF")
+    # find_files() yields absolute paths; strip the arch root so objects land in
+    # out/arm32/<subdir>/<name>.o mirroring the source tree.
+    arm_source_root_abs = ROOT / ARM32_SOURCE_ROOT
+    arm_objs: list[Path] = []
+    for src in arm_s_sources:
+        obj = Path(ARM32_OBJ_ROOT) / src.relative_to(arm_source_root_abs).with_suffix(".o")
+        n.build(obj, "arm32_as", src)
+        arm_objs.append(obj)
+    for src in arm_c_sources:
+        obj = Path(ARM32_OBJ_ROOT) / src.relative_to(arm_source_root_abs).with_suffix(".o")
+        n.build(obj, "arm32_cc", src, implicit=arm_headers)
+        arm_objs.append(obj)
+
+    # Create the object directories up front.  Doing it here rather than in the
+    # rule commands is what keeps the rules shell-independent (see ARM32 RULES).
+    for obj in arm_objs:
+        (ROOT / obj).parent.mkdir(parents=True, exist_ok=True)
+
+    kernel = Path(ARM32_KERNEL)
+    n.build(
+        kernel,
+        "arm32_link",
+        arm_objs,
+        implicit=arm_headers + [Path(f"{ARM32_SOURCE_ROOT}/boot/kernel.ld")],
+    )
+    n.line()
+
+    n.comment("ARM32 PHONY TARGETS")
+    phony(n, "arm32", [kernel])
+    phony(n, "kernel.arm", [kernel])
+    n.line("default arm32")
+
+    return [kernel]
+
+
 def main() -> None:
     # Generation is deterministic for a given checkout/environment.  Toolchain
     # probes happen here so generated flags and Rust library paths are visible
     # at the top of build.ninja.
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default=str(OUT))
+    parser.add_argument(
+        "--arch",
+        default=os.environ.get("ARCH", "x86_64"),
+        choices=("x86_64", "arm32"),
+        help=(
+            "Target architecture.  x86_64 keeps the historical UEFI/PC build graph; "
+            "arm32 emits the Zynq-7020 (Cortex-A9) graph.  The value is baked into the "
+            "generated regen rule so `ninja` re-runs the generator with the same arch."
+        ),
+    )
     parser.add_argument(
         "--fail-if-changed",
         action="store_true",
@@ -525,6 +748,25 @@ def main() -> None:
     n.comment("Generated by tools/gen_ninja.py. Run `ninja reconfigure` after changing the build graph.")
     n.comment("Edit tools/gen_ninja.py, not this generated build.ninja file.")
     n.var("ninja_required_version", "1.10")
+    # Python interpreter used by generation/preflight/staging rules.  Windows has
+    # no `python3` on PATH, so allow an explicit override instead of hardcoding.
+    n.var("python", os.environ.get("PYTHON", "python3"))
+
+    # ------------------------------------------------------------------
+    # ARM32 short-circuit.
+    #
+    # The Zynq port replaces boot/, the arch layer and every platform driver,
+    # so there is nothing to share with the x86_64 graph beyond the generator
+    # itself.  Emitting it separately keeps the historical x86 graph byte-for-
+    # byte unchanged and avoids inventing arch conditionals inside every rule.
+    # ------------------------------------------------------------------
+    if args.arch == "arm32":
+        arm32_graph(n, Path(args.out))
+        changed = write_if_changed(Path(args.out), "\n".join(n.lines) + "\n")
+        if changed and args.fail_if_changed:
+            raise SystemExit("build.ninja was refreshed; rerun ninja so it can load the updated graph")
+        return
+
     n.var("cc", os.environ.get("CC", os.environ.get("COMPILER_PREFIX", "") + "clang"))
     n.var("cxx", os.environ.get("CPP", os.environ.get("COMPILER_PREFIX", "") + "clang++"))
     n.var("nasm", os.environ.get("NASM", os.environ.get("COMPILER_PREFIX", "") + "nasm"))
@@ -610,14 +852,14 @@ def main() -> None:
     # command strings do not need to be duplicated for every app/module.
     n.rule(
         "regen",
-        "python3 tools/gen_ninja.py --out build.ninja",
+        f"$python tools/gen_ninja.py --out build.ninja --arch {args.arch}",
         log_desc("GEN", "build.ninja"),
         generator=True,
         restat=True,
     )
     n.rule(
         "refresh_manifest",
-        "python3 tools/gen_ninja.py --out build.ninja --fail-if-changed && "
+        f"$python tools/gen_ninja.py --out build.ninja --arch {args.arch} --fail-if-changed && "
         "mkdir -p $$(dirname $out) && touch $out",
         log_desc("GEN", "refresh build.ninja"),
         generator=True,
@@ -652,12 +894,12 @@ def main() -> None:
     n.rule("netserver_cxx", "mkdir -p $$(dirname $out) && $cxx $netserver_cxxflags -MF $out.d -c $in -o $out", log_desc("CXX", "$in"), depfile="$out.d")
     n.rule(
         "package_compliance",
-        "python3 tools/package_third_party.py --output out/compliance/third-party",
+        "$python tools/package_third_party.py --output out/compliance/third-party",
         log_desc("STAGE", "third-party compliance"),
         restat=True,
     )
     n.rule("kmod_link", "$cxx -shared $in $ldflags -o $out", log_desc("LD", "$out"))
-    n.rule("python_cmd", "python3 tools/ninja_build.py $cmd", "$desc")
+    n.rule("python_cmd", "$python tools/ninja_build.py $cmd", "$desc")
     n.rule("shell_cmd", "$cmd", "$desc")
 
     n.comment("MANIFEST - regenerate build.ninja before every normal Ninja execution")

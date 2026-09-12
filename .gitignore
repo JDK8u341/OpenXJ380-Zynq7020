@@ -50,6 +50,8 @@ scsi.txt
 .clangd
 
 build.ninja
+# ARM32 (Zynq-7020) 构建图,与 x86 图并存
+build-arm.ninja
 
 .codex
 
@@ -59,3 +61,7 @@ venv/
 
 # Local audit notes
 /docs/LICENSE_AUDIT_2026-08-08.md
+
+# 板级参考资料(原理图 PDF、Vivado 导出的 XSA):体积大且是二进制,
+# 不适合进版本库。需要时放在本地即可;确实要提交用 git add -f。
+/other-infos/
