@@ -136,6 +136,7 @@ puts "clksrc   = [rd 0x00020030]   <== 1=闭环收敛 2=兜底猜值"
 puts "conviter = [rd 0x00020034]   <== 闭环迭代次数,0 表示没进迭代"
 puts "baudgen  = [rd 0x00020038]"
 puts "bauddiv  = [rd 0x0002003C]"
+puts "mmustage = [rd 0x00020040]   <== MMU: 0=未开始 1=已建表 2=已配 3=正要开 4=已开 0xEE=自检失败"
 
 # 交叉校验:ticks 应当约等于 uptime(ms),两者不符说明有中断被吞
 set t [rdn 0x00020028]

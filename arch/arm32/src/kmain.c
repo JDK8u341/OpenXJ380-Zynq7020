@@ -15,11 +15,13 @@
  */
 
 #include <arch/console.h>
+#include <arch/cpu.h>
 #include <arch/fault_test.h>
 #include <arch/heartbeat.h>
 #include <arch/io.h>
 #include <arch/irq.h>
 #include <arch/led.h>
+#include <arch/mmu.h>
 #include <arch/platform.h>
 #include <arch/timer.h>
 #include <arch/types.h>
@@ -37,8 +39,28 @@
 
 static volatile u32 g_tick_seen;
 
+/*
+ * 中断延迟测量。
+ *
+ * 为什么需要:私有定时器是**电平触发**的。如果 CPU 有一段时间没去响应,
+ * 定时器连expire 多次也只会被合并成一次中断 —— 计数上表现为"丢了 N 个 tick",
+ * 但寄存器、GIC 状态全都正常,光看现场分不出"丢中断"和"时钟变慢"。
+ *
+ * 直接记录相邻两次中断之间全局定时器走过的拍数,就能把这件事量化:
+ * 正常是 1ms 对应的 333333 拍,一旦出现远大于它的值,
+ * 说明确实有一段中断没有被及时响应,而且能直接读出停了多久。
+ */
+static volatile u32 g_tick_last_gt;
+static volatile u32 g_tick_max_gap;
+static volatile u32 g_tick_first;
+
+/* 全局定时器 333333343Hz -> 拍数换算成微秒 */
+#define GT_TICKS_TO_US(t) ((u32)(((u64)(t) * 1000000ull) / (u64)PLAT_GLOBAL_TIMER_FREQ_HZ))
+
 static void tick_handler(u32 intid, void *arg)
 {
+    u32 now;
+
     (void)intid;
     (void)arg;
 
@@ -48,6 +70,32 @@ static void tick_handler(u32 intid, void *arg)
      * 表现为"进了中断就再也出不来",而且从寄存器上看一切正常。
      */
     a9_timer_clear_irq();
+
+    now = timer_read_ticks_low();
+
+    /*
+     * ⚠ 第一次中断必须单独处理,不能拿它去更新 max_gap。
+     * g_tick_last_gt 初值是 0,而此刻全局定时器早已跑了上千万拍,
+     * 于是第一次算出来的"间隔"其实是"从定时器归零到现在"的绝对值 ——
+     * 实测会读出 1013343us 这种数字,看上去像一次长达 1 秒的中断丢失,
+     * 实际什么都没发生。这个伪影第一次就把我误导了一轮。
+     */
+    if (g_tick_first == 0u) {
+        g_tick_first = 1u;
+        g_tick_last_gt = now;
+        g_tick_seen++;
+        return;
+    }
+
+    {
+        u32 gap = now - g_tick_last_gt;
+
+        g_tick_last_gt = now;
+
+        if (gap > g_tick_max_gap) {
+            g_tick_max_gap = gap;
+        }
+    }
 
     g_tick_seen++;
 }
@@ -224,7 +272,53 @@ void kmain(void)
 
     HB[HB_SLOT_TICKS] = g_tick_seen;
 
-    /* ---- 6. 主循环 ---- */
+    /* ---- 6. MMU ---- */
+    /*
+     * 位置是有意选的:放在中断子系统验证**之后**。
+     *
+     * 这样串口上就有了明确的前后对照 ——
+     * 横幅与 IRQ 状态行证明"开 MMU 之前一切正常",
+     * 之后主循环的状态行证明"开 MMU 之后仍然正常"。
+     * 若把 MMU 放在最前面,一旦出错就只能看到"什么都没输出",
+     * 无法区分是页表错了还是别的地方本来就坏了。
+     *
+     * 真正的兜底是心跳槽 HB_SLOT_MMUSTAGE:
+     * 打开地址转换后 C 代码未必还能跑,但那个槽是开 MMU 的代码
+     * 自己在每一步之前写的,JTAG 一定能读到。
+     */
+    console_puts(" MMU: building page table (1MB sections, identity map)...\n");
+    timer_delay_ms(20);
+
+    mmu_enable();
+
+    /*
+     * 能执行到这里本身就说明了一件事:上面的 mmu_enable() 里
+     * 打开 SCTLR.M 之后,**取指与访存都经过了页表**并且成功了。
+     * 否则根本回不到这个函数。
+     */
+    console_printf(" MMU         : %s  stage=%u SCTLR=0x%08X TTBR0=0x%08X\n",
+                   mmu_is_enabled() ? "ENABLED" : "disabled", HB[HB_SLOT_MMUSTAGE],
+                   arch_read_sctlr(), arch_read_ttbr0());
+    console_printf(" MMU regions : OCM/心跳=\"%s\"  DDR=\"%s\"  UART=\"%s\"  GIC=\"%s\"\n",
+                   mmu_region_name_for(PLAT_HEARTBEAT_BASE), mmu_region_name_for(PLAT_KERNEL_LOAD),
+                   mmu_region_name_for(PLAT_CONSOLE_UART_BASE), mmu_region_name_for(0xF8F01000u));
+
+    if (!mmu_is_enabled()) {
+        console_puts(" WARNING: MMU did not enable - see heartbeat slot 16\n");
+    } else {
+        /*
+         * 自检:地址转换开着的情况下,读回一个已知常量。
+         * 这是在验证"数据访问经页表后仍然取到正确的值",
+         * 而不只是"没崩"。用区域名函数的返回值做样本 ——
+         * 它来自 .rodata,落在 DDR 段里。
+         */
+        const char *probe = mmu_region_name_for(PLAT_KERNEL_LOAD);
+        console_printf(" MMU selftest: .rodata readback \"%s\" (%s)\n", probe,
+                       probe[0] == 'D' ? "OK" : "MISMATCH");
+    }
+    console_puts("\n");
+
+    /* ---- 7. 主循环 ---- */
     /*
      * 节奏完全由全局定时器决定,不依赖软件延时循环 ——
      * 这样即使 CPU 频率变化,闪烁频率也保持一致。
@@ -277,10 +371,18 @@ void kmain(void)
                  */
                 HB[HB_SLOT_TICKS]    = g_tick_seen;
                 HB[HB_SLOT_IRQCOUNT] = irq_get_stats()->irq_count;
+                HB[HB_SLOT_TICKGAP]  = GT_TICKS_TO_US(g_tick_max_gap);
 
-                console_printf("[XJ380/arm32] alive loop=%u led=0x%02X ticks=%u irq=%u uptime=%u ms\n",
+                /*
+                 * uptime 与 ticks 的差就是"累计欠下的 tick 数":
+                 * 若中断一次不丢,两者应当始终相差一个固定值。
+                 * maxgap 是最大单次延迟,正常应贴着 1000us。
+                 */
+                console_printf("[XJ380/arm32] alive loop=%u led=0x%02X ticks=%u irq=%u lag=%u ms maxgap=%u us\n",
                                loop_count, (u32)(HB[HB_SLOT_LED] & 0xFFu), g_tick_seen,
-                               irq_get_stats()->irq_count, (u32)(timer_read_us() / 1000u));
+                               irq_get_stats()->irq_count,
+                               (u32)(timer_read_us() / 1000u) - g_tick_seen,
+                               GT_TICKS_TO_US(g_tick_max_gap));
             }
         }
 

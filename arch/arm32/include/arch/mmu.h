@@ -418,3 +418,32 @@ void mmu_build_l1_table(u32 *table);
  */
 const char *mmu_region_name_for(u32 addr);
 
+/* ------------------------------------------------------------------ */
+/* 硬件侧(实现在 src/mmu_hw.c)                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 这几个只存在于 ARM 侧,不能放进 src/mmu.c ——
+ * 那个文件要被宿主机编译器直接编译来做单测,
+ * 一旦引入 mcr/mrc 内联汇编就编不过了。
+ */
+
+/* 一级页表实体。位置与对齐由 kernel.ld 的 .mmu_tbl 段保证 */
+extern u32 g_mmu_l1_table[MMU_L1_ENTRY_COUNT];
+
+/* MMU 当前是否已开启(读 SCTLR.M) */
+bool mmu_is_enabled(void);
+
+/*
+ * 建表并打开地址转换。
+ *
+ * 本阶段只开 SCTLR.M,不开 D-Cache / I-Cache ——
+ * 理由见 src/mmu_hw.c 的说明(整块 D-Cache 失效需要按 set/way 遍历,
+ * 属于 M2-5 的缓存维护范畴)。
+ *
+ * 每个阶段都会写心跳槽 HB_SLOT_MMUSTAGE,所以万一挂死,
+ * JTAG 读回那个槽就能知道停在哪一阶段。
+ */
+void mmu_enable(void);
+
+

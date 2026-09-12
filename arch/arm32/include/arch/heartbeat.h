@@ -55,6 +55,16 @@
  */
 #define HB_SLOT_MMUSTAGE  16u
 
+/*
+ * 相邻两次 tick 中断之间的最大间隔(微秒)。
+ *
+ * 私有定时器是电平触发的:CPU 若有一段时间不响应,
+ * 多次 expire 会被合并成一次中断,计数上表现为"丢了 N 个 tick",
+ * 而寄存器和 GIC 状态全都正常 —— 光看现场分不出这是丢中断还是时钟不准。
+ * 这个槽把这个时长直接量出来,正常应紧贴 1000us。
+ */
+#define HB_SLOT_TICKGAP   17u
+
 /* MMU 阶段的取值。0 表示还没开始 */
 #define HB_MMU_STAGE_IDLE       0u /* 尚未开始 */
 #define HB_MMU_STAGE_BUILT      1u /* 页表已填好 */
@@ -64,7 +74,7 @@
 #define HB_MMU_STAGE_FAILED     0xEEu /* 自检未通过,主动放弃开 MMU */
 
 /* 已定义的槽位数。越界写会踩到后面的故障注入选择器 */
-#define HB_SLOT_COUNT     17u
+#define HB_SLOT_COUNT     18u
 
 /* 心跳区预留的槽位容量(见 platform.h 的 PLAT_HEARTBEAT_REGION_SLOTS) */
 #define HB_SLOT_CAPACITY  PLAT_HEARTBEAT_REGION_SLOTS
