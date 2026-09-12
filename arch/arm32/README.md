@@ -99,6 +99,38 @@ shell 内建命令启动 `cmd.exe`，所有边都会报 `CreateProcess failed`�
 
 ---
 
+## 单元测试
+
+单测跑在**宿主机**上，不碰板子 —— 所以只覆盖能脱离硬件验证的纯逻辑。
+
+```
+python -m unittest discover --start-directory tests --pattern 'test_*.py'
+```
+
+| 测试 | 覆盖内容 | 为什么值得测 |
+|---|---|---|
+| `tests/test_arm32_uart_baud.py` | `uart_baud_search()` 的分频搜索 | 这段数学出过 **7.033 倍**的波特率偏差：标定点用了 `BAUDDIV=0`，而合法区间是 **4..254**。回归保护的就是这个区间边界。 |
+| `tests/test_arm32_console.py` | `console_printf` 的格式化 | panic 路径的输出格式；`%p` 在 32 位上必须走 `uintptr_t` 中间转换 |
+
+为了让同一份源码既能被 ARM 交叉编译、又能被宿主 gcc 编译，
+`include/arch/types.h` 按 `__STDC_HOSTED__` 分了两个分支：
+宿主构建走标准头（`stdbool.h`/`stddef.h`/`stdint.h`），
+freestanding 构建自带 `size_t`/`uintptr_t`/`bool` 等定义。
+少了这个分支，宿主上会报 `typedef redefinition`。
+
+**当前整体结果**：45 tests / 1 FAIL / 8 ERROR。
+这些失败**全部是预先存在的**，与 ARM 侧代码无关，基线 commit `08e5c9c`
+为 42 tests / 1 FAIL / 10 ERROR —— 即新增测试把 2 个 error 转成了通过，
+**未引入任何回归**。
+
+> ⚠ **本机宿主工具链是坏的**（预先存在，与本移植无关）：
+> MinGW 的 `gcc`/`g++` 连 `int main(){return 0;}` 都编译不了
+> （`cc1.exe` 静默退出 1），且没有 `sha256sum`。
+> 受影响的测试会报 ERROR 而不是 FAIL。排查 ARM 侧问题时不要被这些噪声带偏。
+> 上表的两个测试不依赖 MinGW，用的是 `("gcc","cc","clang")` 里第一个可用的编译器。
+
+---
+
 ## 启动顺序（`kmain`）
 
 ```
@@ -122,35 +154,53 @@ shell 内建命令启动 `cmd.exe`，所有边都会报 `CreateProcess failed`�
 
 ## 调试通道：OCM 心跳
 
-`0x00020000` 起 9 个 32 位槽，JTAG 用 `mrd` 直接读，**不需要串口**：
+`0x00020000` 起 16 个 32 位槽，JTAG 用 `mrd` 直接读，**不需要串口**：
 
-| 槽 | 含义 |
-|---|---|
-| 0 | magic `0x4F583338`（"OXJ8"）|
-| 1 | 主循环计数 |
-| 2 | PL LED 图案 |
-| 3 | 拨码开关值 |
-| 4 | 全局定时器低 32 位 |
-| 5 | PS LED 状态 |
-| 6 | UART 参考时钟（0 = 未标定）|
-| 7 | PS GPIO `DIRM_0` |
-| 8 | UART 探测结果（1 = 存在）|
-| 9 | 当前设定下实测的真实波特率 |
-| 10 | 周期 tick 计数 |
-| 11 | GIC 收到的中断总数 |
+| 槽 | 偏移 | 含义 |
+|---|---|---|
+| 0 | `0x00` | magic `0x4F583338`（"OXJ8"）|
+| 1 | `0x04` | 主循环计数 |
+| 2 | `0x08` | PL LED 图案 |
+| 3 | `0x0C` | 拨码开关值 |
+| 4 | `0x10` | 全局定时器低 32 位 |
+| 5 | `0x14` | PS LED 状态 |
+| 6 | `0x18` | UART 参考时钟（0 = 未标定）|
+| 7 | `0x1C` | PS GPIO `DIRM_0` |
+| 8 | `0x20` | UART 探测结果（1 = 存在）|
+| 9 | `0x24` | 当前设定下实测的真实波特率 |
+| 10 | `0x28` | 周期 tick 计数 |
+| 11 | `0x2C` | GIC 收到的中断总数 |
+| 12 | `0x30` | 参考时钟来源（1 = 闭环收敛，2 = 兜底常量）|
+| 13 | `0x34` | 闭环实际迭代次数（0 = 没进迭代）|
+| 14 | `0x38` | 最终生效的 `BAUDGEN` |
+| 15 | `0x3C` | 最终生效的 `BAUDDIV` |
+
+槽 12–15 是为一个具体陷阱加的：**闭环收敛成功返回的值，和收敛失败后由调用方
+填的兜底常量，可能完全是同一个数字，含义却相反** —— 前者经过实测验证，
+后者只是猜的。只记 `uart_clk` 无法区分这两种情况，于是踩过一次：
+心跳显示 `uartclk=100500000` 看起来正常，实际是兜底值，收敛早就失败了。
 
 这条通道比串口更好用：能读任意内存、能看 PC/寄存器、崩溃后仍可读。
 移植早期应当优先依赖它。
+
+⚠ **读取时机**：`magic`（槽 0）在 `kmain` 一开头就写了，而 `DIRM0`/`TICKS`/
+`IRQCOUNT` 分别在启动横幅之后、中断子系统起来之后才写。9600 波特下横幅本身
+要 ~870 ms，所以"看到 magic 就立刻读整片心跳区"会稳定地读到一片 0。
+务必轮询槽 10（`ticks != 0`）作为门控 —— 曾经据此误判成"内核卡死在 `uart_puts`"。
 
 ---
 
 ## 已知问题与待办
 
-### 1. 本板串口不可用 —— 需重新生成 PL 设计（软件无法解决）
+### 1. ~~本板串口不可用~~ —— 已解决（用重新导出的 XSA）
 
-**现象**：UART0/UART1 寄存器读回恒为 0。
+**现状：串口已完全可用。** 用户重新导出了含 UART1 的 `opjtmp.xsa`，
+从中生成的 `ps7_init` 打开了 UART 外设，问题消失。
+下面保留原始排查记录，因为它说明了"外设寄存器读回 0"这类现象该怎么归因。
 
-**根因**：现有 `AXI_GPIO_1` 比特流对应的 **PS7 配置没有启用 UART**。
+**当时的现象**：UART0/UART1 寄存器读回恒为 0。
+
+**当时的根因**：原有 `AXI_GPIO_1` 比特流对应的 **PS7 配置没有启用 UART**。
 
 证据链（逐条实测）：
 
@@ -166,15 +216,11 @@ shell 内建命令启动 `cmd.exe`，所有边都会报 `CreateProcess failed`�
 **结论：软件层面打不开它。** MIO 路由、APER 门控、CLKACT 三条路都试过且都生效了，
 但外设寄存器始终读回 0 —— 说明该外设在当前 PS7 配置下根本不响应。
 
-**解决方向**（需要 Vivado）：
-
-1. 打开 `AXI_GPIO_1_BSP.xpr` 的 Block Design
-2. `processing_system7_0` → Re-customize IP → Peripheral I/O Pins
-3. 勾选 **UART 1**（引脚自动选 MIO 48..49）
-4. Validate → Save → Generate Bitstream
-5. Export Hardware（勾 Include bitstream）得到新 XSA
-6. 在 Vitis 里用新 XSA 更新平台 → 生成新的 `ps7_init.tcl`
-7. 之后本驱动无需改动，`PLAT_CONSOLE_UART_BASE` 已指向 UART1
+**最终解法**：用带 UART1 的 XSA 重新生成 `ps7_init`，
+即 `tmp-test/zynq/ps7_init_uart1.tcl`（已提交）。JTAG 加载时 `source` 它即可，
+不需要重新烧写 Flash、也不需要 FSBL/BOOT.BIN。
+注意 `ps7_init` 只管 **PS**（时钟/MIO/DDR），比特流管 **PL**（AXI GPIO → LED），
+两者独立，可以交叉组合：用新 `ps7_init` 换到串口，同时保留旧比特流不丢 LED。
 
 **板子的 PS 调试口已逐脚确认是 UART1**（原理图追踪）：
 
@@ -225,11 +271,16 @@ shell 内建命令启动 `cmd.exe`，所有边都会报 `CreateProcess failed`�
 ```
  CPU          : 666666687 Hz
  Global timer : 333333343 Hz
- UART ref clk : 100000000 Hz (source=1, self-calibrated)
+ UART ref clk : 100000000 Hz (source=1 iters=1, self-calibrated)
  Baud         : requested=9600 actual=9600 (BAUDGEN=1736 BAUDDIV=5 err=0 ppm)
- If you can read this, the serial console works.
-[XJ380/arm32] alive loop=1 led=0x10 sw=0x00 uptime=950 ms
+ PS GPIO DIRM0: 0x00000180 OEN0: 0x00000180
+ IRQ status   : ticks=20 irq_count=20 last_intid=29 spurious=0
+ Periodic tick is RUNNING (1 kHz, Cortex-A9 private timer).
+[XJ380/arm32] alive loop=12 led=0x01 ticks=2178 irq=2178 uptime=3221 ms
 ```
+
+`source=1` 表示闭环收敛成功（`2` 表示走了兜底常量），`iters=1` 表示一次迭代即收敛。
+这两个字段是必要的：光看 `uart_clk` 无法区分"实测验证过"和"只是猜的"。
 
 ### 3. 本板串口硬件（已从原理图逐脚确认）
 
@@ -280,18 +331,19 @@ movs pc, lr          @ 跳转的同时把 SPSR 拷回 CPSR(等价于 x86 的 ire
 ```
 IRQ status  : ticks=20 irq_count=20 last_intid=29 spurious=0
 Periodic tick is RUNNING (1 kHz, Cortex-A9 private timer).
-[XJ380/arm32] alive loop=12 led=0x01 ticks=2219 irq=2219 uptime=3221 ms
-[XJ380/arm32] alive loop=44 led=0x01 ticks=8661 irq=8661 uptime=9663 ms
+[XJ380/arm32] alive loop=12 led=0x01 ticks=2178 irq=2178 uptime=3221 ms
+[XJ380/arm32] alive loop=44 led=0x01 ticks=8547 irq=8547 uptime=9663 ms
 ```
 
 | 检查项 | 结果 |
 |---|---|
-| tick 频率 | 2219→8661 次对应 3221→9663 ms，逐段**精确 1000 Hz** |
-| 中断丢失 | `irq_count` 与 `ticks` **完全相等**（45705 = 45705），零丢失 |
+| tick 频率 | 相邻两条状态行 `Δticks=1611` 对应 `Δuptime=1611 ms`，**精确 1000 Hz** |
+| 中断丢失 | `irq_count` 与 `ticks` **完全相等**（11743 = 11743），零丢失 |
 | INTID | `29`（私有定时器），符合设计 |
 | 虚假中断 | `spurious=0` |
 | GIC 寄存器 | `GICD_CTLR=1`、`GICD_ISENABLER0` bit29=1、`GICC_CTLR=1`、`GICC_PMR=0xF0` |
 | 定时器寄存器 | `LOAD=333332`、`CONTROL=0x07`（使能+自动重载+中断） |
+| JTAG 交叉校验 | 心跳槽 10 与槽 11 相等（`0x2DDF = 0x2DDF`），与串口独立确认同一结论 |
 
 驱动注册中断的用法：
 
@@ -306,9 +358,50 @@ irq_global_enable();                               /* 最后才开中断 */
 
 顺序不能颠倒：中断可能在处理函数登记之前就打进来。
 
-配套的异常诊断（`c_data_abort_handler` 等）会打印出错地址与寄存器现场，
-对应 x86 侧的 `kernel/wsod/`。**目前还没有被真实触发验证过** ——
-需要一个专门的故障注入测试。
+配套的异常诊断（`c_data_abort_handler` / `c_prefetch_abort_handler` /
+`c_undef_handler` / `c_svc_handler`）会打印出错地址与寄存器现场，
+对应 x86 侧的 `kernel/wsod/`。
+
+**这些处理函数是"出了事才跑"的代码，正常路径永远走不到** ——
+所以专门做了故障注入（`src/fault_test.c`）：内核启动后用 JTAG 往
+`0x00020040` 写选择器即可触发，**不需要重新烧录**。没有专门触发过，
+就无法区分"处理函数写对了"和"处理函数根本没被调用、只是系统恰好没崩"。
+
+一条命令完成"加载 → 跑起来 → 等中断子系统 → 注入 → 回读寄存器"：
+
+```
+C:\AMDDesignTools\2025.2\Vitis\bin\xsdb.bat tmp-test/jtag/run_kernel_uart.tcl <1|2|3|4>
+```
+
+配合串口抓取（会打印原始 hex，波特率不对时能区分"全 0x00 / 全 0xFF / 有字符"）：
+
+```
+python tmp-test/run_and_capture.py COM4 9600 2 <1|2|3|4>
+```
+
+**实测结果**（四个用例各跑一遍，注入前 `ticks` 与 `irqcount` 均相等）：
+
+| 选择器 | 异常 | 关键证据 |
+|---|---|---|
+| 1 | Data Abort | `DFAR=0x50000000`、`DFSR=0x08`（synchronous external abort）、`pc=0x001008CC`、`r3=0x50000000` |
+| 2 | Undefined Instruction | `pc=0x0010091C`（UDF 指令处）、`r4=0x00000002`（选择器）|
+| 3 | Prefetch Abort | `IFAR=0x50000000`、`IFSR=0x08`、`pc=0x50000000`、`r4=0x00000003` |
+| 4 | SVC | `!!! SVC (no syscall layer yet) - diagnostic only, returning !!!`，随后 `SVC returned normally` |
+
+前三个停机 PC 分别为 `0x001000D8` / `0x00100104` / `0x0010011C`，
+正是 `boot/vectors.S` 中三个向量各自的 `wfe` 自旋循环 ——
+证明处理函数返回后确实停在了预期位置。
+
+**SVC 与前三个有本质区别**：它的向量 `_vec_svc` 没有 `wfe` 自旋，
+处理完就 `pop {r0-r12, lr}` / `movs pc, lr` 返回到 SVC 的下一条指令。
+所以它的处理函数**不能**打印 "System halted"，否则会让人以为系统停了。
+用例 4 输出末尾的 `SVC returned normally` 顺带验证了这条返回路径 ——
+**那正是将来系统调用要走的机制**（`movs pc, lr` 在跳转的同时把 SPSR 拷回 CPSR）。
+
+**踩坑提醒**：`DFSR`/`IFSR` 的故障状态在 **bit [4:0]**，不是 [3:0]。
+`0x08` 在 [3:0] 下看着像"域故障"，实际 `[4:0]=0b01000` 是
+"Synchronous external abort"（访问了没有从设备的地址）。上一版就写错了这个
+提示，反而误导排障 —— 现在用 `fsr_status_text()` 显式查表。
 
 ### 5. 其它待办（M2 及以后）
 
@@ -323,7 +416,7 @@ irq_global_enable();                               /* 最后才开中断 */
 
 ## 已修复的坑（供参考）
 
-这三处在板上实测踩到，都已修好并留下注释：
+以下几处在板上实测踩到，都已修好并留下注释：
 
 1. **全局定时器 64 位读取算法写反了**。
    原本要求"低 32 位两次读相等"才接受结果，但计数器在 333MHz 递增，
@@ -335,3 +428,29 @@ irq_global_enable();                               /* 最后才开中断 */
 
 3. **UART 轮询没有超时**。外设不响应时 `while (!(SR & TXEMPTY))` 永不退出，
    整机挂死。现在所有轮询都有自旋上限，无串口表现为可诊断的降级。
+
+4. **`uart_init()` 解引用空指针，静默配错波特率**。
+   重构时把分频搜索挪进 `uart_baud_search()`，而该函数对 `result == NULL`
+   是直接返回的 —— 于是 `result->baudgen` 读的是**地址 0**。
+   ARM 关闭 MMU 时地址 0 是 OCM 且可写，所以既不崩溃也不报错，
+   只是把 `BAUDGEN`/`BAUDDIV` 写成垃圾值。而 `console_init()` 恰好就是用
+   `NULL` 调用它的，还在 `kmain` 里紧跟一次正确的 `uart_init()` 之后执行，
+   把刚配好的寄存器又覆盖掉 → 横幅必然乱码。
+   **教训**：允许 `NULL` 的参数要在被调用函数内部统一转成局部变量，
+   不能只在某一层做判断。
+
+5. **JTAG 读心跳读太早，误判成"内核卡死"**。
+   `magic` 在 `kmain` 开头就写，但 `DIRM0`/`TICKS`/`IRQCOUNT` 在横幅之后才写，
+   而 9600 波特下横幅要 ~870 ms。验证脚本 `con` 后只等 500 ms 就读，
+   于是稳定读到一片 0，看起来像"卡死在 `uart_puts`"。
+   现在改为轮询 `ticks != 0` 作为门控。
+   **教训**：用轮询标志位判断"子系统起来了"时，要选一个真正代表该子系统的标志，
+   而不是最早写下的那个。
+
+6. **缩短波特率测量窗口会引入系统性偏差**。
+   曾把测量字符数从 200 降到 32 以减少串口噪声，结果参考时钟从精确的
+   100 MHz 偏到 103.17 MHz。原因是 `UART_SR` 的 `TXEMPTY` 表示 **FIFO 空**，
+   而最后一个字节此时还在移位寄存器里 —— 计时窗口实际只覆盖了 `N-1` 个字符，
+   算出的波特率被高估 `N/(N-1)` 倍（N=32 → 3.2%，N=200 → 0.5%）。
+   而闭环只会把"测出来的值"拉到目标，**不会察觉偏差来自测量本身**。
+   `MEASURE_COUNT` 已加注释说明为什么不能调小。

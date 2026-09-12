@@ -1,8 +1,10 @@
 /*
  * 故障注入实现
  *
- * 三个异常各有一条触发路径,每次触发前先把说明打到串口 ——
+ * 四个异常各有一条触发路径,每次触发前先把说明打到串口 ——
  * 这样即便处理函数没跑起来,也能从"最后一行输出"判断走到哪一步。
+ *
+ * 其中前三个是致命异常(处理完停在 wfe 自旋),SVC 会返回到下一条指令。
  */
 
 #include <arch/console.h>
@@ -76,6 +78,21 @@ void fault_test_trigger(u32 selector)
                          :
                          : "r0", "lr", "memory");
         break;
+    }
+
+    case FAULT_SEL_SVC: {
+        console_puts("    svc #0 -> expect SVC handler (diagnostic only, will return)\n");
+        timer_delay_ms(50);
+
+        /*
+         * SVC 与前三个不同:它的向量(_vec_svc)没有 wfe 自旋,处理完就返回。
+         * 所以这里提前 return,避免落到下面那句"异常没有触发"的提示上 ——
+         * 对 SVC 来说"返回了"恰恰是正确结果。
+         */
+        __asm__ volatile("svc #0" ::: "memory");
+
+        console_puts("    SVC returned normally -> handler ran and returned as designed\n");
+        return;
     }
 
     default:

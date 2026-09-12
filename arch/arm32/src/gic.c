@@ -417,10 +417,17 @@ void c_undef_handler(arm_irq_frame_t *frame)
 
 void c_svc_handler(arm_irq_frame_t *frame)
 {
-    /* M1 阶段还没有用户态;走到这里说明有人主动发了 SVC */
-    console_puts("\n!!! SVC (no syscall layer yet) !!!\n");
+    /*
+     * M1 阶段还没有用户态;走到这里说明有人主动发了 SVC。
+     *
+     * ⚠ 这个处理函数**会返回**,不能打 "System halted":
+     *   vectors.S 的 _vec_svc 没有 wfe 自旋,它是 pop 之后 movs pc, lr
+     *   返回到 SVC 的下一条指令。照抄另外三个致命异常的说法会让人
+     *   以为系统停了,而实际上它继续在跑 —— 这类误导在排障时代价很高。
+     */
+    console_puts("\n!!! SVC (no syscall layer yet) - diagnostic only, returning !!!\n");
     dump_regs(frame);
-    dump_halt();
+    console_puts("  Returning to the instruction after SVC.\n");
 }
 
 void c_prefetch_abort_handler(arm_irq_frame_t *frame)
