@@ -223,7 +223,13 @@ void console_printf(const char *fmt, ...)
             break;
         }
         case 'p': {
-            u32 value = (u32)va_arg(args, void *);
+            /*
+             * 经由 uintptr_t 转换,而不是直接 (u32)va_arg(args, void *)。
+             * 直接截断指针在 32 位 ARM 上恰好能用,但在指针更宽的环境里
+             * 会被编译器判为危险转换(-Wvoid-pointer-to-int-cast)。
+             * 这个写法在两种环境下都表达同样的意图:取指针的数值。
+             */
+            u32 value = (u32)(uintptr_t)va_arg(args, void *);
             console_puts("0x");
             out_unsigned(value, 16, false, 8, true, false);
             fmt++;

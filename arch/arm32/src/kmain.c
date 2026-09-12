@@ -39,6 +39,10 @@
 #define HB_IDX_MEASBAUD  9u  /* 当前设定下实测的真实波特率(不外推) */
 #define HB_IDX_TICKS     10u /* 周期 tick 计数 */
 #define HB_IDX_IRQCOUNT  11u /* GIC 收到的中断总数 */
+#define HB_IDX_CLKSRC    12u /* 1=闭环收敛成功 2=收敛失败走兜底 */
+#define HB_IDX_CONVITER  13u /* 闭环实际迭代次数 */
+#define HB_IDX_BAUDGEN   14u /* 最终生效的 BAUDGEN */
+#define HB_IDX_BAUDDIV   15u /* 最终生效的 BAUDDIV */
 
 /* ------------------------------------------------------------------ */
 /* 周期 tick 处理函数                                                  */
@@ -152,6 +156,16 @@ void kmain(void)
     HB[HB_IDX_UARTOK]  = uart_present ? 1u : 0u;
 
     /*
+     * 把"怎么得到这个 uart_clk 的"一并记录。
+     * uart_clk 本身不足以判断可用性:收敛成功和兜底猜值可能都是同一个数字,
+     * 而只有前者能保证线路上真的是 9600。
+     */
+    HB[HB_IDX_CLKSRC]   = clock_source;
+    HB[HB_IDX_CONVITER] = uart_converge_last_iters();
+    HB[HB_IDX_BAUDGEN]  = baud_result.baudgen;
+    HB[HB_IDX_BAUDDIV]  = baud_result.bauddiv;
+
+    /*
      * ---- 4. 启动横幅 ----
      * 到这里 uart_clk 已经过闭环验证:实际波特率与 PLAT_CONSOLE_BAUD 相符,
      * 所以下面这些文字应当是终端上可以直接读到的。
@@ -164,7 +178,8 @@ void kmain(void)
 
     console_printf(" CPU          : %u Hz\n", PLAT_CPU_FREQ_HZ);
     console_printf(" Global timer : %u Hz\n", PLAT_GLOBAL_TIMER_FREQ_HZ);
-    console_printf(" UART ref clk : %u Hz (source=%u, %s)\n", uart_clk, clock_source,
+    console_printf(" UART ref clk : %u Hz (source=%u iters=%u, %s)\n", uart_clk, clock_source,
+                   uart_converge_last_iters(),
                    clock_source == 1 ? "self-calibrated" : "fallback");
     console_printf(" Baud         : requested=%u actual=%u (BAUDGEN=%u BAUDDIV=%u err=%u ppm)\n",
                    baud_result.requested, baud_result.actual, baud_result.baudgen, baud_result.bauddiv,

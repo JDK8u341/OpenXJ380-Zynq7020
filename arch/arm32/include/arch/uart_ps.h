@@ -13,17 +13,9 @@
  */
 
 #include <arch/types.h>
+#include <arch/uart_baud.h> /* uart_baud_result_t 与纯计算的分频搜索 */
 
-/* 波特率协商结果,便于诊断 */
-typedef struct
-{
-    u32 requested;   /* 请求的波特率 */
-    u32 actual;      /* 实际可达成的波特率 */
-    u32 baudgen;     /* BAUDGEN 寄存器值 */
-    u32 bauddiv;     /* BAUDDIV 寄存器值 */
-    u32 error_ppm;   /* 相对误差,单位 ppm */
-    bool valid;      /* 误差是否在可接受范围内 */
-} uart_baud_result_t;
+/* 波特率协商结果与 uart_baud_search() 见 arch/uart_baud.h */
 
 /*
  * 初始化 UART 并设置波特率。
@@ -110,3 +102,12 @@ u32 uart_measure_baud(uintptr_t base);
  * @return 收敛后的参考时钟(Hz);失败返回 0
  */
 u32 uart_converge_ref_clk(uintptr_t base, u32 target_baud);
+
+/*
+ * 上一次 uart_converge_ref_clk() 实际用掉的迭代次数(从 1 开始计)。
+ *
+ * 用途:收敛成功返回真值、和收敛失败后由调用方填兜底值,两者的返回值
+ * 可能完全相同。配合本计数就能区分"实测验证过"与"只是猜的"。
+ * 返回 0 表示上次根本没有进入迭代(探测失败或参数非法)。
+ */
+u32 uart_converge_last_iters(void);

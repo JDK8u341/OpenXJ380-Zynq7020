@@ -17,6 +17,24 @@ proc rd {a} {
     if {$i >= 0} { return [string trim [string range $s [expr {$i+1}] end]] }
     return $s
 }
+# 数值版读寄存器。用 scan 而不是 expr {0x...}:
+# expr 对 mrd 返回的异常文本(而非纯十六进制)会直接报错,
+# 而 scan 解析失败时返回 0,可以稳妥地兜到 -1。
+proc rdn {a} {
+    set s [rd $a]
+    if {[string equal $s "ERR"]} { return -1 }
+    if {[scan $s %x n] != 1} { return -1 }
+    return $n
+}
+
+# 判断"读到的是不是零"。直接做字符串比较,绕开进制解析 ——
+# 早期轮询只关心"还没写" 与 "写了非零" 两种状态。
+proc is_zero {s} {
+    if {[string equal $s "ERR"]} { return 0 }
+    if {[string equal $s "00000000"]} { return 1 }
+    if {[scan $s %x n] != 1} { return 0 }
+    return [expr {$n == 0}]
+}
 
 step "connect"
 if {[catch {connect} e]} { puts "FAIL connect: $e"; exit 1 }
@@ -54,23 +72,74 @@ rst -processor
 if {[catch {dow $ELF} e]} { puts "FAIL dow: $e"; exit 1 }
 puts "OK  PC = [lindex [rrd pc] 1]"
 
+# 清空心跳区(0x20000..0x2003F)。
+#
+# 为什么必须做:OCM 不会被 rst -processor 清零,上一次运行留下的 magic
+# 会让下面"等 magic 出现"的轮询立刻命中,于是在新内核还没走到写心跳之前
+# 就把整片区域读成 0 —— 看上去像"内核卡住了",其实是读了残影。
+# 这个坑真实发生过:串口上主循环明明在跑,JTAG 却报 loop=0/ticks=0。
+step "clear heartbeat (防陈旧数据)"
+for {set a 0x00020000} {$a <= 0x0002003C} {incr a 4} {
+    mwr -force $a 0
+}
+puts "OK"
+
 step "run"
 con
 
 step "wait for heartbeat"
-set magic 0
+set magic [rd 0x00020000]
 for {set i 0} {$i < 20} {incr i} {
-    after 500
+    after 250
     set magic [rd 0x00020000]
     if {[string match "*4F583338*" $magic]} { break }
 }
 puts "magic    = $magic"
+
+# 仅仅"magic 出现"不代表可以读整片心跳区。
+#
+# magic 在 kmain 开头就写了,而 DIRM0/TICKS/IRQCOUNT 分别在横幅之后、
+# 中断起来之后才写。9600 波特下横幅本身要 ~870ms,所以"看到 magic 立刻读"
+# 会稳定地读到一片 0 —— 曾经据此误判成"内核卡在 uart_puts"。
+# 这里改成等真正代表子系统起来的信号:周期 tick 计数非 0。
+step "wait for IRQ subsystem (ticks != 0)"
+set ticks_raw "00000000"
+for {set i 0} {$i < 40} {incr i} {
+    after 250
+    set ticks_raw [rd 0x00020028]
+    if {![is_zero $ticks_raw]} { break }
+}
+puts "ticks    = $ticks_raw"
+
+# 再多给一点时间,让主循环跑几轮,把 LOOP/GT/SW 等槽位填上
+after 1500
+
 puts "loop     = [rd 0x00020004]"
 puts "pl_led   = [rd 0x00020008]"
 puts "gt       = [rd 0x00020010]"
-puts "uart_clk = [rd 0x00020018]   <== 期望非 0(自标定成功)"
+puts "uart_clk = [rd 0x00020018]"
 puts "dirm0    = [rd 0x0002001C]"
-puts "uartok   = [rd 0x00020020]   <== 期望 1"
+puts "uartok   = [rd 0x00020020]"
+puts "measbaud = [rd 0x00020024]"
+puts "ticks    = [rd 0x00020028]"
+puts "irqcount = [rd 0x0002002C]"
+puts "clksrc   = [rd 0x00020030]   <== 1=闭环收敛 2=兜底猜值"
+puts "conviter = [rd 0x00020034]   <== 闭环迭代次数,0 表示没进迭代"
+puts "baudgen  = [rd 0x00020038]"
+puts "bauddiv  = [rd 0x0002003C]"
+
+# 交叉校验:ticks 应当约等于 uptime(ms),两者不符说明有中断被吞
+set t [rdn 0x00020028]
+set q [rdn 0x0002002C]
+puts ""
+puts ">>> ticks=$t irqcount=$q"
+if {$t > 0 && $t == $q} {
+    puts ">>> 1kHz tick 与 GIC 转发计数一致,零丢失"
+} elseif {$t > 0} {
+    puts ">>> 警告: ticks 与 irqcount 不一致,可能有中断未 EOI"
+} else {
+    puts ">>> 警告: 始终没有 tick,中断子系统未起来"
+}
 
 set u [rd 0x00020020]
 puts ""

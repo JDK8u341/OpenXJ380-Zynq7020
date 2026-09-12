@@ -33,9 +33,6 @@
 #define UART_SR_TXEMPTY 0x00000008u
 #define UART_SR_TXFULL  0x00000010u
 
-/* AMD 驱动同款上限:相对误差超过 5% 视为不可用 */
-#define UART_MAX_BAUD_ERROR_PERCENT 5u
-
 /*
  * 所有轮询循环都设自旋上限。
  *
@@ -45,6 +42,20 @@
  * 有无超时决定了"没有串口"是表现为可诊断的降级,还是表现为整机挂死。
  */
 #define UART_POLL_LIMIT 2000000u
+
+/*
+ * 上一次闭环收敛实际用掉的迭代次数。
+ *
+ * 之所以要把它暴露出来:收敛"返回 100.5MHz"和"失败后用 100.5MHz 兜底"
+ * 在心跳里长得一模一样,而这两者的含义完全相反 ——
+ * 一个是"实测验证过",一个是"猜的"。没有这个计数就无法区分。
+ */
+static u32 g_converge_iters;
+
+u32 uart_converge_last_iters(void)
+{
+    return g_converge_iters;
+}
 
 /* 打开指定 UART 的 AMBA 外设时钟。SLCR 需要先解锁 */
 static void uart_enable_aper_clock(uintptr_t base)
@@ -97,15 +108,25 @@ bool uart_probe(uintptr_t base)
 
 void uart_init(uintptr_t base, u32 uart_clk, u32 baud, uart_baud_result_t *result)
 {
-    u32 best_baudgen   = 0;
-    u32 best_bauddiv   = 0;
-    u32 best_error     = 0xFFFFFFFFu;
-    u32 iter_bauddiv;
-    u32 input_clk = uart_clk;
+    /*
+     * result 允许为 NULL(调用方只想要副作用,不关心协商结果)。
+     * 内部统一改用局部变量,避免后面解引用空指针。
+     *
+     * 这里踩过一次:重构时把分频搜索挪进 uart_baud_search() 之后,
+     * 忘了 result 可能是 NULL,于是 uart_converge_ref_clk() 传 NULL 进来时
+     * 直接往地址 0 写。ARM 关闭 MMU 时地址 0 是 OCM 且可写,
+     * 所以既不崩溃也不报错,只是静默配上错误的波特率 ——
+     * 串口只剩一堆 0x00,极难定位。
+     */
+    uart_baud_result_t local;
+    uart_baud_result_t *out = (result != NULL) ? result : &local;
 
-    if (result != NULL) {
-        result->valid = false;
-    }
+    out->requested = baud;
+    out->baudgen   = 0;
+    out->bauddiv   = 0;
+    out->actual    = 0;
+    out->error_ppm = 0;
+    out->valid     = false;
 
     /* 探测外设是否存在(顺带打开 APER 时钟)。不存在则不做任何后续配置 */
     if (!uart_probe(base)) {
@@ -128,43 +149,21 @@ void uart_init(uintptr_t base, u32 uart_clk, u32 baud, uart_baud_result_t *resul
     }
 
     /*
-     * 遍历 BAUDDIV 4..254,找使实际波特率最接近目标的组合。
-     * 这是 AMD XUartPs_SetBaudRate 的同一算法。
+     * 分频搜索本身是纯计算,挪到 uart_baud.c 以便在宿主机上单测
+     * (这段数学曾出过 7 倍偏差的 bug,见 uart_baud.h)。
      */
-    for (iter_bauddiv = 4; iter_bauddiv < 255; iter_bauddiv++) {
-        u32 baudgen = input_clk / (baud * (iter_bauddiv + 1));
-        u32 actual;
-        u32 error;
+    uart_baud_search(uart_clk, baud, out);
 
-        if (baudgen == 0) {
-            continue; /* 分频值过小,跳过 */
-        }
-
-        actual = input_clk / (baudgen * (iter_bauddiv + 1));
-        error  = (baud > actual) ? (baud - actual) : (actual - baud);
-
-        if (error < best_error) {
-            best_error   = error;
-            best_baudgen = baudgen;
-            best_bauddiv = iter_bauddiv;
-        }
+    if (out->baudgen == 0) {
+        return; /* 没有可用组合 */
     }
 
-    mmio_write32(base + UART_BAUDGEN, best_baudgen);
-    mmio_write32(base + UART_BAUDDIV, best_bauddiv);
+    mmio_write32(base + UART_BAUDGEN, out->baudgen);
+    mmio_write32(base + UART_BAUDDIV, out->bauddiv);
 
     /* 再次复位收发逻辑,然后使能 */
     mmio_write32(base + UART_CR, UART_CR_TXRST | UART_CR_RXRST);
     mmio_write32(base + UART_CR, UART_CR_TXEN | UART_CR_RXEN);
-
-    if (result != NULL) {
-        result->requested = baud;
-        result->baudgen   = best_baudgen;
-        result->bauddiv   = best_bauddiv;
-        result->actual    = (best_baudgen == 0) ? 0 : input_clk / (best_baudgen * (best_bauddiv + 1));
-        result->error_ppm = (baud == 0) ? 0 : (best_error * 1000000u) / baud;
-        result->valid     = (best_error * 100u) / baud <= UART_MAX_BAUD_ERROR_PERCENT;
-    }
 }
 
 void uart_putc(uintptr_t base, char c)
@@ -284,6 +283,26 @@ u32 uart_calibrate_ref_clk(uintptr_t base)
 /* 实测当前配置下的真实波特率                                          */
 /* ------------------------------------------------------------------ */
 
+/*
+ * 测量时发送的字符数。
+ *
+ * ⚠ 不要为了"减少串口噪声"把它调小 —— 这会直接破坏测量精度。
+ *
+ * 这些字符会真的出现在串口上(测量靠计时发送才能反映线上真实速率),
+ * 看着像噪声,但数量受一个硬约束:
+ *
+ *   UART_SR 的 TXEMPTY 表示 TX FIFO 为空,而最后一个字节此时还在
+ *   移位寄存器里没发完。所以"从空到空"的计时窗口实际只覆盖了
+ *   MEASURE_COUNT-1 个字符,算出来的波特率被高估 N/(N-1) 倍。
+ *
+ *   N=32  -> 高估 3.2%,闭环被这个偏差带偏,收敛到 103.17MHz(实测);
+ *   N=200 -> 高估 0.5%,落在闭环 0.5% 的收敛判据内,一次迭代收敛,
+ *            实测精确得到 100000000Hz / BAUDGEN=1736 / 0ppm。
+ *
+ * 换句话说:N 越小噪声越少,但系统误差越大,而闭环只会把
+ * "测出来的值"拉到目标,不会察觉这个偏差是测量本身的。
+ * 200 是实测验证过能收敛到正确参考时钟的最小档位。
+ */
 #define MEASURE_COUNT 200u
 
 /*
@@ -349,6 +368,8 @@ u32 uart_converge_ref_clk(uintptr_t base, u32 target_baud)
     u32 f_ref = 100000000u; /* 初值取 Xilinx 常见默认;闭环会把它拉到位 */
     u32 iter;
 
+    g_converge_iters = 0;
+
     if (!uart_probe(base) || target_baud == 0) {
         return 0;
     }
@@ -366,6 +387,8 @@ u32 uart_converge_ref_clk(uintptr_t base, u32 target_baud)
     for (iter = 0; iter < 12; iter++) {
         u32 measured;
         u32 diff;
+
+        g_converge_iters = iter + 1u;
 
         uart_init(base, f_ref, target_baud, NULL);
         measured = uart_measure_baud(base);
