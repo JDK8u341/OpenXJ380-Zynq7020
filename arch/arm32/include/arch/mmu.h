@@ -198,11 +198,21 @@
 #define MMU_ATTR_NON_SHAREABLE  (~MMU_ATTR_S_BIT)
 
 /*
- * XN(Execute Never)。Xilinx 用 (1<<4)|(1<<0) 一个常量同时覆盖一级和二级 ——
- * 因为一级段的 XN 在 bit4、二级小页的 XN 在 bit0。
- * 直接或进去即可,但要知道它对不同级别命中的是不同位。
+ * XN(Execute Never)。
+ *
+ * ⚠ Xilinx 的 xil_mmu.h 只给了一个常量:
+ *     #define EXECUTE_NEVER ((0x1 << 4) | (0x1 << 0))
+ *   它**只能用在二级描述符上**。照抄到一级段上会当场毁掉整段:
+ *     一级段的 XN 在 bit4,而 bit0 是**类型位**的一半(段 = 0b10);
+ *     把 bit0 也置 1,类型就变成 0b11 = reserved,该段立刻失效;
+ *     二级小页才是 0b1x,bit0 正好是 XN。
+ *
+ *   所以这里拆成两个级别专用的常量,不提供任何"合并版",
+ *   以免再出现"一个常量看起来通用、实际只能用于其中一级"的情况。
+ *   (mmu_l1_section_attr / mmu_l2_small_page_attr 的 xn 参数已覆盖此需求)
  */
-#define MMU_ATTR_XN             ((1u << 4) | (1u << 0))
+#define MMU_L1_ATTR_XN  (1u << 4)
+#define MMU_L2_ATTR_XN  (1u << 0)
 
 /* ------------------------------------------------------------------ */
 /* CP15 相关位定义                                                      */
@@ -343,3 +353,68 @@ typedef enum
 } mmu_l1_check_t;
 
 mmu_l1_check_t mmu_l1_table_check(const u32 *table);
+
+/* ------------------------------------------------------------------ */
+/* 地址映射区域表                                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 一段连续物理内存的映射描述。
+ *
+ * base 与 size 都必须是 1MB(段大小)的整数倍 —— 本阶段只做段映射,
+ * 不支持半段。mmu_regions_check() 会强制这一点。
+ */
+typedef struct
+{
+    u32         base;
+    u32         size;
+    u32         attr;  /* MMU_ATTR_* */
+    const char *name;
+} mmu_region_t;
+
+/* 区域表自检的错误码 */
+typedef enum
+{
+    MMU_REGIONS_OK = 0,
+    MMU_REGIONS_UNSORTED = 1,     /* 未按地址升序 */
+    MMU_REGIONS_OVERLAP = 2,      /* 两段区域重叠 */
+    MMU_REGIONS_MISALIGNED = 3,   /* base 或 size 不是 1MB 的整数倍 */
+    MMU_REGIONS_OUT_OF_RANGE = 4, /* 越过 4GB 地址空间上界 */
+    MMU_REGIONS_TOO_MANY = 5,     /* 段数超出单段上限 */
+} mmu_regions_check_t;
+
+/*
+ * 取得内置的 Zynq-7020 映射区域表。
+ * count_out 可传 NULL。返回的指针指向静态常量,不需要释放。
+ */
+const mmu_region_t *mmu_regions(u32 *count_out);
+
+/*
+ * 自检区域表。
+ *
+ * 为什么值得单独做:区域表**没有在别处出现第二次**,
+ * 所以重叠或乱序不会被任何编译器或运行时检查发现 ——
+ * 后果是后写入的区域静默覆盖前一个,而页表看上去完全正常。
+ * 启动时调用一次,把这类问题挡在开 MMU 之前。
+ */
+mmu_regions_check_t mmu_regions_check(void);
+
+/*
+ * 按区域表填充整个一级表。
+ *
+ * 先把 4096 项全部写成 fault,再逐区域写入段描述符 ——
+ * 于是"没被任何区域覆盖"的地址一律产生 translation fault,
+ * 而不是悄悄落到某个设备上。这比 Xilinx 原表把大片保留区
+ * 也填成有效映射更安全:访问到不存在的从设备会得到清晰的
+ * 转换故障,而不是一次可能挂死总线的 AXI 事务。
+ *
+ * table 必须 16KB 对齐(用 mmu_l1_table_check 校验)。
+ */
+void mmu_build_l1_table(u32 *table);
+
+/*
+ * 诊断:返回某个地址在一级表里对应的区域名(如 "DDR")。
+ * 找不到时返回 "unmapped"。用于把页表打进串口/JTAG 时快速定位。
+ */
+const char *mmu_region_name_for(u32 addr);
+

@@ -20,6 +20,18 @@
  */
 
 #include <arch/mmu.h>
+#include <arch/platform.h>
+
+/*
+ * 编译期确认区域表里的字面量与板级描述符一致。
+ *
+ * 这两处描述的是同一件事(DDR 在哪、多大),但一个在 platform.h、
+ * 一个在本文件的区域表里。若只改一处,页表会安静地映射错范围 ——
+ * 所以让它在编译期就报错,而不是等到板上跑飞。
+ */
+_Static_assert(PLAT_DDR_BASE == 0x00100000u, "region table disagrees with PLAT_DDR_BASE");
+_Static_assert(PLAT_DDR_SIZE == 0x3FF00000u, "region table disagrees with PLAT_DDR_SIZE");
+_Static_assert(PLAT_OCM_BASE == 0x00000000u, "region table disagrees with PLAT_OCM_BASE");
 
 /* ------------------------------------------------------------------ */
 /* 属性组合                                                             */
@@ -194,4 +206,159 @@ mmu_l1_check_t mmu_l1_table_check(const u32 *table)
     }
 
     return MMU_L1_CHECK_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* 地址映射区域表                                                       */
+/* ------------------------------------------------------------------ */
+
+/* 区域表上限。真表只有 6 项,给足余量即可,超出说明写错了 */
+#define MMU_REGION_LIMIT 32u
+
+/* 单个 1MB 段。低 1MB 承载 OCM(256KB)与心跳 */
+#define MMU_LOW_1MB_BASE 0x00000000u
+#define MMU_LOW_1MB_SIZE 0x00100000u
+
+/*
+ * 映射区域表(恒等映射:虚拟地址 == 物理地址)。
+ *
+ * 与 Xilinx 原表的三处**有意偏离**,逐条说明理由:
+ *
+ * 1. 低 1MB 用 Normal Non-cacheable 而不是 WB。
+ *    OCM 里放着 OCM 心跳(0x20000),那是 JTAG 唯一的观测通道。
+ *    JTAG 走 DAP/AXI 直接读物理内存,**不经过 CPU 的 L1/L2** ——
+ *    一旦这段被当成写回可缓存,心跳写进去只是躺在 cache 里,
+ *    JTAG 读到的是陈旧值。偏偏 MMU 刚开的那几次调试最依赖它,
+ *    所以这里宁可损失一点性能也要保住这条通道。
+ *    (OCM 是片上存储,本身访问就快,不可缓存的代价很小。)
+ *
+ * 2. 高位 OCM 别名(0xFFF00000)用与低位**相同**的属性。
+ *    两者是同一块物理内存的两种映射。以不同缓存属性映射同一物理位置
+ *    在架构上是 UNPREDICTABLE,虽然当前不访问高位别名,
+ *    但保持一致的代价为零。
+ *
+ * 3. 未列出的地址一律是 fault,而不是像 Xilinx 那样把大片保留区
+ *    也填成有效映射。本板实际只有 6 处外设,Xilinx 表覆盖的
+ *    NAND/NOR/QSPI-XIP 等在这块板子上都不存在。
+ *    访问不存在的从设备会得到清晰的 translation fault,
+ *    而不是一次可能挂死 AXI 总线的事务。
+ *
+ * 属性取值见头文件;每个都标注了位域解码。
+ */
+static const mmu_region_t g_regions[] = {
+    {MMU_LOW_1MB_BASE, MMU_LOW_1MB_SIZE, MMU_ATTR_NORMAL_NC, "OCM + heartbeat (JTAG-visible)"},
+    {PLAT_DDR_BASE, PLAT_DDR_SIZE, MMU_ATTR_NORMAL_WB, "DDR"},
+    /*
+     * PL 用强序,与 Xilinx 一致。
+     * 本板只在 0x41200000 挂了 AXI GPIO,其余地址访问会 AXI 解码失败;
+     * 强序不做推测访问,正是这里想要的(见计划 §2.15 的 ARM 794073)。
+     */
+    {0x40000000u, 0x80000000u, MMU_ATTR_STRONG_ORDERED, "PL (AXI GP0/GP1)"},
+    /* PS 外设:UART0/1、I2C、SPI、CAN、GEM、GPIO、QSPI、SD 等 */
+    {0xE0000000u, 0x00300000u, MMU_ATTR_DEVICE, "PS peripherals"},
+    /* SLCR、SCU、GIC、全局定时器、私有定时器控制 */
+    {0xF8000000u, 0x01000000u, MMU_ATTR_DEVICE, "SLCR / SCU / GIC"},
+    /*
+     * 高位 OCM 别名。注意这一段(1MB 粒度)实际上把
+     * OCM 别名、BootROM 与若干保留区都圈了进去 ——
+     * 1MB 粒度下无法细分,所以整体按不可缓存处理:
+     * 这里没有任何东西需要被缓存,但误缓存 BootROM 会有麻烦。
+     */
+    {0xFFF00000u, 0x00100000u, MMU_ATTR_NORMAL_NC, "OCM high alias / BootROM"},
+};
+
+const mmu_region_t *mmu_regions(u32 *count_out)
+{
+    if (count_out != NULL) {
+        *count_out = (u32)(sizeof(g_regions) / sizeof(g_regions[0]));
+    }
+    return g_regions;
+}
+
+mmu_regions_check_t mmu_regions_check(void)
+{
+    u32                count = 0;
+    const mmu_region_t *regions = mmu_regions(&count);
+    u32                i;
+
+    if (count == 0u || count > MMU_REGION_LIMIT) {
+        return MMU_REGIONS_TOO_MANY;
+    }
+
+    for (i = 0; i < count; i++) {
+        u64 base = (u64)regions[i].base;
+        u64 size = (u64)regions[i].size;
+
+        if (size == 0u || (base % MMU_SECTION_SIZE) != 0u || (size % MMU_SECTION_SIZE) != 0u) {
+            return MMU_REGIONS_MISALIGNED;
+        }
+
+        /*
+         * 用 64 位算上界:0xFFF00000 + 0x100000 恰好是 0x100000000,
+         * 在 32 位里会绕回 0 而被误判成"没越界"。
+         */
+        if (base + size > 0x100000000ULL) {
+            return MMU_REGIONS_OUT_OF_RANGE;
+        }
+
+        if (i > 0u) {
+            u64 prev_base = (u64)regions[i - 1u].base;
+            u64 prev_end = prev_base + (u64)regions[i - 1u].size;
+
+            if (base < prev_base) {
+                return MMU_REGIONS_UNSORTED;
+            }
+            if (base < prev_end) {
+                return MMU_REGIONS_OVERLAP;
+            }
+        }
+    }
+
+    return MMU_REGIONS_OK;
+}
+
+void mmu_build_l1_table(u32 *table)
+{
+    u32       count = 0;
+    const mmu_region_t *regions = mmu_regions(&count);
+    u32       i;
+    u32       j;
+
+    /*
+     * 先全部填成 fault。
+     *
+     * fault 描述符的值就是 0(类型位 0b00),所以未列出的地址
+     * 访问即产生 translation fault —— 这正是"没映射"应有的行为。
+     */
+    for (i = 0; i < MMU_L1_ENTRY_COUNT; i++) {
+        table[i] = MMU_ATTR_RESERVED;
+    }
+
+    for (i = 0; i < count; i++) {
+        u32 first_index = regions[i].base >> MMU_SECTION_SHIFT;
+        u32 sections = regions[i].size >> MMU_SECTION_SHIFT;
+
+        for (j = 0; j < sections; j++) {
+            u32 pa = regions[i].base + (j << MMU_SECTION_SHIFT);
+
+            table[first_index + j] = mmu_section_descriptor(pa, regions[i].attr);
+        }
+    }
+}
+
+const char *mmu_region_name_for(u32 addr)
+{
+    u32       count = 0;
+    const mmu_region_t *regions = mmu_regions(&count);
+    u32       i;
+
+    for (i = 0; i < count; i++) {
+        /* 上界用 64 位,理由同 mmu_regions_check */
+        if ((u64)addr >= (u64)regions[i].base &&
+            (u64)addr < (u64)regions[i].base + (u64)regions[i].size) {
+            return regions[i].name;
+        }
+    }
+
+    return "unmapped";
 }

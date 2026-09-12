@@ -59,6 +59,29 @@ static void check_u32(unsigned int got, unsigned int want, const char *what)
     }
 }
 
+/* 前缀匹配。只比首字母不够 —— "PS peripherals" 与 "PL (AXI GP)" 都是 'P' */
+static int starts_with(const char *text, const char *prefix)
+{
+    while (*prefix != '\0') {
+        if (*text != *prefix) {
+            return 0;
+        }
+        text++;
+        prefix++;
+    }
+    return 1;
+}
+
+static void check_region(u32 addr, const char *want, const char *what)
+{
+    const char *got = mmu_region_name_for(addr);
+
+    if (!starts_with(got, want)) {
+        printf("FAIL: %s (addr 0x%08X -> \"%s\", want \"%s\")\n", what, addr, got, want);
+        failures++;
+    }
+}
+
 int main(void)
 {
     /* ============================================================== */
@@ -281,6 +304,177 @@ int main(void)
               "an L2 table covers exactly one section");
     check_u32(MMU_L1_TABLE_ALIGN, MMU_L1_TABLE_SIZE, "L1 alignment equals its size");
     check_u32(MMU_L2_TABLE_ALIGN, MMU_L2_TABLE_SIZE, "L2 alignment equals its size");
+
+    /* ============================================================== */
+    /* 8. XN 常量必须分级,不能有一个"通用"版本                       */
+    /* ============================================================== */
+    {
+        /*
+         * Xilinx 只给了一个 EXECUTE_NEVER = (1<<4)|(1<<0)。
+         * 它在二级小页上是对的(小页 0b1x,bit0 就是 XN),
+         * 但或到一级段上会把类型位从 0b10 变成 0b11 = reserved,
+         * 整段当场失效。这里把这个陷阱钉死。
+         */
+        unsigned int good = MMU_ATTR_NORMAL_NC | MMU_L1_ATTR_XN;
+        unsigned int bad = MMU_ATTR_NORMAL_NC | MMU_L2_ATTR_XN;
+
+        check(MMU_L1_ATTR_XN == (1u << 4), "L1 XN is bit4");
+        check(MMU_L2_ATTR_XN == (1u << 0), "L2 XN is bit0");
+
+        check(MMU_IS_L1_SECTION(good), "L1 XN keeps the section type intact");
+        check(!MMU_IS_L1_SECTION(bad), "applying the L2 XN bit to an L1 section destroys it");
+        check_u32(bad & MMU_DESC_TYPE_MASK, MMU_L1_TYPE_RESERVED,
+                  "the L2 XN bit turns an L1 section into a reserved descriptor");
+    }
+
+    /* ============================================================== */
+    /* 9. 区域表自检                                                  */
+    /* ============================================================== */
+    {
+        u32 count = 0;
+        const mmu_region_t *regions = mmu_regions(&count);
+
+        check(mmu_regions_check() == MMU_REGIONS_OK, "region table must pass its own check");
+        check(count > 0u, "region table must not be empty");
+        check(regions != NULL, "region table pointer must not be NULL");
+
+        /* 升序且不重叠:重叠会让后写的区域静默覆盖前一个 */
+        {
+            u32 i;
+            for (i = 1; i < count; i++) {
+                unsigned long long prev_end =
+                    (unsigned long long)regions[i - 1].base + regions[i - 1].size;
+                check((unsigned long long)regions[i].base >= prev_end,
+                      "regions must be sorted and non-overlapping");
+            }
+        }
+
+        check_u32(mmu_regions(NULL) == regions, 1u, "mmu_regions(NULL) must still return the table");
+    }
+
+    /* ============================================================== */
+    /* 10. 建表结果:逐点核对关键地址                                  */
+    /* ============================================================== */
+    {
+        static unsigned int table[MMU_L1_ENTRY_COUNT];
+
+        mmu_build_l1_table(table);
+
+        /* -- 低 1MB:OCM + 心跳,必须不可缓存,否则 JTAG 读到陈旧值 -- */
+        check_u32(table[mmu_l1_index(0x00000000u)], 0x11DE2u, "OCM section must be Normal NC");
+        check_u32(table[mmu_l1_index(0x00020000u)], 0x11DE2u, "heartbeat is inside the NC section");
+
+        /* -- DDR:内核所在的段必须是写回可缓存 -- */
+        check_u32(table[mmu_l1_index(0x00100000u)], 0x15DE6u | 0x00100000u, "kernel load section");
+        check_u32(table[mmu_l1_index(0x3FF00000u)], 0x15DE6u | 0x3FF00000u, "last DDR section");
+        check(mmu_descriptor_pa(table[mmu_l1_index(0x00100000u)], 1) == 0x00100000u,
+              "identity mapping: VA == PA for the kernel");
+
+        /* -- PL:AXI GPIO 在强序段里 -- */
+        check_u32(table[mmu_l1_index(0x41200000u)] & 0xFFFFFu, 0xC02u,
+                  "AXI GPIO section must be Strongly-Ordered");
+        check_u32(mmu_descriptor_pa(table[mmu_l1_index(0x41200000u)], 1), 0x41200000u,
+                  "AXI GPIO identity mapping");
+
+        /* -- PS 外设:UART1 -- */
+        check_u32(mmu_l1_index(0xE0001000u), mmu_l1_index(0xE0000000u),
+                  "UART1 must share a section with the start of PS peripherals");
+        check_u32(table[mmu_l1_index(0xE0001000u)] & 0xFFFFFu, 0xC06u,
+                  "UART1 section must be Device");
+
+        /* -- SLCR / SCU / GIC -- */
+        check_u32(table[mmu_l1_index(0xF8000000u)] & 0xFFFFFu, 0xC06u, "SLCR must be Device");
+        check_u32(table[mmu_l1_index(0xF8F00000u)] & 0xFFFFFu, 0xC06u, "SCU must be Device");
+        check_u32(table[mmu_l1_index(0xF8F01000u)] & 0xFFFFFu, 0xC06u, "GIC distributor must be Device");
+        check_u32(table[mmu_l1_index(0xF8F00100u)] & 0xFFFFFu, 0xC06u, "GIC CPU interface must be Device");
+
+        /* -- 高位 OCM 别名:与低位属性一致 -- */
+        check_u32(table[mmu_l1_index(0xFFF00000u)], 0x11DE2u | 0xFFF00000u,
+                  "high OCM alias must use the same attribute as the low one");
+
+        /* -- 未映射区必须是 fault,而不是悄悄落到设备上 -- */
+        check_u32(table[mmu_l1_index(0xC0000000u)], 0u, "reserved 0xC0000000 must fault");
+        check_u32(table[mmu_l1_index(0xE0300000u)], 0u, "the hole after PS peripherals must fault");
+        check_u32(table[mmu_l1_index(0xE1000000u)], 0u, "absent NAND/NOR must fault");
+        check_u32(table[mmu_l1_index(0xFC000000u)], 0u, "unused QSPI XIP window must fault");
+        check_u32(table[mmu_l1_index(0xFFE00000u)], 0u, "the hole below the high OCM must fault");
+
+        /* -- 全局不变量 1:不允许出现 reserved 类型(0b11) -- */
+        /*
+         * 一级描述符类型 0b11 是保留值,行为不可预测。
+         * 它最可能的来源就是把二级的 XN 位或到一级段上(见第 8 节),
+         * 所以整表扫一遍,把这类错误挡在开 MMU 之前。
+         */
+        {
+            u32 i;
+            u32 reserved_count = 0;
+            u32 mapped_count = 0;
+
+            for (i = 0; i < MMU_L1_ENTRY_COUNT; i++) {
+                if ((table[i] & MMU_DESC_TYPE_MASK) == MMU_L1_TYPE_RESERVED) {
+                    reserved_count++;
+                }
+                if (MMU_IS_L1_SECTION(table[i])) {
+                    mapped_count++;
+                }
+            }
+
+            check_u32(reserved_count, 0u, "no L1 entry may use the reserved type 0b11");
+
+            /* -- 全局不变量 2:映射段数 == 区域表声明的段数总和 -- */
+            {
+                u32 count = 0;
+                const mmu_region_t *regions = mmu_regions(&count);
+                u32 expected = 0;
+                u32 i2;
+
+                for (i2 = 0; i2 < count; i2++) {
+                    expected += regions[i2].size >> MMU_SECTION_SHIFT;
+                }
+
+                check_u32(mapped_count, expected,
+                          "mapped section count must equal the sum declared by the region table");
+                check(mapped_count < MMU_L1_ENTRY_COUNT,
+                      "unmapped addresses must remain as faults, not be filled in");
+            }
+        }
+
+        /* -- 恒等映射:每个已映射段的描述符地址必须等于段基址 -- */
+        {
+            u32 i;
+            u32 mismatched = 0;
+
+            for (i = 0; i < MMU_L1_ENTRY_COUNT; i++) {
+                if (MMU_IS_L1_SECTION(table[i])) {
+                    if (mmu_descriptor_pa(table[i], 1) != (i << MMU_SECTION_SHIFT)) {
+                        mismatched++;
+                    }
+                }
+            }
+
+            check_u32(mismatched, 0u, "every mapped section must be an identity mapping");
+        }
+    }
+
+    /* ============================================================== */
+    /* 11. 区域名查询(诊断输出用)                                     */
+    /* ============================================================== */
+    {
+        check_region(0x00020000u, "OCM + heartbeat", "heartbeat address");
+        check_region(0x00000000u, "OCM + heartbeat", "start of the low 1MB");
+        check_region(0x00100000u, "DDR", "kernel load address");
+        check_region(0x3FFFFFFFu, "DDR", "last byte of DDR");
+        check_region(0x41200000u, "PL (AXI GP", "AXI GPIO address");
+        check_region(0xE0001000u, "PS peripherals", "UART1");
+        check_region(0xF8F01000u, "SLCR", "GIC distributor");
+        check_region(0xFFF00000u, "OCM high alias", "start of the high OCM alias");
+        check_region(0xFFFFFFFFu, "OCM high alias", "very last byte of the address space");
+
+        /* 未映射区必须报 unmapped,而不是被某个区域误覆盖 */
+        check_region(0xC0000000u, "unmapped", "reserved 0xC0000000");
+        check_region(0xE0300000u, "unmapped", "the hole after PS peripherals");
+        check_region(0xFFE00000u, "unmapped", "the hole below the high OCM");
+    }
 
     if (failures == 0) {
         printf("ALL PASS\n");
