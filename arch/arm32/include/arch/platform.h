@@ -207,14 +207,32 @@
 /*
  * 心跳区:放在 OCM 内,程序链接位置无关。
  * JTAG 可直接用 mrd 0x00020000 读回,无需串口。
- *   [0]=magic [1]=步进计数 [2]=PL LED 图案 [3]=拨码开关值
- *   [4]=全局定时器 [5]=PS LED 状态 [6]=DIRM_0 [7]=OEN_0
+ *
+ * 槽位语义见 arch/heartbeat.h —— 那里是唯一定义处,不要在这里重复列举。
+ * (这段注释原先列了一份槽位表,在心跳扩展到 16 槽之后就一直是错的:
+ *  它把 [6] 写成 DIRM_0,而实际 [6] 是 UART 参考时钟。
+ *  过期文档比没有文档更糟,所以改成指向定义处。)
+ *
+ * ⚠ 心跳区所在的低 1MB 在页表里被映射为**不可缓存**(见 src/mmu.c 的区域表),
+ *   这是有意的:JTAG 走 DAP/AXI 直接读物理内存,不经过 CPU 的 L1/L2,
+ *   一旦这段是写回可缓存,心跳就只是躺在 cache 里,JTAG 会读到陈旧值。
  */
 #define PLAT_HEARTBEAT_BASE 0x00020000u
 #define PLAT_HEARTBEAT_MAGIC 0x4F583338u /* "OXJ8" */
 
 /*
- * 故障注入选择器。放在心跳区之后,由 JTAG 写入以触发指定异常,
- * 见 arch/fault_test.h 与 arch/arm32/README.md 的验证章节。
+ * 故障注入选择器。
+ *
+ * ⚠ 位置不是随便挑的:它必须**紧接在心跳区预留容量之后**。
+ *   心跳区占地 0x00020000..0x0002007F(32 槽),选择器从 0x00020080 开始。
+ *
+ *   这个边界是踩出来的:最初选择器放在 0x00020040,也就是第 16 槽,
+ *   而心跳后来扩展到了第 16 槽(MMU 阶段标记)——
+ *   两者一旦撞上,fault_test_poll() 会把 MMU 写的进度号当成注入码,
+ *   随机触发异常,而且症状是"内核莫名奇妙进了 Data Abort"。
+ *   arch/heartbeat.h 里有静态断言双向锁住这条边界。
+ *
+ * 由 JTAG 写入以触发指定异常,见 arch/fault_test.h。
  */
-#define PLAT_FAULT_SEL_ADDR 0x00020040u
+#define PLAT_HEARTBEAT_REGION_SLOTS 32u
+#define PLAT_FAULT_SEL_ADDR 0x00020080u

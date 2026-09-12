@@ -16,6 +16,7 @@
 
 #include <arch/console.h>
 #include <arch/fault_test.h>
+#include <arch/heartbeat.h>
 #include <arch/io.h>
 #include <arch/irq.h>
 #include <arch/led.h>
@@ -24,25 +25,11 @@
 #include <arch/types.h>
 #include <arch/uart_ps.h>
 
-/* 心跳区:与平台头文件约定一致,可用 xsdb mrd 读回 */
-#define HB ((volatile u32 *)PLAT_HEARTBEAT_BASE)
-
-#define HB_IDX_MAGIC     0u
-#define HB_IDX_LOOP      1u
-#define HB_IDX_LED       2u
-#define HB_IDX_SW        3u
-#define HB_IDX_GT        4u
-#define HB_IDX_PSLED     5u
-#define HB_IDX_UARTCLK   6u
-#define HB_IDX_DIRM0     7u
-#define HB_IDX_UARTOK    8u
-#define HB_IDX_MEASBAUD  9u  /* 当前设定下实测的真实波特率(不外推) */
-#define HB_IDX_TICKS     10u /* 周期 tick 计数 */
-#define HB_IDX_IRQCOUNT  11u /* GIC 收到的中断总数 */
-#define HB_IDX_CLKSRC    12u /* 1=闭环收敛成功 2=收敛失败走兜底 */
-#define HB_IDX_CONVITER  13u /* 闭环实际迭代次数 */
-#define HB_IDX_BAUDGEN   14u /* 最终生效的 BAUDGEN */
-#define HB_IDX_BAUDDIV   15u /* 最终生效的 BAUDDIV */
+/*
+ * 心跳槽位定义在 arch/heartbeat.h —— 它是跨模块契约:
+ * 写这个区的除了本文件,还有那些"中途可能回不来、必须自己留标记"
+ * 的模块(如 MMU 启动)。槽位定义只能有一处。
+ */
 
 /* ------------------------------------------------------------------ */
 /* 周期 tick 处理函数                                                  */
@@ -98,7 +85,7 @@ void kmain(void)
      * 所以先做 LED:即使后面串口标定失败,板上也一定有可见反馈。
      */
     led_init();
-    HB[HB_IDX_MAGIC] = PLAT_HEARTBEAT_MAGIC;
+    HB[HB_SLOT_MAGIC] = PLAT_HEARTBEAT_MAGIC;
 
     /* ---- 2. 时间基准 ---- */
     /*
@@ -152,18 +139,18 @@ void kmain(void)
         console_init(PLAT_CONSOLE_UART_BASE, uart_clk, PLAT_CONSOLE_BAUD);
     }
 
-    HB[HB_IDX_UARTCLK] = uart_clk;
-    HB[HB_IDX_UARTOK]  = uart_present ? 1u : 0u;
+    HB[HB_SLOT_UARTCLK] = uart_clk;
+    HB[HB_SLOT_UARTOK]  = uart_present ? 1u : 0u;
 
     /*
      * 把"怎么得到这个 uart_clk 的"一并记录。
      * uart_clk 本身不足以判断可用性:收敛成功和兜底猜值可能都是同一个数字,
      * 而只有前者能保证线路上真的是 9600。
      */
-    HB[HB_IDX_CLKSRC]   = clock_source;
-    HB[HB_IDX_CONVITER] = uart_converge_last_iters();
-    HB[HB_IDX_BAUDGEN]  = baud_result.baudgen;
-    HB[HB_IDX_BAUDDIV]  = baud_result.bauddiv;
+    HB[HB_SLOT_CLKSRC]   = clock_source;
+    HB[HB_SLOT_CONVITER] = uart_converge_last_iters();
+    HB[HB_SLOT_BAUDGEN]  = baud_result.baudgen;
+    HB[HB_SLOT_BAUDDIV]  = baud_result.bauddiv;
 
     /*
      * ---- 4. 启动横幅 ----
@@ -197,7 +184,7 @@ void kmain(void)
         console_puts(" WARNING: baud error out of range, output may be garbled.\n\n");
     }
 
-    HB[HB_IDX_DIRM0] = led_get_dirm0();
+    HB[HB_SLOT_DIRM0] = led_get_dirm0();
 
     /* ---- 5. 中断子系统(GIC + 周期 tick) ---- */
     /*
@@ -235,7 +222,7 @@ void kmain(void)
         console_puts(" WARNING: no tick observed - GIC or timer not delivering.\n\n");
     }
 
-    HB[HB_IDX_TICKS] = g_tick_seen;
+    HB[HB_SLOT_TICKS] = g_tick_seen;
 
     /* ---- 6. 主循环 ---- */
     /*
@@ -256,7 +243,7 @@ void kmain(void)
         if (ps_ph != last_ps) {
             led_ps_set(ps_ph != 0);
             last_ps = ps_ph;
-            HB[HB_IDX_PSLED] = ps_ph;
+            HB[HB_SLOT_PSLED] = ps_ph;
         }
 
         if (step != last_step) {
@@ -269,10 +256,10 @@ void kmain(void)
             last_step = step;
             loop_count++;
 
-            HB[HB_IDX_LOOP] = loop_count;
-            HB[HB_IDX_LED]  = bar ^ sw;
-            HB[HB_IDX_SW]   = sw;
-            HB[HB_IDX_GT]   = gt;
+            HB[HB_SLOT_LOOP] = loop_count;
+            HB[HB_SLOT_LED]  = bar ^ sw;
+            HB[HB_SLOT_SW]   = sw;
+            HB[HB_SLOT_GT]   = gt;
         }
 
         if (uart_present) {
@@ -288,11 +275,11 @@ void kmain(void)
                  *   irq_count —— GIC 实际转发的中断总数
                  * 两者若明显不符,说明有中断被吞或未被 EOI。
                  */
-                HB[HB_IDX_TICKS]    = g_tick_seen;
-                HB[HB_IDX_IRQCOUNT] = irq_get_stats()->irq_count;
+                HB[HB_SLOT_TICKS]    = g_tick_seen;
+                HB[HB_SLOT_IRQCOUNT] = irq_get_stats()->irq_count;
 
                 console_printf("[XJ380/arm32] alive loop=%u led=0x%02X ticks=%u irq=%u uptime=%u ms\n",
-                               loop_count, (u32)(HB[HB_IDX_LED] & 0xFFu), g_tick_seen,
+                               loop_count, (u32)(HB[HB_SLOT_LED] & 0xFFu), g_tick_seen,
                                irq_get_stats()->irq_count, (u32)(timer_read_us() / 1000u));
             }
         }

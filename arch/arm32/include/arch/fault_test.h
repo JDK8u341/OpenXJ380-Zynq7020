@@ -8,10 +8,10 @@
  *   "处理函数写对了" 和 "处理函数根本没被调用、只是系统恰好没崩"。
  *
  * 用法:内核启动后,用 JTAG 往选择器地址写码即可触发,不需要重新烧录:
- *   xsdb> mwr -force 0x00020040 1     # 触发 Data Abort
- *   xsdb> mwr -force 0x00020040 2     # 触发 Undefined Instruction
- *   xsdb> mwr -force 0x00020040 3     # 触发 Prefetch Abort
- *   xsdb> mwr -force 0x00020040 4     # 触发 SVC(会返回,不致命)
+ *   xsdb> mwr -force 0x00020080 1     # 触发 Data Abort
+ *   xsdb> mwr -force 0x00020080 2     # 触发 Undefined Instruction
+ *   xsdb> mwr -force 0x00020080 3     # 触发 Prefetch Abort
+ *   xsdb> mwr -force 0x00020080 4     # 触发 SVC(会返回,不致命)
  */
 
 #include <arch/types.h>
