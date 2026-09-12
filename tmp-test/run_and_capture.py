@@ -10,7 +10,10 @@
     之前正是靠这一步才定位到 console_init 用 NULL 覆盖了波特率寄存器。
 
 用法:
-    python tmp-test/run_and_capture.py [COM4] [9600] [秒数]
+    python tmp-test/run_and_capture.py [COM4] [9600] [秒数] [透传给 tcl 的参数...]
+
+第 4 个参数起原样转发给 tcl(通过 xsdb 的 argv),这样可以复用同一份
+"加载 + 等心跳"脚本跑不同用例,例如故障注入的选择器。
 """
 
 import subprocess
@@ -21,6 +24,7 @@ import time
 PORT = sys.argv[1] if len(sys.argv) > 1 else "COM4"
 BAUD = int(sys.argv[2]) if len(sys.argv) > 2 else 9600
 SECONDS = float(sys.argv[3]) if len(sys.argv) > 3 else 20.0
+TCL_ARGS = sys.argv[4:]
 
 XSDC = r"C:\AMDDesignTools\2025.2\Vitis\bin\xsdb.bat"
 TCL = r"C:\Users\VeryS\Documents\others\OpenXJ380\tmp-test\jtag\run_kernel_uart.tcl"
@@ -79,9 +83,9 @@ def main():
     # 给串口线程一点时间先打开端口,避免漏掉开头的横幅
     time.sleep(1.0)
 
-    print(f"[jtag] xsdb -source {TCL}")
+    print(f"[jtag] xsdb -source {TCL} {' '.join(TCL_ARGS)}")
     proc = subprocess.run(
-        [XSDC, TCL],
+        [XSDC, TCL, *TCL_ARGS],
         capture_output=True,
         encoding="utf-8",
         errors="replace",

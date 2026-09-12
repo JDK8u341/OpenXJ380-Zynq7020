@@ -36,6 +36,15 @@ proc is_zero {s} {
     return [expr {$n == 0}]
 }
 
+# 读 ARM 核心寄存器。用 catch 包住:不是所有版本都能读 DFAR/IFAR,
+# 读不到时应当继续往下走而不是中断整段验证。
+proc rr {reg} {
+    if {[catch {rrd $reg} v]} { return "n/a" }
+    set v [string trim $v]
+    if {[llength $v] >= 2} { return [lindex $v 1] }
+    return $v
+}
+
 step "connect"
 if {[catch {connect} e]} { puts "FAIL connect: $e"; exit 1 }
 puts "OK"
@@ -147,5 +156,29 @@ if {[string match "*00000001" $u]} {
     puts ">>> UART 已被内核探测到 —— 请看串口终端是否出现启动横幅"
 } else {
     puts ">>> 内核仍未探测到 UART"
+}
+
+# 可选:注入故障。
+#
+# 用法: xsdb run_kernel_uart.tcl <selector>
+#   1 = Data Abort   2 = Undefined Instruction   3 = Prefetch Abort
+#
+# 放在最后是有意的:只有先确认内核正常跑起来了,注入才有意义 ——
+# 否则"触发了异常"和"内核本来就没起来"在串口上长得一样。
+set sel [lindex $argv 0]
+if {$sel ne "" && $sel != 0} {
+    step "注入故障 selector=$sel"
+    mwr -force 0x00020040 $sel
+    puts "已写入 FAULT_SEL"
+
+    # 异常处理函数会打完现场再停机,9600 波特下需要一点时间把日志吐完
+    after 4000
+
+    puts "FAULT_SEL  = [rd 0x00020040]  (内核应已清零,避免反复触发)"
+    puts "PC         = [rr pc]"
+    puts "DFAR       = [rr dfar]"
+    puts "DFSR       = [rr dfsr]"
+    puts "IFAR       = [rr ifar]"
+    puts "IFSR       = [rr ifsr]"
 }
 exit 0

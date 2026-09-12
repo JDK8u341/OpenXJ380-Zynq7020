@@ -363,34 +363,64 @@ static const char *fsr_status_text(u32 fsr)
     }
 }
 
-static void dump_frame(const char *what, arm_irq_frame_t *frame, u32 extra, const char *extra_label)
+/*
+ * 只打寄存器,不打标题 —— 标题由调用方打。
+ *
+ * 拆成两半是有原因的:早先的做法是处理函数先打"标题 + 故障地址",
+ * 再调用一个"自带标题"的 dump_frame,于是同一个异常在串口上看起来像
+ * 连续发生了两次:
+ *     !!! Data Abort !!!
+ *       DFAR = 0x50000000 ...
+ *     !!! Data Abort !!!
+ *       pc = ...
+ * 真正严重的故障(嵌套异常、双重故障)也长这样,这种输出会直接误导排障。
+ * 一个异常,一段输出。
+ */
+static void dump_regs(arm_irq_frame_t *frame)
 {
-    console_printf("\n!!! %s !!!\n", what);
-    if (frame != NULL) {
-        console_printf("  pc       = 0x%08X\n", frame->pc);
-        console_printf("  r0-r3    = 0x%08X 0x%08X 0x%08X 0x%08X\n",
-                       frame->r[0], frame->r[1], frame->r[2], frame->r[3]);
-        console_printf("  r4-r7    = 0x%08X 0x%08X 0x%08X 0x%08X\n",
-                       frame->r[4], frame->r[5], frame->r[6], frame->r[7]);
-        console_printf("  r8-r11   = 0x%08X 0x%08X 0x%08X 0x%08X\n",
-                       frame->r[8], frame->r[9], frame->r[10], frame->r[11]);
-        console_printf("  r12      = 0x%08X\n", frame->r[12]);
+    if (frame == NULL) {
+        return;
     }
-    if (extra_label != NULL && extra != 0) {
-        console_printf("  %s = 0x%08X\n", extra_label, extra);
-    }
+
+    console_printf("  pc       = 0x%08X\n", frame->pc);
+    console_printf("  r0-r3    = 0x%08X 0x%08X 0x%08X 0x%08X\n",
+                   frame->r[0], frame->r[1], frame->r[2], frame->r[3]);
+    console_printf("  r4-r7    = 0x%08X 0x%08X 0x%08X 0x%08X\n",
+                   frame->r[4], frame->r[5], frame->r[6], frame->r[7]);
+    console_printf("  r8-r11   = 0x%08X 0x%08X 0x%08X 0x%08X\n",
+                   frame->r[8], frame->r[9], frame->r[10], frame->r[11]);
+    console_printf("  r12      = 0x%08X\n", frame->r[12]);
+}
+
+/*
+ * 停机提示。实际的自旋在 vectors.S 的 `1: wfe / b 1b` 里 ——
+ * 处理函数返回后就停在那里,核心寄存器仍可被 JTAG 读回。
+ */
+static void dump_halt(void)
+{
     console_puts("  System halted. Registers remain readable via JTAG (rrd).\n");
 }
 
 void c_undef_handler(arm_irq_frame_t *frame)
 {
-    dump_frame("Undefined Instruction", frame, 0, NULL);
+    console_puts("\n!!! Undefined Instruction !!!\n");
+    /*
+     * 触发指令地址在 frame->pc。
+     * fault_test 会把选择器留在 r4,所以这里额外提示一下:
+     * 若是故障注入进来的,r4 就是选择器,可直接对照 fault_test.h。
+     */
+    console_puts("  (pc points at the offending instruction;\n");
+    console_puts("   if injected via fault_test, r4 holds the selector)\n");
+    dump_regs(frame);
+    dump_halt();
 }
 
 void c_svc_handler(arm_irq_frame_t *frame)
 {
     /* M1 阶段还没有用户态;走到这里说明有人主动发了 SVC */
-    dump_frame("SVC (no syscall layer yet)", frame, 0, NULL);
+    console_puts("\n!!! SVC (no syscall layer yet) !!!\n");
+    dump_regs(frame);
+    dump_halt();
 }
 
 void c_prefetch_abort_handler(arm_irq_frame_t *frame)
@@ -404,8 +434,8 @@ void c_prefetch_abort_handler(arm_irq_frame_t *frame)
     console_puts("\n!!! Prefetch Abort !!!\n");
     console_printf("  IFAR     = 0x%08X   (address the fetch failed at)\n", ifar);
     console_printf("  IFSR     = 0x%08X   (%s)\n", ifsr, fsr_status_text(ifsr));
-
-    dump_frame("Prefetch Abort", frame, ifar, "IFAR");
+    dump_regs(frame);
+    dump_halt();
 }
 
 void c_data_abort_handler(arm_irq_frame_t *frame)
@@ -416,6 +446,6 @@ void c_data_abort_handler(arm_irq_frame_t *frame)
     console_puts("\n!!! Data Abort !!!\n");
     console_printf("  DFAR     = 0x%08X   (address that faulted; x86 equivalent is CR2)\n", dfar);
     console_printf("  DFSR     = 0x%08X   (%s)\n", dfsr, fsr_status_text(dfsr));
-
-    dump_frame("Data Abort", frame, dfar, "DFAR");
+    dump_regs(frame);
+    dump_halt();
 }
