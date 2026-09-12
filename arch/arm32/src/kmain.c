@@ -410,6 +410,26 @@ void kmain(void)
     }
 
     /*
+     * L2(PL310)。
+     *
+     * 顺序与 Xilinx boot.S 一致:L1 先开,再初始化 L2。
+     * 它不在 CLIDR 里,所以上面那套 CP15 几何循环完全覆盖不到它 ——
+     * 必须走它自己的寄存器(0xF8F02000),配置也完全是另一套
+     * (延迟参数、SLCR 里的 RAM 配置)。
+     */
+    {
+        u32 l2_id = l2_cache_id();
+
+        console_puts(" Cache: configuring PL310 L2...\n");
+        timer_delay_ms(20);
+
+        l2_cache_init();
+
+        console_printf(" Cache L2    : %s  ID=0x%08X TYPE=0x%08X CTRL=0x%08X\n",
+                       l2_cache_is_enabled() ? "ON" : "off", l2_id, l2_cache_type(), l2_cache_control());
+    }
+
+    /*
      * 缓存维护自检。
      *
      * 这一步验证的是**DMA 路径所依赖的语义**,而不是缓存快不快:
@@ -417,7 +437,9 @@ void kmain(void)
      * 两者任一不成立,DMA 就会出现"偶尔错几个字节"这类最难查的问题。
      *
      * 不需要任何外设参与 —— 靠的是"缓存与内存是两份副本"这个事实。
-     * 原理见 src/cache_hw.c 的 cache_selftest()。
+     * L2 使能后,这一套操作的语义要在**两级缓存**上都成立,
+     * 而 cache_*_range() 正好同时维护 L1 与 L2,所以这个自检
+     * 同时也是对两级联动的验证。
      */
     {
         u32 selftest = cache_selftest();

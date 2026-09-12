@@ -66,6 +66,16 @@ cache_geometry_t cache_discover(bool instruction, u32 level)
     return geo;
 }
 
+/*
+ * L1 数据缓存的行大小。
+ * 放在这里而不是和区间维护放一起:PL310 的按地址操作也要用它做对齐,
+ * 而 PL310 那段在文件里更靠前。
+ */
+u32 cache_line_bytes(void)
+{
+    return cache_discover(false, 0u).line_bytes;
+}
+
 /* ------------------------------------------------------------------ */
 /* 按 set/way 的整块操作                                               */
 /* ------------------------------------------------------------------ */
@@ -350,13 +360,184 @@ bool cache_icache_enabled(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* 按地址(MVA)的区间维护                                               */
+/* PL310 L2                                                             */
 /* ------------------------------------------------------------------ */
 
-u32 cache_line_bytes(void)
+#define L2CC(offset) (PLAT_L2CC_BASE + (offset))
+
+/* SLCR 里 L2 的 RAM 配置寄存器(与 unlock/lock 一起用) */
+#define SLCR_L2C_RAM      0xF8000A1Cu
+#define SLCR_L2C_RAM_CFG  0x00020202u
+
+u32 l2_cache_id(void)
 {
-    return cache_discover(false, 0u).line_bytes;
+    return mmio_read32(L2CC(L2CC_ID));
 }
+
+u32 l2_cache_type(void)
+{
+    return mmio_read32(L2CC(L2CC_TYPE));
+}
+
+u32 l2_cache_control(void)
+{
+    return mmio_read32(L2CC(L2CC_CONTROL));
+}
+
+bool l2_cache_is_enabled(void)
+{
+    return (l2_cache_control() & L2CC_CONTROL_ENABLE) != 0u;
+}
+
+/*
+ * 等 L2 维护操作做完。
+ *
+ * 写 SYNC 之后读回 0 表示完成。这个轮询不能省:
+ * PL310 的失效/清洗是**后台执行**的,不等待就继续改内存,
+ * 缓存里可能还留着描述旧内容的行 —— 之后它们被逐出时会把
+ * 陈旧数据写回去,是 DMA 数据损坏的经典成因。
+ */
+void l2_cache_sync(void)
+{
+    mmio_write32(L2CC(L2CC_SYNC), 0u);
+
+    while (mmio_read32(L2CC(L2CC_SYNC)) != 0u) {
+        /* 轮询等待 */
+    }
+}
+
+void l2_cache_invalidate_all(void)
+{
+    mmio_write32(L2CC(L2CC_INV_WAY), L2CC_ALL_WAYS);
+    l2_cache_sync();
+}
+
+/*
+ * 勘误 727915(Background Clean and Invalidate by Way 会导致数据损坏)
+ * 的规避方式,记录在此以备将来:
+ *
+ * Xilinx 的 xil_cache.c 在做"按 Way 的清洗并失效"前后,会往调试寄存器
+ * (L2CC_DEBUG_CTRL,0xF40)写 0x3 关闭写回与行填充、操作完再写 0x0 恢复,
+ * 让操作从前台完成。
+ *
+ * **本实现没有使用那条路径** —— 初始化用的是"按 Way 失效"(不涉及清洗),
+ * 区间维护用的是"按地址",两者都不受该勘误影响。
+ * 将来若有人为了"整块刷新"去用 L2CC_INV_CLN_WAY,必须先加上这层包裹。
+ */
+
+void l2_cache_init(void)
+{
+    u32 ctrl;
+
+    /* 1. 先关闭,配置期间不受影响 */
+    mmio_write32(L2CC(L2CC_CONTROL), 0u);
+    l2_cache_sync();
+
+    /* 2. 辅助控制:预取、替换策略、奇偶校验等默认位 */
+    ctrl = mmio_read32(L2CC(L2CC_AUX_CONTROL));
+    ctrl |= L2CC_AUX_CONTROL_DEFAULT;
+    mmio_write32(L2CC(L2CC_AUX_CONTROL), ctrl);
+
+    /* 3. Tag / Data RAM 延迟。这两个值随芯片走,不能自己猜 */
+    mmio_write32(L2CC(L2CC_TAG_RAM_CTRL), L2CC_TAG_RAM_LATENCY);
+    mmio_write32(L2CC(L2CC_DATA_RAM_CTRL), L2CC_DATA_RAM_LATENCY);
+
+    /* 4. 整块失效。此时 L2 还关着,清掉复位后的未知内容 */
+    l2_cache_invalidate_all();
+
+    /* 5. 清掉可能挂起的中断 */
+    {
+        u32 pending = mmio_read32(L2CC(L2CC_ISR));
+
+        if (pending != 0u) {
+            mmio_write32(L2CC(L2CC_IAR), pending);
+        }
+    }
+
+    /*
+     * 6. SLCR 里的 L2 RAM 配置。
+     *
+     * 这一步容易被漏掉 —— 它不在 L2 寄存器空间里,而在 SLCR 里,
+     * 且需要先解锁。少了它 L2 能"使能成功"但行为不保证。
+     */
+    mmio_write32(SLCR_UNLOCK, SLCR_UNLOCK_KEY);
+    mmio_write32(SLCR_L2C_RAM, SLCR_L2C_RAM_CFG);
+    mmio_write32(SLCR_LOCK, SLCR_LOCK_KEY);
+
+    /* 7. 使能 */
+    mmio_write32(L2CC(L2CC_CONTROL), L2CC_CONTROL_ENABLE);
+    l2_cache_sync();
+
+    arch_dsb();
+}
+
+/* ------------------------------------------------------------------ */
+/* L2 按物理地址的区间维护                                             */
+/* ------------------------------------------------------------------ */
+
+typedef enum
+{
+    L2_OP_CLEAN = 0,
+    L2_OP_INVALIDATE = 1,
+    L2_OP_CLEAN_INVALIDATE = 2,
+} l2_op_t;
+
+static void l2_range_op(uintptr_t addr, size_t size, l2_op_t op)
+{
+    cache_range_t range = cache_align_range(addr, size, cache_line_bytes());
+    uintptr_t     line;
+    u32           step = cache_line_bytes();
+
+    if (cache_range_is_empty(&range) || !l2_cache_is_enabled()) {
+        return;
+    }
+
+    for (line = range.start; line < range.end; line += step) {
+        switch (op) {
+        case L2_OP_CLEAN:
+            mmio_write32(L2CC(L2CC_CLEAN_PA), (u32)line);
+            break;
+        case L2_OP_INVALIDATE:
+            mmio_write32(L2CC(L2CC_INV_PA), (u32)line);
+            break;
+        case L2_OP_CLEAN_INVALIDATE:
+        default:
+            /*
+             * ⚠ PL310 勘误 588369:单条"清洗并失效"**不会失效已经干净的行**。
+             * 于是一行若本来是干净的,做完这个操作后它仍然留在缓存里 ——
+             * 对 DMA 接收缓冲来说,这意味着 CPU 接着读到的还是旧副本。
+             *
+             * 规避办法就是拆成两步:先按地址清洗(把该写的写下去),
+             * 再按地址失效(无条件丢弃)。两步之后无论原本脏不脏,
+             * 缓存里都不会再留着这一行。
+             */
+            mmio_write32(L2CC(L2CC_CLEAN_PA), (u32)line);
+            mmio_write32(L2CC(L2CC_INV_PA), (u32)line);
+            break;
+        }
+    }
+
+    l2_cache_sync();
+}
+
+void l2_cache_clean_range(uintptr_t addr, size_t size)
+{
+    l2_range_op(addr, size, L2_OP_CLEAN);
+}
+
+void l2_cache_invalidate_range(uintptr_t addr, size_t size)
+{
+    l2_range_op(addr, size, L2_OP_INVALIDATE);
+}
+
+void l2_cache_clean_invalidate_range(uintptr_t addr, size_t size)
+{
+    l2_range_op(addr, size, L2_OP_CLEAN_INVALIDATE);
+}
+
+/* ------------------------------------------------------------------ */
+/* 按地址(MVA)的区间维护                                               */
+/* ------------------------------------------------------------------ */
 
 /*
  * 三种区间维护的循环结构完全一样,区别只在写哪个 CP15 寄存器:
@@ -395,6 +576,36 @@ static void cache_range_op(uintptr_t addr, size_t size, cache_op_t op)
     }
 
     arch_dsb();
+
+    /*
+     * L2 必须**跟着 L1 一起维护**,而且顺序不能反。
+     *
+     * 为什么不能只做 L1:Zynq 上的 L2 位于 CPU 与 DDR 之间,
+     * PL 侧的主设备访问 DDR 时会经过它。只清洗 L1 的话,
+     * 数据可能停在 L2 里没落到 DDR,PL 读到的是旧内容 ——
+     * 而 CPU 这边一切正常,问题只在设备侧偶发出现。
+     *
+     * 为什么顺序不能反:
+     *   clean  —— 必须**先 L1 后 L2**。先清 L2 再清 L1 的话,
+     *             L1 随后写回的脏行会留在 L2 里,而 L2 的清洗已经做完了,
+     *             于是这些数据最终没到 DDR;
+     *   invalidate —— 也必须**先 L1 后 L2**。反过来的话 L1 里残留的
+     *             旧副本会一直用下去,读不到设备刚写进 DDR 的新数据。
+     *
+     * 上面 L1 的循环已经跑完,这里再对 L2 做同样的操作,顺序自然正确。
+     */
+    switch (op) {
+    case CACHE_OP_CLEAN:
+        l2_cache_clean_range(addr, size);
+        break;
+    case CACHE_OP_CLEAN_INVALIDATE:
+        l2_cache_clean_invalidate_range(addr, size);
+        break;
+    case CACHE_OP_INVALIDATE:
+    default:
+        l2_cache_invalidate_range(addr, size);
+        break;
+    }
 }
 
 void cache_clean_range(uintptr_t addr, size_t size)

@@ -645,14 +645,55 @@ cache_clean_invalidate_range(addr, size);   /* 双向交替使用              *
 换成只提供**单地址**原语，区间语义统一收进 `cache_hw.c` ——
 避免同一件事有两套实现，其中一套还是错的。
 
+**L2（PL310，512KB）已使能**：
+
+```
+Cache L2    : ON  ID=0x410000C8 TYPE=0x9E300300 CTRL=0x00000001
+Cache maint : line=32 B  clean/invalidate selftest=PASS
+```
+
+顺序与 Xilinx `boot.S` 一致：**L1 先开，再初始化 L2**。
+`ps7_init` 里没有任何 L2 代码（实测确认），所以在此之前它一直处于复位状态。
+
+⚠ **Zynq 上这颗 PL310 的寄存器偏移与通用 PL310 手册不一致**，
+而且不一致的恰好是两个"按 Way"与"按地址"的操作：
+
+| 偏移 | 通用 PL310 | 本芯片（Zynq）|
+|---|---|---|
+| `0x0770` | Invalidate Line by PA | Invalidate by PA | 
+| `0x077C` | Clean&Invalidate by PA | **Invalidate by Way** |
+| `0x07B0` | Clean Line by PA | Clean by PA |
+| `0x07F0` | Invalidate Way | **Clean&Invalidate by PA** |
+| `0x07FC` | Clean&Invalidate Way | Clean&Invalidate Way |
+
+**`0x77C` 与 `0x7F0` 的功能在两者之间是对调的。** 用错不会报错，
+只会静默地把"失效整条 way"当成"清洗一行地址"来做。
+本实现的取值来自 AMD/Xilinx standalone BSP 的 `arm/cortexa9/xl2cc.h`
+（随这颗芯片一起出货的定义），并在代码里标注了这个差异。
+
+**L1 与 L2 必须一起维护，且顺序不能反**：
+
+- clean 必须**先 L1 后 L2** —— 先清 L2 的话，L1 随后写回的脏行会留在 L2 里，
+  而 L2 的清洗已经做完了，这些数据最终到不了 DDR；
+- invalidate 也必须**先 L1 后 L2** —— 反过来 L1 里残留的旧副本会一直用下去。
+
+只做 L1 的危害：Zynq 的 L2 位于 CPU 与 DDR 之间，PL 侧主设备访问 DDR 会经过它，
+数据停在 L2 里没落到 DDR 时，**CPU 这边一切正常，问题只在设备侧偶发出现**。
+`cache_*_range()` 已经两级都做，顺序写死在同一个函数里。
+
+**勘误处理**（`xil_errata.h` 的 MIT 定义）：
+
+| 勘误 | 影响 | 本实现 |
+|---|---|---|
+| PL310 588369 | 单条"清洗并失效"**不会失效已经干净的行** | 已规避：拆成"先清洗、再失效"两步 |
+| PL310 727915 | Background Clean&Invalidate **by Way** 会导致数据损坏 | **未使用那条路径**（初始化用按 Way 失效，区间用按地址），已在代码里记录规避方法备查 |
+| ARM 775420 | 会中止的数据缓存维护操作可能导致死锁 | 未处理：当前维护操作只作用于已映射的内核缓冲区 |
+
 ### 7. 其它待办（M3 及以后）
 
-- 缓存维护与 Cortex-A9/PL310 勘误 —— L1 已使能(6x);**L2(PL310)尚未配置**,
-  它不在 CLIDR 里,必须走自己的寄存器(0xF8F02000)。需 vendor Xilinx 的
-  `xil_cache.c` 与 `xil_errata.h`(MIT 许可),含 PL310 勘误 588369 / 727915,
-  后者正是"Background Clean and Invalidate by Way 导致数据损坏",DMA 场景的典型杀手
-- 按地址(MVA)的缓存维护目前只有 `arch/cpu.h` 里的朴素实现,**尚未做
-  cache-line 对齐处理**,也没有勘误规避 —— 做 DMA 之前必须先解决这一块
+- 缓存维护与 Cortex-A9/PL310 勘误 —— **L1 与 L2 均已使能**；
+  588369 已规避，727915 未触及相关路径，775420 尚未处理
+  （见上方缓存章节的勘误表）
 - 设备/驱动描述层（方案已定：C 静态描述符表 + probe 循环；
   PL 部分暂缓，等真正做 PL 设计时再引入生成器）
 - SMP：`sev` + OCM 跳板替代 x86 的 INIT-SIPI-SIPI

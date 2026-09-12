@@ -363,3 +363,110 @@ u32 cache_line_bytes(void);
  * 详见 src/cache_hw.c 的实现注释。
  */
 u32 cache_selftest(void);
+
+/* ------------------------------------------------------------------ */
+/* PL310 L2 寄存器映射                                                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * ⚠ Zynq 上这颗 PL310 的寄存器偏移与**通用 PL310 手册不一致**,
+ *   而且不一致的恰好是两个"按 Way"与"按地址"的操作 ——
+ *   用错不会报错,只会静默地做错事(比如把"失效整条 way"当成
+ *   "清洗一行地址")。这类错误在 DMA 场景表现为随机数据损坏。
+ *
+ *   对照(通用 PL310 TRM vs 本芯片):
+ *     偏移     通用 PL310              本芯片(Zynq)
+ *     0x0770   Invalidate Line by PA   Invalidate by PA      一致
+ *     0x077C   Clean&Invalidate by PA  **Invalidate by Way**
+ *     0x07B0   Clean Line by PA        Clean by PA           一致
+ *     0x07F0   Invalidate Way          **Clean&Invalidate by PA**
+ *     0x07FC   Clean&Invalidate Way    Clean&Invalidate Way  一致
+ *
+ *   也就是说 0x77C 与 0x7F0 的功能在两者之间是对调的。
+ *   下表的取值来自 AMD/Xilinx standalone BSP 的
+ *   arm/cortexa9/xl2cc.h —— 那是随这颗芯片一起出货的定义,以它为准。
+ */
+#define L2CC_ID            0x0000u /* Cache ID */
+#define L2CC_TYPE          0x0004u /* Cache Type */
+#define L2CC_CONTROL       0x0100u /* 使能位在 bit0 */
+#define L2CC_AUX_CONTROL   0x0104u
+#define L2CC_TAG_RAM_CTRL  0x0108u
+#define L2CC_DATA_RAM_CTRL 0x010Cu
+#define L2CC_ISR           0x021Cu /* 原始中断状态 */
+#define L2CC_IAR           0x0220u /* 中断清除 */
+#define L2CC_SYNC          0x0730u /* 写入任意值即发起同步;读回 0 表示完成 */
+#define L2CC_INV_PA        0x0770u /* 按物理地址失效一行 */
+#define L2CC_INV_WAY       0x077Cu /* 按 Way 失效(写 16 位 way 位图) */
+#define L2CC_CLEAN_PA      0x07B0u /* 按物理地址清洗一行 */
+#define L2CC_CLEAN_WAY     0x07BCu
+#define L2CC_INV_CLN_PA    0x07F0u /* 按物理地址清洗并失效一行 */
+#define L2CC_INV_CLN_WAY   0x07FCu
+#define L2CC_DEBUG_CTRL    0x0F40u /* 勘误规避用:关闭写回与行填充 */
+
+#define L2CC_CONTROL_ENABLE 0x00000001u
+
+/* 写入 DEBUG_CTRL 的值:0x3 = 关闭写回与行填充,0x0 = 恢复 */
+#define L2CC_DEBUG_DISABLE_WB_AND_LINEFILL 0x3u
+#define L2CC_DEBUG_ENABLE_WB_AND_LINEFILL  0x0u
+
+/* 按 Way 操作时用 16 位位图表示哪些 way 参与 */
+#define L2CC_ALL_WAYS 0xFFFFu
+
+/* PL310 在 Zynq 上是 512KB / 8 路 / 32 字节行 */
+#define L2CC_ZYNQ7020_BYTES 0x00080000u
+
+/*
+ * 下列三个值来自 Xilinx boot.S,是随这块芯片验证过的配置,**不要自己推算**:
+ *
+ *   AUX_CONTROL    0x72360000  预取全开、替换策略、奇偶校验等默认位
+ *   TAG_RAM_LAT   0x0111       Tag RAM 延迟
+ *   DATA_RAM_LAT  0x0121       Data RAM 延迟
+ *
+ * 两个延迟值尤其不能猜:它们取决于芯片的时序实现,写错不会报错,
+ * 只会在高负载下偶发缓存错误。
+ */
+#define L2CC_AUX_CONTROL_DEFAULT 0x72360000u
+#define L2CC_TAG_RAM_LATENCY     0x0111u
+#define L2CC_DATA_RAM_LATENCY    0x0121u
+
+/* ------------------------------------------------------------------ */
+/* L2 硬件接口(实现在 src/cache_hw.c)                                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 配置并使能 PL310。
+ *
+ * ⚠ 必须在 L1 缓存使能**之后**调用,顺序与 Xilinx boot.S 一致:
+ *   它也是先写 SCTLR 打开 MMU 与 D-Cache,再初始化 L2。
+ *
+ * 流程:关闭 -> 写辅助控制/延迟 -> 整块失效 -> 同步
+ *       -> 配 SLCR 的 L2 RAM -> 使能
+ */
+void l2_cache_init(void);
+
+/* 等待 L2 维护操作完成(写 SYNC 后轮询读回 0) */
+void l2_cache_sync(void);
+
+/* 整块失效(按 Way)。只在单核启动阶段、使能之前用 */
+void l2_cache_invalidate_all(void);
+
+bool l2_cache_is_enabled(void);
+
+/* 诊断:Cache ID / Type / 控制寄存器 */
+u32 l2_cache_id(void);
+u32 l2_cache_type(void);
+u32 l2_cache_control(void);
+
+/*
+ * 按物理地址的 L2 区间维护。
+ *
+ * 这三个是在 L1 的对应操作之后**追加**调用的(见 cache_clean_range 等),
+ * 调用方一般不需要直接用它。
+ *
+ * ⚠ 内含 PL310 勘误 588369 的规避:该勘误使得"清洗并失效"不会失效
+ *   已经干净的行,所以这里把它拆成"先清洗、再失效"两步做 ——
+ *   单条 INV_CLN 在受影响的行上会留下本该被丢弃的干净数据。
+ */
+void l2_cache_clean_range(uintptr_t addr, size_t size);
+void l2_cache_invalidate_range(uintptr_t addr, size_t size);
+void l2_cache_clean_invalidate_range(uintptr_t addr, size_t size);
