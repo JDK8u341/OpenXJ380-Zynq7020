@@ -376,31 +376,37 @@ static inline void arch_branch_predictor_invalidate_all(void)
     arch_isb();
 }
 
-/* 按地址清洗数据缓存到一致性点(DCCMVAC) */
-static inline void arch_dcache_clean_range(uintptr_t start, uintptr_t end)
+/*
+ * 按地址(MVA)的单行维护原语。
+ *
+ * 这里只提供**单个地址**的操作,不提供区间版本 ——
+ * 区间版本必须做缓存行对齐(见 arch/cache.h 的 cache_align_range),
+ * 而"对齐"这件事是有语义的、需要单测的逻辑,不适合塞在内联汇编旁边。
+ * 区间接口在 src/cache_hw.c:cache_clean_range / invalidate_range /
+ * clean_invalidate_range。
+ *
+ * 命名对照 CP15 助记符:
+ *   DCCMVAC  (c7,c10,1)  清洗     —— 写回到一致性点,行保留
+ *   DCIMVAC  (c7,c6,1)   失效     —— 丢弃,不写回
+ *   DCCIMVAC (c7,c14,1)  清洗并使失效
+ */
+
+/* 把该行写回到一致性点 */
+static inline void arch_dcache_clean_mva(uintptr_t va)
 {
-    for (uintptr_t addr = start; addr < end; addr += 32) {
-        __asm__ volatile("mcr p15, 0, %0, c7, c10, 1" ::"r"(addr) : "memory");
-    }
-    arch_dsb();
+    __asm__ volatile("mcr p15, 0, %0, c7, c10, 1" ::"r"(va) : "memory");
 }
 
-/* 按地址使数据缓存失效(DCIMVAC)。用于 DMA 接收缓冲 */
-static inline void arch_dcache_invalidate_range(uintptr_t start, uintptr_t end)
+/* 丢弃该行(不写回) */
+static inline void arch_dcache_invalidate_mva(uintptr_t va)
 {
-    for (uintptr_t addr = start; addr < end; addr += 32) {
-        __asm__ volatile("mcr p15, 0, %0, c7, c6, 1" ::"r"(addr) : "memory");
-    }
-    arch_dsb();
+    __asm__ volatile("mcr p15, 0, %0, c7, c6, 1" ::"r"(va) : "memory");
 }
 
-/* 按地址清洗并使数据缓存失效(DCCIMVAC) */
-static inline void arch_dcache_flush_range(uintptr_t start, uintptr_t end)
+/* 写回后丢弃 */
+static inline void arch_dcache_clean_invalidate_mva(uintptr_t va)
 {
-    for (uintptr_t addr = start; addr < end; addr += 32) {
-        __asm__ volatile("mcr p15, 0, %0, c7, c14, 1" ::"r"(addr) : "memory");
-    }
-    arch_dsb();
+    __asm__ volatile("mcr p15, 0, %0, c7, c14, 1" ::"r"(va) : "memory");
 }
 
 /* ------------------------------------------------------------------ */

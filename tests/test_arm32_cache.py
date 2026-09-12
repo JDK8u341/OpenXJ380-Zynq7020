@@ -211,6 +211,104 @@ int main(void)
     check_u32(cache_setway_max_level((3u << 24) | (1u << 27)), 1u, "LoC=3, LoUIS=1 -> 1 (smaller)");
     check_u32(cache_setway_max_level((1u << 24) | (3u << 27)), 1u, "LoC=1, LoUIS=3 -> 1 (smaller)");
 
+    /* ============================================================== */
+    /* 7. 区间对齐 —— DMA 缓存维护最容易出错的地方                    */
+    /* ============================================================== */
+    /*
+     * 缓存维护按**行**生效,而一行的所有权与请求范围无关。
+     * 如果只覆盖范围内的行、不做向外取整,那么范围两端若各有一行
+     * 只有一部分落在里面,那一行的另一半就得不到处理 ——
+     * 对 DMA 来说这意味着缓冲区首尾各有一小段没被写回(或没被失效),
+     * 表现为"大部分时候对,偶尔错几个字节"。
+     *
+     * 所以这里逐条钉住"向外取整"的语义。
+     */
+    {
+        cache_range_t r;
+        const unsigned int LINE = 32u;
+
+        /* -- 已对齐的范围:原样保留 -- */
+        r = cache_align_range(0x1000u, 128u, LINE);
+        check_u32((unsigned int)r.start, 0x1000u, "aligned start stays");
+        check_u32((unsigned int)r.end, 0x1080u, "aligned end stays");
+
+        /* -- 起点不对齐:向下取整 -- */
+        r = cache_align_range(0x1004u, 4u, LINE);
+        check_u32((unsigned int)r.start, 0x1000u, "unaligned start rounds down");
+        check_u32((unsigned int)r.end, 0x1020u, "end rounds up to cover the whole line");
+
+        /* -- 终点不对齐:向上取整 -- */
+        r = cache_align_range(0x1000u, 33u, LINE);
+        check_u32((unsigned int)r.start, 0x1000u, "start unchanged");
+        check_u32((unsigned int)r.end, 0x1040u, "33 bytes span two lines");
+
+        /* -- 一行内部的 1 字节:必须覆盖整行 -- */
+        r = cache_align_range(0x101Fu, 1u, LINE);
+        check_u32((unsigned int)r.start, 0x1000u, "last byte of a line rounds down");
+        check_u32((unsigned int)r.end, 0x1020u, "and up: exactly one line");
+        check_u32(cache_range_lines(&r, LINE), 1u, "one byte inside a line covers one line");
+
+        /* -- 跨行边界:两行 -- */
+        r = cache_align_range(0x101Fu, 2u, LINE);
+        check_u32(cache_range_lines(&r, LINE), 2u, "straddling a boundary covers two lines");
+
+        /* -- size == 0:空区间,调用方据此直接跳过 -- */
+        r = cache_align_range(0x1004u, 0u, LINE);
+        check(cache_range_is_empty(&r), "zero size yields an empty range");
+        check_u32((unsigned int)r.start, (unsigned int)r.end, "empty range has start == end");
+        check_u32(cache_range_lines(&r, LINE), 0u, "empty range covers no lines");
+
+        /* -- line_bytes == 0:几何未知时的保守退化,不能除以 0 -- */
+        r = cache_align_range(0x1004u, 4u, 0u);
+        check_u32((unsigned int)r.start, 0x1004u, "line size 0 degenerates to byte granularity");
+        check_u32((unsigned int)r.end, 0x1008u, "and does not lose the tail");
+        check_u32(cache_range_lines(&r, 0u), 4u, "and does not divide by zero");
+
+        /*
+         * -- 溢出:addr + size 绕回 --
+         *
+         * 这一条最关键。若不做检查,end 会小于 start,调用方把它当成
+         * 空区间直接跳过 —— 于是**整段缓冲区一行都没被维护**,
+         * 而且不会有任何报错。
+         *
+         * 宿主是 64 位,所以用 UINTPTR_MAX 附近的地址触发同样的分支;
+         * ARM 目标上是 32 位绕回,走的是同一段代码。
+         */
+        r = cache_align_range(UINTPTR_MAX - 8u, 64u, LINE);
+        check(!cache_range_is_empty(&r), "overflowing range must NOT collapse to empty");
+        check(r.end >= r.start, "end must never precede start");
+        check(r.end <= UINTPTR_MAX, "end must not wrap past the top of the address space");
+
+        /*
+         * -- 对齐不变量:覆盖范围必须包含原始范围 --
+         * 随机性质的抽样检查,比逐点断言更能抓住取整方向的错误。
+         */
+        {
+            unsigned int addr;
+            unsigned int sizes[] = {1u, 4u, 31u, 32u, 33u, 100u, 1000u};
+            unsigned int si;
+
+            for (addr = 0x1000u; addr < 0x1200u; addr += 7u) {
+                for (si = 0; si < sizeof(sizes) / sizeof(sizes[0]); si++) {
+                    unsigned int end_want = addr + sizes[si];
+
+                    r = cache_align_range(addr, sizes[si], LINE);
+
+                    if (r.start > addr || r.end < end_want) {
+                        printf("FAIL: range [0x%X,0x%X) not covered by [0x%X,0x%X)\n", addr, end_want,
+                               (unsigned int)r.start, (unsigned int)r.end);
+                        failures++;
+                    }
+                    if (((unsigned int)r.start % LINE) != 0u || ((unsigned int)r.end % LINE) != 0u) {
+                        printf("FAIL: range [0x%X,0x%X) is not line aligned\n", (unsigned int)r.start,
+                               (unsigned int)r.end);
+                        failures++;
+                    }
+                }
+            }
+        }
+    }
+
     if (failures == 0) {
         printf("ALL PASS\n");
         return 0;

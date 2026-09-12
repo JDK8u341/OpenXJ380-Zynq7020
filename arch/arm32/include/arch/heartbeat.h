@@ -74,6 +74,15 @@
  */
 #define HB_SLOT_CACHEBENCH 18u
 
+/*
+ * 缓存维护自检结果:0 = 通过,非 0 = 失败项编号(见 src/cache_hw.c)。
+ *
+ * 验证的是 DMA 依赖的语义 —— clean 有没有真的把数据写回内存、
+ * invalidate 有没有真的丢弃缓存副本。两者任一不成立,
+ * DMA 会表现为"偶尔错几个字节",那是最难查的一类问题。
+ */
+#define HB_SLOT_CACHESELFTEST 19u
+
 /* MMU 阶段的取值。0 表示还没开始 */
 #define HB_MMU_STAGE_IDLE       0u /* 尚未开始 */
 #define HB_MMU_STAGE_BUILT      1u /* 页表已填好 */
@@ -83,7 +92,7 @@
 #define HB_MMU_STAGE_FAILED     0xEEu /* 自检未通过,主动放弃开 MMU */
 
 /* 已定义的槽位数。越界写会踩到后面的故障注入选择器 */
-#define HB_SLOT_COUNT     19u
+#define HB_SLOT_COUNT     20u
 
 /* 心跳区预留的槽位容量(见 platform.h 的 PLAT_HEARTBEAT_REGION_SLOTS) */
 #define HB_SLOT_CAPACITY  PLAT_HEARTBEAT_REGION_SLOTS

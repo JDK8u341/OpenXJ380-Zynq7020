@@ -164,6 +164,93 @@ static inline u32 cache_setway_iterations(const cache_geometry_t *geo)
 }
 
 /* ------------------------------------------------------------------ */
+/* 按地址(MVA)维护的区间对齐                                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 一段已经按缓存行对齐的区间([start, end),end 不含)。
+ */
+typedef struct
+{
+    uintptr_t start;
+    uintptr_t end;
+} cache_range_t;
+
+static inline bool cache_range_is_empty(const cache_range_t *range)
+{
+    return range->start >= range->end;
+}
+
+/*
+ * 把 [addr, addr+size) 扩展成整行覆盖的范围。
+ *
+ * 为什么要扩展而不是直接用给定范围:
+ *   缓存维护操作是**按行**生效的,而一行的所有权与请求范围无关。
+ *   如果只对范围内的行做操作,那么范围两端若各有一行只有一部分落在里面,
+ *   那一行的另一半数据就得不到处理 ——
+ *   对 DMA 来说这意味着缓冲区首尾各有一小段没被写回(或没被失效),
+ *   表现为"大部分时候对,偶尔错几个字节"。
+ *
+ *   所以必须**向外**取整:起点向下对齐到行边界,终点向上对齐。
+ *   多处理一点是安全的(最坏是多刷几行相邻数据),
+ *   少处理一点则一定出错。
+ *
+ * 边界情况:
+ *   size == 0        -> 空区间(start == end),调用方据此跳过
+ *   line_bytes == 0  -> 视为 1 字节粒度(几何未知时的保守退化)
+ *   addr + size 溢出 -> 夹到地址空间上界,不绕回
+ */
+static inline cache_range_t cache_align_range(uintptr_t addr, size_t size, u32 line_bytes)
+{
+    cache_range_t range;
+    u32           align = (line_bytes != 0u) ? line_bytes : 1u;
+    uintptr_t     mask  = (uintptr_t)align - 1u;
+
+    if (size == 0u) {
+        range.start = addr;
+        range.end   = addr;
+        return range;
+    }
+
+    range.start = addr & ~mask;
+
+    /*
+     * 上界单独算并检查回绕。addr + size 在 32 位上完全可能绕回 0,
+     * 那时 end < start,调用方会当成空区间直接跳过 ——
+     * 于是整段缓冲区**一行都没被维护**,而且不会有任何报错。
+     */
+    {
+        uintptr_t end = addr + size;
+
+        if (end < addr) {
+            end = ~(uintptr_t)0; /* 绕回:夹到上界 */
+        }
+
+        end = (end + mask) & ~mask;
+
+        if (end < range.start) {
+            end = ~(uintptr_t)0; /* 向上对齐本身绕回 */
+        }
+
+        range.end = end;
+    }
+
+    return range;
+}
+
+/* 区间跨越的缓存行数,便于诊断与上界检查 */
+static inline u32 cache_range_lines(const cache_range_t *range, u32 line_bytes)
+{
+    u32 align = (line_bytes != 0u) ? line_bytes : 1u;
+
+    if (cache_range_is_empty(range)) {
+        return 0u;
+    }
+
+    return (u32)((range->end - range->start) / align);
+}
+
+/* ------------------------------------------------------------------ */
 /* 硬件侧(实现在 src/cache_hw.c,只能上板验证)                        */
 /* ------------------------------------------------------------------ */
 
@@ -229,3 +316,50 @@ bool cache_icache_enabled(void);
  * 这个差别骗不了人。
  */
 u32 cache_benchmark_us(u32 passes);
+
+/* ------------------------------------------------------------------ */
+/* 按地址(MVA)的区间维护 —— DMA 真正要用的东西                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 这三个是驱动做 DMA 时唯一需要关心的缓存接口。用法约定:
+ *
+ *   设备 -> 内存(DMA 写入后,CPU 要读)
+ *       cache_invalidate_range(...)    丢弃 CPU 缓存里的旧副本,
+ *                                       强制从内存重新读
+ *   内存 -> 设备(CPU 写完后,DMA 要读)
+ *       cache_clean_range(...)         把脏行写回到一致性点
+ *   双向(缓冲区会被双方交替使用)
+ *       cache_clean_invalidate_range(...)
+ *
+ * ⚠ 顺序不能反:
+ *   - "先 invalidate 再写"会丢掉还没写回的数据;
+ *   - "只 clean 不 invalidate"用于 RX 缓冲会让 CPU 继续读到缓存里的旧内容。
+ *
+ * ⚠ 区间会**向外对齐到整行**(见 cache_align_range 的说明),
+ *   所以相邻数据也可能被一并写回/丢弃 —— 调用方不应把
+ *   不该被丢弃的数据紧挨着 DMA 缓冲区放。
+ *
+ * 当前实现只覆盖 L1。L2(PL310)尚未使能,等 M2-5d 处理它之后,
+ * 这里的语义需要重新审视:L2 在 PL310 上由它自己的寄存器维护。
+ */
+void cache_clean_range(uintptr_t addr, size_t size);
+void cache_invalidate_range(uintptr_t addr, size_t size);
+void cache_clean_invalidate_range(uintptr_t addr, size_t size);
+
+/* 当前 L1 D-Cache 的行大小(字节)。缓存未使能时也返回硬件的真实值 */
+u32 cache_line_bytes(void);
+
+/*
+ * 板上自检:验证 clean / invalidate 真的按语义工作。
+ *
+ * 不用 DMA 也能验证,靠的是"缓存与内存是两份副本"这个事实:
+ *   - 写入数据后 **invalidate**,若之后读回的是**旧值**,
+ *     说明缓存里确实存着未写回的新值(缓存有效),且 invalidate 真的丢弃了它;
+ *   - 写入数据后 **clean**,再 invalidate,读回**新值**,
+ *     说明 clean 真的把数据写回了内存。
+ *
+ * 返回 0 表示全部通过,非 0 是失败项编号。
+ * 详见 src/cache_hw.c 的实现注释。
+ */
+u32 cache_selftest(void);

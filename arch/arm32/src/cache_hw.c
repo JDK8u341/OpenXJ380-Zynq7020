@@ -349,3 +349,156 @@ bool cache_icache_enabled(void)
     return (arch_read_sctlr() & SCTLR_I) != 0u;
 }
 
+/* ------------------------------------------------------------------ */
+/* 按地址(MVA)的区间维护                                               */
+/* ------------------------------------------------------------------ */
+
+u32 cache_line_bytes(void)
+{
+    return cache_discover(false, 0u).line_bytes;
+}
+
+/*
+ * 三种区间维护的循环结构完全一样,区别只在写哪个 CP15 寄存器:
+ *
+ *   DCCMVAC  (c7,c10,1)  清洗     —— 写回到一致性点,行保留
+ *   DCIMVAC  (c7,c6,1)   失效     —— 丢弃,不写回
+ *   DCCIMVAC (c7,c14,1)  清洗并使失效
+ *
+ * ⚠ 这里**没有**逐个地址都做一次 DSB。整段做完之后统一 DSB 一次即可:
+ *   DSB 的作用是让之前发出的维护操作在后续访存之前完成,
+ *   而不是每条操作之后都要屏障一次。
+ *   逐条 DSB 会让 DMA 路径慢上几十倍,而收益为零。
+ */
+static void cache_range_op(uintptr_t addr, size_t size, cache_op_t op)
+{
+    cache_range_t range = cache_align_range(addr, size, cache_line_bytes());
+    uintptr_t     line;
+
+    if (cache_range_is_empty(&range)) {
+        return;
+    }
+
+    for (line = range.start; line < range.end; line += cache_line_bytes()) {
+        switch (op) {
+        case CACHE_OP_CLEAN:
+            arch_dcache_clean_mva(line);
+            break;
+        case CACHE_OP_CLEAN_INVALIDATE:
+            arch_dcache_clean_invalidate_mva(line);
+            break;
+        case CACHE_OP_INVALIDATE:
+        default:
+            arch_dcache_invalidate_mva(line);
+            break;
+        }
+    }
+
+    arch_dsb();
+}
+
+void cache_clean_range(uintptr_t addr, size_t size)
+{
+    cache_range_op(addr, size, CACHE_OP_CLEAN);
+}
+
+void cache_invalidate_range(uintptr_t addr, size_t size)
+{
+    cache_range_op(addr, size, CACHE_OP_INVALIDATE);
+}
+
+void cache_clean_invalidate_range(uintptr_t addr, size_t size)
+{
+    cache_range_op(addr, size, CACHE_OP_CLEAN_INVALIDATE);
+}
+
+/* ------------------------------------------------------------------ */
+/* 自检                                                                */
+/* ------------------------------------------------------------------ */
+
+/* 自检缓冲区。256 字节 = 8 行(32 字节行),足够覆盖多行情况 */
+#define SELFTEST_BYTES 256u
+#define SELFTEST_OLD   0xA5A5A5A5u
+#define SELFTEST_NEW   0x5A5A5A5Au
+
+static volatile u32 g_selftest_buf[SELFTEST_BYTES / 4u];
+
+/*
+ * 不用 DMA 也能验证缓存维护,靠的是"缓存与内存是两份副本"这个事实。
+ *
+ *   测试 1(证明缓存确实持有未写回的数据,且 invalidate 真的丢弃它):
+ *     先把 OLD 写进内存并让缓存失效 -> 此时内存与缓存都是 OLD
+ *     再写 NEW(只进缓存,还没写回)
+ *     invalidate                       -> 丢弃缓存里的 NEW
+ *     读回                             -> 应当是 OLD
+ *     若读回 NEW,说明 invalidate 没起作用(缓存根本没被丢弃);
+ *     若第一次就写不进缓存(缓存无效),这里也会看到 NEW ——
+ *     两种情况都能被这一个断言区分开。
+ *
+ *   测试 2(证明 clean 真的把数据写回了内存):
+ *     写 NEW 之后 clean(写回),再 invalidate(丢弃缓存副本),
+ *     读回应当是 NEW。若读回 OLD,说明 clean 没把数据写下去。
+ *
+ * 两个测试合起来把 clean 与 invalidate 的语义都钉住了,
+ * 而且完全不需要任何外设参与。
+ */
+u32 cache_selftest(void)
+{
+    u32 i;
+
+    /* ---- 测试 1:invalidate 丢弃未写回的数据 ---- */
+    for (i = 0; i < (SELFTEST_BYTES / 4u); i++) {
+        g_selftest_buf[i] = SELFTEST_OLD;
+    }
+    cache_clean_invalidate_range((uintptr_t)g_selftest_buf, SELFTEST_BYTES);
+
+    for (i = 0; i < (SELFTEST_BYTES / 4u); i++) {
+        g_selftest_buf[i] = SELFTEST_NEW;
+    }
+
+    cache_invalidate_range((uintptr_t)g_selftest_buf, SELFTEST_BYTES);
+
+    for (i = 0; i < (SELFTEST_BYTES / 4u); i++) {
+        if (g_selftest_buf[i] != SELFTEST_OLD) {
+            return 1u; /* invalidate 没有丢弃缓存里的新数据 */
+        }
+    }
+
+    /* ---- 测试 2:clean 把数据写回内存 ---- */
+    for (i = 0; i < (SELFTEST_BYTES / 4u); i++) {
+        g_selftest_buf[i] = SELFTEST_NEW;
+    }
+    cache_clean_range((uintptr_t)g_selftest_buf, SELFTEST_BYTES);
+
+    /* 丢弃缓存副本,强制从内存重新读 */
+    cache_invalidate_range((uintptr_t)g_selftest_buf, SELFTEST_BYTES);
+
+    for (i = 0; i < (SELFTEST_BYTES / 4u); i++) {
+        if (g_selftest_buf[i] != SELFTEST_NEW) {
+            return 2u; /* clean 没有把数据写回内存 */
+        }
+    }
+
+    /*
+     * ---- 测试 3:非整行对齐的区间必须覆盖到首尾所在的行 ----
+     *
+     * 取缓冲区中间 4 字节(落在某一行内部)做失效。
+     * 由于维护操作按行生效,这一行整体被丢弃;
+     * 若实现没有向外对齐,边界行会被漏掉,行为就不可预期。
+     * 这里只验证"调用不会出错且数据仍然自洽",对齐逻辑本身由宿主单测覆盖。
+     */
+    {
+        volatile u32 *mid = &g_selftest_buf[4];
+
+        *mid = SELFTEST_OLD;
+        cache_clean_range((uintptr_t)mid, 4u);
+        cache_invalidate_range((uintptr_t)mid, 4u);
+
+        if (*mid != SELFTEST_OLD) {
+            return 3u;
+        }
+    }
+
+    return 0u;
+}
+

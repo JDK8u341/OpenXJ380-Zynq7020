@@ -408,6 +408,27 @@ void kmain(void)
 
         HB[HB_SLOT_CACHEBENCH] = (after_us > 0u) ? (before_us / after_us) : 0u;
     }
+
+    /*
+     * 缓存维护自检。
+     *
+     * 这一步验证的是**DMA 路径所依赖的语义**,而不是缓存快不快:
+     * clean 是否真的把数据写回了内存、invalidate 是否真的丢弃了缓存副本。
+     * 两者任一不成立,DMA 就会出现"偶尔错几个字节"这类最难查的问题。
+     *
+     * 不需要任何外设参与 —— 靠的是"缓存与内存是两份副本"这个事实。
+     * 原理见 src/cache_hw.c 的 cache_selftest()。
+     */
+    {
+        u32 selftest = cache_selftest();
+
+        console_printf(" Cache maint : line=%u B  clean/invalidate selftest=%s\n", cache_line_bytes(),
+                       (selftest == 0u) ? "PASS" : "FAIL");
+        if (selftest != 0u) {
+            console_printf("               failed at check %u (see cache_hw.c)\n", selftest);
+        }
+        HB[HB_SLOT_CACHESELFTEST] = selftest;
+    }
     console_puts("\n");
 
     /* ---- 9. 主循环 ---- */
