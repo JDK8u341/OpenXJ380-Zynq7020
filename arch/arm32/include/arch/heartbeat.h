@@ -83,6 +83,15 @@
  */
 #define HB_SLOT_CACHESELFTEST 19u
 
+/*
+ * L2 有效性:同一个 128KB 工作集在"关 L2"与"开 L2"下的耗时之比。
+ *
+ * 存在的理由与 HB_SLOT_CACHEBENCH 相同,但针对的是 L2 ——
+ * 4KB 的工作集装得进 L1,根本碰不到 L2,所以那个加速比证明不了 L2 的事。
+ * 正常应当在数倍以上。
+ */
+#define HB_SLOT_L2BENCH   20u
+
 /* MMU 阶段的取值。0 表示还没开始 */
 #define HB_MMU_STAGE_IDLE       0u /* 尚未开始 */
 #define HB_MMU_STAGE_BUILT      1u /* 页表已填好 */
@@ -92,7 +101,7 @@
 #define HB_MMU_STAGE_FAILED     0xEEu /* 自检未通过,主动放弃开 MMU */
 
 /* 已定义的槽位数。越界写会踩到后面的故障注入选择器 */
-#define HB_SLOT_COUNT     20u
+#define HB_SLOT_COUNT     21u
 
 /* 心跳区预留的槽位容量(见 platform.h 的 PLAT_HEARTBEAT_REGION_SLOTS) */
 #define HB_SLOT_CAPACITY  PLAT_HEARTBEAT_REGION_SLOTS

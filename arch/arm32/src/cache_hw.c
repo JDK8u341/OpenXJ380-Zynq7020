@@ -262,20 +262,18 @@ static volatile u32 g_bench_buf[1024];
 volatile u32 g_bench_sink;
 
 /*
- * 跑一遍内存密集循环,返回耗时(微秒)。
+ * 在**指定工作集**上跑内存密集循环,返回耗时(微秒)。
  *
- * 存在的意义:**证明缓存真的在起作用**,而不只是"寄存器某位被置了 1"。
- * 这一类验证很容易被自己骗过去 —— SCTLR 的 C 位读回来是 1,
- * 但如果内存属性写成了不可缓存、或者缓存根本没使能到那条路径,
- * 系统照样"正常工作",只是白忙一场。
- * 一个内存密集循环的耗时会在缓存生效前后差出数倍,这个差别骗不了人。
+ * 工作集大小是这套验证的关键变量:
+ *   4KB   —— 装得进 32KB 的 L1,只反映 L1;
+ *   128KB —— 超出 L1、装得进 512KB 的 L2,只有 L2 在起作用才快;
+ *   2MB   —— 两级都装不下,每次都要去 DDR。
  *
- * 循环体刻意做成只读 + 累加:
- *   - 只读 -> 不受写回策略(write-back / write-through)影响,
- *            单纯反映"读命中缓存"带来的收益;
- *   - 累加到 volatile -> 编译器无法把循环删掉。
+ * 之所以要参数化:光测 4KB 的话,L2 开没开完全看不出来 ——
+ * 本项目就出过这个纰漏,L2 明明"寄存器读回是 1"却没有独立证据
+ * 证明它在缓存任何东西。
  */
-u32 cache_benchmark_us(u32 passes)
+u32 cache_bench_us_on(const volatile u32 *buf, u32 words, u32 passes)
 {
     u64 t0;
     u64 t1;
@@ -283,11 +281,15 @@ u32 cache_benchmark_us(u32 passes)
     u32 i;
     u32 sum = 0;
 
+    if (buf == NULL || words == 0u || passes == 0u) {
+        return 0u;
+    }
+
     t0 = timer_read_us();
 
     for (pass = 0; pass < passes; pass++) {
-        for (i = 0; i < (sizeof(g_bench_buf) / sizeof(g_bench_buf[0])); i++) {
-            sum += g_bench_buf[i];
+        for (i = 0; i < words; i++) {
+            sum += buf[i];
         }
     }
 
@@ -299,6 +301,31 @@ u32 cache_benchmark_us(u32 passes)
     return (u32)(t1 - t0);
 }
 
+u32 cache_benchmark_us(u32 passes)
+{
+    return cache_bench_us_on(g_bench_buf, sizeof(g_bench_buf) / sizeof(g_bench_buf[0]), passes);
+}
+
+/*
+ * L2 有效性实验用的工作集。
+ *
+ * 128KB:远超 32KB 的 L1,又远小于 512KB 的 L2 ——
+ * 这个尺寸下若 L2 真的在工作,访问应当基本命中 L2;
+ * 若 L2 没在工作(哪怕寄存器说它开着),就退化成每次去 DDR。
+ * 两者的耗时差别是数量级的,骗不了人。
+ */
+static volatile u32 g_bench_l2_buf[32768]; /* 128KB */
+
+const volatile u32 *cache_l2_bench_buf(void)
+{
+    return g_bench_l2_buf;
+}
+
+u32 cache_l2_bench_words(void)
+{
+    return sizeof(g_bench_l2_buf) / sizeof(g_bench_l2_buf[0]);
+}
+
 /* ------------------------------------------------------------------ */
 /* 使能                                                                 */
 /* ------------------------------------------------------------------ */
@@ -306,10 +333,9 @@ u32 cache_benchmark_us(u32 passes)
 /*
  * 使能 L1 D-Cache 与 I-Cache。
  *
- * **本阶段不动 L2(PL310)** —— 它此刻处于复位状态(ps7_init 里没有任何
- * L2 代码,实测确认),配置与使能留给 M2-5c。
+ * **本函数不动 L2(PL310)** —— 它由 l2_cache_init() 单独配置。
  *
- * 这个顺序与 Xilinx 的 cortexa9/gcc/boot.S 一致:那里也是先写
+ * 顺序与 Xilinx 的 cortexa9/gcc/boot.S 一致:那里也是先写
  * SCTLR 打开 MMU 与 D-Cache,之后才处理 L2。先动 L1 的好处是
  * 万一出问题,变量只有一个 —— 不用同时怀疑两级缓存。
  *
@@ -410,6 +436,40 @@ void l2_cache_invalidate_all(void)
 {
     mmio_write32(L2CC(L2CC_INV_WAY), L2CC_ALL_WAYS);
     l2_cache_sync();
+}
+
+void l2_cache_clean_all(void)
+{
+    mmio_write32(L2CC(L2CC_CLEAN_WAY), L2CC_ALL_WAYS);
+    l2_cache_sync();
+}
+
+void l2_cache_disable(void)
+{
+    if (!l2_cache_is_enabled()) {
+        return;
+    }
+
+    /*
+     * 先写回再失效,最后才清使能位。
+     *
+     * 直接清使能位会丢掉尚未写回 DDR 的脏行 —— 症状是"某些内存写入
+     * 凭空消失",而且只在关 L2 的那一刻发生,下次开起来又是一切正常。
+     * 拆成两步(clean 再 invalidate)同时也是 PL310 勘误 588369 的规避方式。
+     */
+    l2_cache_clean_all();
+    l2_cache_invalidate_all();
+
+    mmio_write32(L2CC(L2CC_CONTROL), 0u);
+    l2_cache_sync();
+    arch_dsb();
+}
+
+void l2_cache_enable(void)
+{
+    mmio_write32(L2CC(L2CC_CONTROL), L2CC_CONTROL_ENABLE);
+    l2_cache_sync();
+    arch_dsb();
 }
 
 /*

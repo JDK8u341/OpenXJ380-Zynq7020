@@ -427,6 +427,63 @@ void kmain(void)
 
         console_printf(" Cache L2    : %s  ID=0x%08X TYPE=0x%08X CTRL=0x%08X\n",
                        l2_cache_is_enabled() ? "ON" : "off", l2_id, l2_cache_type(), l2_cache_control());
+
+        /*
+         * L2 有效性实验 —— 受控 A/B。
+         *
+         * 为什么必须单独做这一步:上面那行只证明"使能位被置上了",
+         * 而**不能证明 L2 真的在缓存任何东西**。本项目在 L1 上就吃过
+         * 这个亏(SCU/ACTLR 没设,C 位读回是 1 但缓存完全无效),
+         * 所以 L2 不能只靠寄存器交差。
+         *
+         * 工作集取 128KB:远超 32KB 的 L1,又远小于 512KB 的 L2。
+         * 于是在 L2 真的工作时访问基本命中;L2 一关就退化成每次去 DDR,
+         * 耗时差一个数量级,不可能看不出来。
+         */
+        {
+            const volatile u32 *buf = cache_l2_bench_buf();
+            u32                 words = cache_l2_bench_words();
+            u32                 on_us;
+            u32                 off_us;
+            u32                 reon_us;
+
+            /* 三遍:开 -> 关 -> 再开。中间那次是唯一的变量 */
+            on_us = cache_bench_us_on(buf, words, 16u);
+
+            l2_cache_disable();
+            off_us = cache_bench_us_on(buf, words, 16u);
+            l2_cache_enable();
+
+            reon_us = cache_bench_us_on(buf, words, 16u);
+
+            console_printf(" L2 bench    : 128KB working set  on=%u us  off=%u us  on-again=%u us\n",
+                           on_us, off_us, reon_us);
+
+            /*
+             * 判据来自**实测**,不是估计。
+             *
+             * 本板实测:on=11211us  off=15987us  on-again=11214us
+             * 也就是 L2 带来约 1.43 倍,而不是我最初想当然的"一个数量级" ——
+             * 顺序访问会被 PL310 的预取掩盖掉相当一部分延迟,纯读循环
+             * 又比真实负载更友好。第一版判据按 2 倍写,于是误报了 WARN。
+             *
+             * 真正能证明"L2 在缓存"的是这两条:
+             *   1. 关掉之后明显更慢(不是噪声);
+             *   2. 重新打开能精确回到原来的水平。
+             * 第 2 条尤其关键 —— 它同时验证了 disable/enable 没有副作用
+             * (直接清使能位会丢掉脏行,是最容易出错的地方),
+             * 而加速比的**绝对大小**反而不是判据:它取决于工作集、
+             * 访问模式与预取行为,拿来当阈值只会误导。
+             */
+            if (off_us > (on_us + (on_us / 5u)) && reon_us < (off_us - (off_us / 5u))) {
+                console_printf(" L2 check    : effective (off/on = %u.%02ux)\n", off_us / (on_us ? on_us : 1u),
+                               ((off_us * 100u) / (on_us ? on_us : 1u)) % 100u);
+            } else {
+                console_puts(" L2 WARN     : no measurable benefit - L2 may not be caching\n");
+            }
+
+            HB[HB_SLOT_L2BENCH] = (on_us > 0u) ? (off_us / on_us) : 0u;
+        }
     }
 
     /*

@@ -450,6 +450,35 @@ void l2_cache_sync(void);
 /* 整块失效(按 Way)。只在单核启动阶段、使能之前用 */
 void l2_cache_invalidate_all(void);
 
+/*
+ * 整块写回(按 Way)。
+ *
+ * ⚠ 这里是"只清洗"而不是"清洗并失效":后者(0x7FC)正是 PL310 勘误 727915
+ *   涉及的那条路径。要"刷新整个 L2"时,应当像 588369 的规避一样
+ *   拆成两步 —— 先 clean_all() 再 invalidate_all()。
+ */
+void l2_cache_clean_all(void);
+
+/*
+ * 关闭 / 使能 L2 的使能位。
+ *
+ * disable() 会**先写回再失效**再清使能位:直接清使能位会丢掉尚未写回的
+ * 脏行,表现为"某些内存写入凭空消失",而且只在关 L2 的那一刻发生。
+ *
+ * 这两个接口的用途是让上层能做"开/关 L2 的对照实验" ——
+ * 光看控制寄存器读回 1,并不能说明 L2 真的在缓存任何东西,
+ * 必须用超出 L1 容量、又能装进 L2 的工作集去测出差别。
+ */
+void l2_cache_disable(void);
+void l2_cache_enable(void);
+
+/* 在指定工作集上跑内存密集循环,返回耗时(微秒) */
+u32 cache_bench_us_on(const volatile u32 *buf, u32 words, u32 passes);
+
+/* L2 有效性实验用的 128KB 工作集(超出 L1、装得进 L2) */
+const volatile u32 *cache_l2_bench_buf(void);
+u32 cache_l2_bench_words(void);
+
 bool l2_cache_is_enabled(void);
 
 /* 诊断:Cache ID / Type / 控制寄存器 */
