@@ -238,20 +238,11 @@
 /* ------------------------------------------------------------------ */
 
 /*
- * SCTLR(System Control Register)常用位。
- * Xilinx boot.S 用的初值是 0b01000000000101 = 0x4005,
- * 即 M(MMU) + C(D-Cache) + RR(轮转替换),**不含 I(I-Cache)**。
+ * SCTLR 的位定义在 arch/cpu.h —— 它是 CPU 的系统控制寄存器,
+ * 不是 MMU 专有的(其中 M 位是 MMU 使能,C/I 位是缓存使能,
+ * 缓存侧也要用)。放在 cpu.h 里可以避免"缓存模块为了拿一个位
+ * 定义去包含 MMU 头文件"这种反向依赖。
  */
-#define SCTLR_M   (1u << 0)   /* MMU 使能 */
-#define SCTLR_A   (1u << 1)   /* 地址对齐检查 */
-#define SCTLR_C   (1u << 2)   /* 数据缓存使能 */
-#define SCTLR_I   (1u << 12)  /* 指令缓存使能 */
-#define SCTLR_V   (1u << 13)  /* 异常向量基址:0=0x00000000,1=0xFFFF0000 */
-#define SCTLR_RR  (1u << 14)  /* 缓存替换策略:1=轮转 */
-#define SCTLR_Z   (1u << 11)  /* 分支预测使能 */
-#define SCTLR_U   (1u << 22)  /* 不对齐访问使能(ARMv7 应置 1) */
-#define SCTLR_XP  (1u << 23)  /* 异常向量:0=ARM 态 */
-#define SCTLR_EE  (1u << 25)  /* 异常字节序:0=小端 */
 
 /*
  * TTBR0 低位属性。Xilinx boot.S 的做法是把表基址与 0x5B 或起来
@@ -261,14 +252,9 @@
 #define TTBR0_ATTR_XILINX  0x5Bu
 
 /*
- * ACTLR(Auxiliary Control Register)位。
- * bit6 = SMP(参与 SCU 一致性),bit0 = 缓存/TLB 维护广播。
- * 单核阶段也要置位:SMP 位影响的是缓存一致性行为的定义,
- * 不置位会在后续加第二个核时出问题,而那时很难联想到这里。
+ * ACTLR 的位定义在 arch/cpu.h —— 与 SCTLR 同理,它是 CPU 的辅助控制
+ * 寄存器,缓存侧也要用(ACTLR.SMP 直接决定 L1 能不能缓存 Shareable 内存)。
  */
-#define ACTLR_SMP           (1u << 6)
-#define ACTLR_FW            (1u << 0)
-#define ACTLR_XILINX_INIT   (ACTLR_SMP | ACTLR_FW)
 
 /* ------------------------------------------------------------------ */
 /* 纯函数:地址 -> 表索引                                               */

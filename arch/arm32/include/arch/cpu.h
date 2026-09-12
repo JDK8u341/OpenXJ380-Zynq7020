@@ -109,6 +109,27 @@ static inline u32 arch_read_sctlr(void)
     return value;
 }
 
+/*
+ * SCTLR(System Control Register)常用位。
+ *
+ * 住在这里而不是 mmu.h:它是 CPU 的系统控制寄存器,不只服务 MMU ——
+ * M 位是地址转换使能,C/I 位是缓存使能,两边都要用。
+ * 放在 cpu.h 可以让缓存模块不必为了一个位定义去包含 MMU 头文件。
+ *
+ * Xilinx boot.S 用的初值是 0b01000000000101 = 0x4005,
+ * 即 M(MMU) + C(D-Cache) + RR,注意**不含 I(I-Cache)**。
+ */
+#define SCTLR_M   (1u << 0)   /* MMU 使能 */
+#define SCTLR_A   (1u << 1)   /* 地址对齐检查 */
+#define SCTLR_C   (1u << 2)   /* 数据缓存使能 */
+#define SCTLR_Z   (1u << 11)  /* 分支预测使能 */
+#define SCTLR_I   (1u << 12)  /* 指令缓存使能 */
+#define SCTLR_V   (1u << 13)  /* 异常向量基址:0=VBAR,1=0xFFFF0000 */
+#define SCTLR_RR  (1u << 14)  /* 缓存替换策略:1=轮转 */
+#define SCTLR_U   (1u << 22)  /* 不对齐访问使能(ARMv7 应置 1) */
+#define SCTLR_XP  (1u << 23)  /* 异常向量:0=ARM 态 */
+#define SCTLR_EE  (1u << 25)  /* 异常字节序:0=小端 */
+
 static inline void arch_write_sctlr(u32 value)
 {
     __asm__ volatile("mcr p15, 0, %0, c1, c0, 0" ::"r"(value) : "memory");
@@ -173,6 +194,40 @@ static inline u32 arch_read_mpidr(void)
     __asm__ volatile("mrc p15, 0, %0, c0, c0, 5" : "=r"(value));
     return value;
 }
+
+/*
+ * ACTLR(Auxiliary Control Register, CP15 c1,c0,1)。
+ *
+ * ⚠ 这个寄存器在移植时极易被整个忘掉 —— 它不影响地址转换,
+ *   漏了也不会报任何错,只表现为"缓存开了但完全没有加速"。
+ *   本项目就踩过:见 cortexa9_actlr_init() 的说明。
+ */
+static inline u32 arch_read_actlr(void)
+{
+    u32 value;
+    __asm__ volatile("mrc p15, 0, %0, c1, c0, 1" : "=r"(value));
+    return value;
+}
+
+static inline void arch_write_actlr(u32 value)
+{
+    __asm__ volatile("mcr p15, 0, %0, c1, c0, 1" ::"r"(value) : "memory");
+    arch_isb();
+}
+
+/*
+ * ACTLR 的位。
+ *
+ * bit6(SMP)决定了本核是否参与 SCU 一致性 —— 它直接影响
+ * **L1 能不能缓存 Shareable 内存**:DDR 在区域表里是 S=1,
+ * 而 SMP 位没置时那些访问不会进 L1,表现为"缓存开着但没加速"。
+ *
+ * bit0(FW)是缓存/TLB 维护操作的广播。单核阶段置位看着没用,
+ * 但它定义的是维护操作的行为;等 M4 加第二个核时少了它会出现
+ * "清了缓存但别的核看不见",而那时很难联想到是启动阶段漏了一位。
+ */
+#define ACTLR_FW            (1u << 0) /* 缓存/TLB 维护广播 */
+#define ACTLR_SMP           (1u << 6) /* 参与 SCU 一致性 */
 
 static inline u32 arch_cpu_id(void)
 {

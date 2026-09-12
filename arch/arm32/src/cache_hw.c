@@ -38,6 +38,7 @@
 #include <arch/cpu.h>
 #include <arch/io.h>
 #include <arch/platform.h>
+#include <arch/timer.h>
 #include <arch/types.h>
 
 /* ------------------------------------------------------------------ */
@@ -155,6 +156,66 @@ void cache_invalidate_before_enable(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Coherency 前置条件:SCU + ACTLR                                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * ⚠ 这两步在移植时极易被整个漏掉,而漏了**不会报任何错** ——
+ *   地址转换照样工作、系统照样跑,唯一的症状是"缓存开了但完全没有加速"。
+ *   本项目就踩过:基准测试测出 off=24704us on=24701us,速度比 1x。
+ *
+ * 原因在于区域表把 DDR 映射成了 **Shareable(S=1)** —— 与 Xilinx 原表一致。
+ * Cortex-A9 上,可共享的访问要走 SCU 做一致性检查;而 SCU 没使能、
+ * ACTLR 的 SMP 位也没置时,这些访问的一致性无从保证,
+ * 硬件于是干脆不把它们放进 L1。结果就是缓存"开着但没用"。
+ *
+ * Xilinx 的 cortexa9/gcc/boot.S 里这两步都在,顺序是:
+ *   使能 SCU -> 配 TTBR0/DACR -> 开 MMU+D-Cache -> 写 ACTLR
+ * 本函数把前两步合并,在 mmu_enable() 之前调用。
+ *
+ * ⚠ SCU 必须在**缓存使能之前**打开。反过来的话,缓存里可能已经存了
+ *   未经一致性检查的数据,再打开 SCU 并不能追溯修正它们。
+ */
+void cortexa9_coherency_init(void)
+{
+    u32 scu_ctrl;
+    u32 actlr;
+
+    /* 1. 使能 SCU(bit0)。此处 MMU 还没有开,访问的是物理地址 */
+    scu_ctrl = mmio_read32(PLAT_SCU_BASE);
+    if ((scu_ctrl & 1u) == 0u) {
+        mmio_write32(PLAT_SCU_BASE, scu_ctrl | 1u);
+    }
+    arch_dsb();
+
+    /*
+     * 2. ACTLR:
+     *      bit6 = SMP       —— 参与 SCU 一致性
+     *      bit0 = FW        —— 缓存/TLB 维护操作广播到其它核
+     *
+     *    单核阶段置 bit0 看着没用,但它决定的是"维护操作的行为定义"。
+     *    等 M4 加第二个核时,少了它会出现"清了缓存但别的核看不见",
+     *    而那时很难联想到是启动阶段漏了这么一位。
+     */
+    actlr = arch_read_actlr();
+    actlr |= ACTLR_SMP | ACTLR_FW;
+    arch_write_actlr(actlr);
+
+    arch_dsb();
+    arch_isb();
+}
+
+u32 cortexa9_scu_status(void)
+{
+    return mmio_read32(PLAT_SCU_BASE);
+}
+
+u32 cortexa9_actlr_status(void)
+{
+    return arch_read_actlr();
+}
+
+/* ------------------------------------------------------------------ */
 /* 几何诊断                                                             */
 /* ------------------------------------------------------------------ */
 
@@ -162,3 +223,129 @@ u32 cache_total_bytes(bool instruction, u32 level)
 {
     return cache_discover(instruction, level).total_bytes;
 }
+
+/* ------------------------------------------------------------------ */
+/* 缓存有效性基准                                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 4KB 工作缓冲区。放在 .bss 里 —— 那属于 DDR 的 Normal WB 段,
+ * 正是要被缓存的那类内存。
+ *
+ * 4KB 远小于 32KB 的 L1,所以只要缓存真的在起作用,
+ * 第一遍之后所有访问都应当命中。
+ *
+ * ⚠ 必须是 volatile,而且这不是"保险起见"。
+ *
+ *   第一版没加 volatile,结果这个基准测试**被编译器整体优化掉了**:
+ *   数组在 .bss 里、编译期就知道全是 0,于是 GCC 直接把 1024 个 0
+ *   求和折叠成常数 0,整个循环消失。实测读出 "off=7us on=7us" ——
+ *   20 万次访存只用 7us(666MHz 下才 4662 个周期),物理上不可能。
+ *
+ *   这个错误恰好被基准测试自己的判据抓到了:速度比 1x 触发警告。
+ *   如果当初只判断"寄存器位是否为 1",这次就会安静地通过 ——
+ *   而验证工具本身失效,比没有验证更危险。
+ */
+static volatile u32 g_bench_buf[1024];
+
+/* 用来吃掉累加结果,防止编译器把整个循环优化掉 */
+volatile u32 g_bench_sink;
+
+/*
+ * 跑一遍内存密集循环,返回耗时(微秒)。
+ *
+ * 存在的意义:**证明缓存真的在起作用**,而不只是"寄存器某位被置了 1"。
+ * 这一类验证很容易被自己骗过去 —— SCTLR 的 C 位读回来是 1,
+ * 但如果内存属性写成了不可缓存、或者缓存根本没使能到那条路径,
+ * 系统照样"正常工作",只是白忙一场。
+ * 一个内存密集循环的耗时会在缓存生效前后差出数倍,这个差别骗不了人。
+ *
+ * 循环体刻意做成只读 + 累加:
+ *   - 只读 -> 不受写回策略(write-back / write-through)影响,
+ *            单纯反映"读命中缓存"带来的收益;
+ *   - 累加到 volatile -> 编译器无法把循环删掉。
+ */
+u32 cache_benchmark_us(u32 passes)
+{
+    u64 t0;
+    u64 t1;
+    u32 pass;
+    u32 i;
+    u32 sum = 0;
+
+    t0 = timer_read_us();
+
+    for (pass = 0; pass < passes; pass++) {
+        for (i = 0; i < (sizeof(g_bench_buf) / sizeof(g_bench_buf[0])); i++) {
+            sum += g_bench_buf[i];
+        }
+    }
+
+    t1 = timer_read_us();
+
+    /* 写进 volatile,确保上面的循环不会被判定为无副作用而删除 */
+    g_bench_sink = sum;
+
+    return (u32)(t1 - t0);
+}
+
+/* ------------------------------------------------------------------ */
+/* 使能                                                                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 使能 L1 D-Cache 与 I-Cache。
+ *
+ * **本阶段不动 L2(PL310)** —— 它此刻处于复位状态(ps7_init 里没有任何
+ * L2 代码,实测确认),配置与使能留给 M2-5c。
+ *
+ * 这个顺序与 Xilinx 的 cortexa9/gcc/boot.S 一致:那里也是先写
+ * SCTLR 打开 MMU 与 D-Cache,之后才处理 L2。先动 L1 的好处是
+ * 万一出问题,变量只有一个 —— 不用同时怀疑两级缓存。
+ *
+ * ⚠ 三步的顺序不能变:
+ *     1. 失效 D-Cache / I-Cache / 分支预测器
+ *     2. (紧接着)写 SCTLR 使能
+ *     3. 中间不要插入会分配缓存行的访存
+ *
+ *   第 3 条容易被忽略:失效之后如果还去读了一大片数据,
+ *   那些访问在缓存已使能的情况下会重新分配缓存行,把刚清干净的缓存
+ *   又填上未知内容 —— 于是"先失效"这一步白做了,而且不留任何痕迹。
+ */
+void cache_enable_l1(void)
+{
+    u32 sctlr;
+
+    /* 1. 清干净 */
+    cache_invalidate_before_enable();
+
+    /* 2. 使能。D-Cache 与 I-Cache 一起开:I-Cache 的失效刚做过,
+     *    而两者独立,一起开不会互相影响。 */
+    sctlr = arch_read_sctlr();
+    sctlr |= SCTLR_C | SCTLR_I;
+    arch_write_sctlr(sctlr);
+
+    arch_dsb();
+    arch_isb();
+
+    /*
+     * 3. 到这里已经在缓存下运行了。
+     *
+     * 紧接着做一次自检:如果 I-Cache 或 D-Cache 有任何一致性问题,
+     * 最可能的表现就是"接下来的第一次函数调用取到错的指令"
+     * 或者"读回的值不对"。所以这里立刻读回一个已知常量,
+     * 让问题在最早的时刻暴露,而不是等到几百毫秒后的主循环。
+     */
+    (void)arch_read_sctlr();
+}
+
+bool cache_dcache_enabled(void)
+{
+    return (arch_read_sctlr() & SCTLR_C) != 0u;
+}
+
+bool cache_icache_enabled(void)
+{
+    return (arch_read_sctlr() & SCTLR_I) != 0u;
+}
+

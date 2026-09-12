@@ -197,3 +197,35 @@ void cache_dcache_clean_invalidate_all(void);
  * 否则又引入了新的未知内容,这一步就白做了。
  */
 void cache_invalidate_before_enable(void);
+
+/* 使能 L1 D-Cache 与 I-Cache(本阶段不动 L2,见 src/cache_hw.c) */
+void cache_enable_l1(void);
+
+/*
+ * Coherency 前置条件:使能 SCU 并设置 ACTLR(SMP + 维护广播)。
+ *
+ * **必须在任何缓存使能之前调用。**
+ *
+ * ⚠ 漏掉它的症状极具迷惑性:地址转换照常、系统照常跑、SCTLR 的 C/I 位
+ *   读回来都是 1,唯独缓存完全没有加速效果 —— 因为 DDR 是 Shareable 映射,
+ *   而 Cortex-A9 在 SCU 未使能、ACTLR.SMP 未置位时不会把可共享访问放进 L1。
+ *   见 src/cache_hw.c 的说明。本项目踩过一次,靠耗时基准才发现。
+ */
+void cortexa9_coherency_init(void);
+
+/* 读回 SCU 控制寄存器与 ACTLR,用于诊断输出 */
+u32 cortexa9_scu_status(void);
+u32 cortexa9_actlr_status(void);
+
+bool cache_dcache_enabled(void);
+bool cache_icache_enabled(void);
+
+/*
+ * 内存密集循环的耗时(微秒),用于**证明缓存真的在起作用**。
+ *
+ * 存在的意义:光看 SCTLR 的 C 位读回 1 不能说明缓存有效 ——
+ * 内存属性写错、或者缓存没覆盖到那条路径,系统照样"正常工作",
+ * 只是白忙一场。跑一段内存密集循环,缓存生效前后耗时会差出数倍,
+ * 这个差别骗不了人。
+ */
+u32 cache_benchmark_us(u32 passes);

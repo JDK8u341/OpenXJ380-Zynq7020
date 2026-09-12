@@ -123,6 +123,7 @@ void kmain(void)
     u32      loop_count = 0;
     u32      last_step  = 0xFFFFFFFFu;
     u32      last_ps    = 0xFFFFFFFFu;
+    u32      before_us  = 0; /* 使能缓存前的基准耗时 */
     bool     uart_present;
 
     /* static: 由 BSS 自动清零。这样在"无串口"路径下打印诊断也不会读未初始化值 */
@@ -347,13 +348,69 @@ void kmain(void)
                        igeo.sets, igeo.line_bytes);
         console_printf(" Cache check : %s (expect D and I both 32KB 4-way 32B/line 256 sets)\n",
                        (d_ok && i_ok) ? "MATCH" : "MISMATCH");
-        console_printf(" Caches now  : D=%s I=%s (enabling is the next step)\n",
-                       (arch_read_sctlr() & SCTLR_C) ? "on" : "off",
-                       (arch_read_sctlr() & SCTLR_I) ? "on" : "off");
+
+        /*
+         * 使能前先跑一遍基准。
+         *
+         * 这一段本身在**无缓存**下执行(代码从 DDR 取指),所以耗时很长 ——
+         * 这正是我们要拿来当对照的值。200 遍 × 4KB 读。
+         */
+        before_us = cache_benchmark_us(200u);
     }
     console_puts("\n");
 
-    /* ---- 8. 主循环 ---- */
+    /* ---- 8. 使能 L1 缓存 ---- */
+    /*
+     * 顺序不能变:先做 coherency 前置条件(SCU + ACTLR),
+     * 再使能缓存。
+     *
+     * ⚠ 漏掉 coherency_init 的症状极具迷惑性 —— 地址转换照常、系统照常跑、
+     *   SCTLR 的 C/I 位读回来都是 1,唯独缓存完全不起作用。
+     *   原因是 DDR 映射为 Shareable(S=1),而 SCU 未使能、ACTLR.SMP 未置位时
+     *   Cortex-A9 不会把可共享访问放进 L1。本项目踩过一次,
+     *   靠下面的耗时基准才发现 —— 光看寄存器是发现不了的。
+     */
+    console_puts(" Cache: enabling SCU + ACTLR (coherency preconditions)...\n");
+    cortexa9_coherency_init();
+
+    console_puts(" Cache: invalidating and enabling L1 D/I-cache...\n");
+    timer_delay_ms(20);
+
+    cache_enable_l1();
+
+    /*
+     * 能执行到这里就已经说明了一部分事情:cache_enable_l1() 里写 SCTLR
+     * 之后,**取指与访存都经过了缓存**并且成功了。否则回不到这一行。
+     */
+    {
+        u32 after_us = cache_benchmark_us(200u);
+
+        console_printf(" Caches      : D=%s I=%s  SCTLR=0x%08X\n",
+                       cache_dcache_enabled() ? "ON" : "off", cache_icache_enabled() ? "ON" : "off",
+                       arch_read_sctlr());
+        console_printf(" Coherency   : SCU=0x%08X ACTLR=0x%08X\n", cortexa9_scu_status(),
+                       cortexa9_actlr_status());
+        console_printf(" Cache bench : off=%u us  on=%u us  speedup=%ux\n", before_us, after_us,
+                       (after_us > 0u) ? (before_us / after_us) : 0u);
+
+        /*
+         * 判断依据是**加速比**,不是寄存器位。
+         *
+         * 缓存使能后如果耗时几乎没变,说明缓存没有真正覆盖到这条路径
+         * (最常见的原因是内存属性被写成了不可缓存)。这种情况下
+         * SCTLR 的 C 位照样是 1,系统也照样跑 —— 只有这个比值能揭穿。
+         */
+        if (after_us > 0u && before_us > (after_us * 2u)) {
+            console_puts(" Cache check : caches are demonstrably effective\n");
+        } else {
+            console_puts(" Cache WARN  : little speedup - caches may not be covering this memory\n");
+        }
+
+        HB[HB_SLOT_CACHEBENCH] = (after_us > 0u) ? (before_us / after_us) : 0u;
+    }
+    console_puts("\n");
+
+    /* ---- 9. 主循环 ---- */
     /*
      * 节奏完全由全局定时器决定,不依赖软件延时循环 ——
      * 这样即使 CPU 频率变化,闪烁频率也保持一致。

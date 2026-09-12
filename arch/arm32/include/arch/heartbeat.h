@@ -65,6 +65,15 @@
  */
 #define HB_SLOT_TICKGAP   17u
 
+/*
+ * 缓存加速比(使能缓存前后同一个内存密集循环的耗时之比)。
+ *
+ * 存在的意义同 maxgap:光看 SCTLR 的 C 位读回 1 不能说明缓存有效 ——
+ * 内存属性写错时系统照样跑,只是白忙一场。这个比值能揭穿那种情况。
+ * 正常情况下应当在数倍以上。
+ */
+#define HB_SLOT_CACHEBENCH 18u
+
 /* MMU 阶段的取值。0 表示还没开始 */
 #define HB_MMU_STAGE_IDLE       0u /* 尚未开始 */
 #define HB_MMU_STAGE_BUILT      1u /* 页表已填好 */
@@ -74,7 +83,7 @@
 #define HB_MMU_STAGE_FAILED     0xEEu /* 自检未通过,主动放弃开 MMU */
 
 /* 已定义的槽位数。越界写会踩到后面的故障注入选择器 */
-#define HB_SLOT_COUNT     18u
+#define HB_SLOT_COUNT     19u
 
 /* 心跳区预留的槽位容量(见 platform.h 的 PLAT_HEARTBEAT_REGION_SLOTS) */
 #define HB_SLOT_CAPACITY  PLAT_HEARTBEAT_REGION_SLOTS
