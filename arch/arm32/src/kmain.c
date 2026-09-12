@@ -15,6 +15,7 @@
  */
 
 #include <arch/console.h>
+#include <arch/fault_test.h>
 #include <arch/io.h>
 #include <arch/irq.h>
 #include <arch/led.h>
@@ -280,6 +281,12 @@ void kmain(void)
                                irq_get_stats()->irq_count, (u32)(timer_read_us() / 1000u));
             }
         }
+
+        /*
+         * 故障注入钩子:JTAG 往 PLAT_FAULT_SEL_ADDR 写码即触发对应异常,
+         * 用来验证异常诊断路径。详见 arch/fault_test.h。
+         */
+        fault_test_poll();
     }
 
     /* 不会到这里 */

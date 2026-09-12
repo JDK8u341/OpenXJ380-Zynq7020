@@ -212,3 +212,9 @@
  */
 #define PLAT_HEARTBEAT_BASE 0x00020000u
 #define PLAT_HEARTBEAT_MAGIC 0x4F583338u /* "OXJ8" */
+
+/*
+ * 故障注入选择器。放在心跳区之后,由 JTAG 写入以触发指定异常,
+ * 见 arch/fault_test.h 与 arch/arm32/README.md 的验证章节。
+ */
+#define PLAT_FAULT_SEL_ADDR 0x00020040u

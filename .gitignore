@@ -65,3 +65,8 @@ venv/
 # 板级参考资料(原理图 PDF、Vivado 导出的 XSA):体积大且是二进制,
 # 不适合进版本库。需要时放在本地即可;确实要提交用 git add -f。
 /other-infos/
+
+# Vivado/Vitis 从 XSA 生成的文件(ps7_init.c 一万多行,design_1.hwh 是
+# 硬件描述)。JTAG 流程实际需要的只有同目录下的 ps7_init_uart1.tcl。
+/tmp-test/zynq/ps7_init_uart1.c
+/tmp-test/zynq/design_1.hwh
