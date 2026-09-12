@@ -95,6 +95,26 @@ void fault_test_trigger(u32 selector)
         return;
     }
 
+    case FAULT_SEL_XN_FETCH: {
+        console_puts("    branching into the XN-marked PS peripheral region\n");
+        console_puts("      -> expect Prefetch Abort with IFSR=0x0D (permission fault)\n");
+        timer_delay_ms(50);
+
+        /*
+         * 挑 UART1 的地址:它在页表里是 Device 且带 XN。
+         *
+         * 这里刻意不复用 FAULT_SEL_PREFETCH 用的 0x50000000 ——
+         * 那个地址没有映射(XN 与否都会报外部异常),区分不出 XN 是否生效。
+         * 只有"已映射 + 明确标了 XN"的地址才能验证 XN 这条路径。
+         */
+        __asm__ volatile("ldr r0, =0xE0001000\n\t"
+                         "blx r0\n\t"
+                         :
+                         :
+                         : "r0", "lr", "memory");
+        break;
+    }
+
     default:
         console_puts("    unknown selector, nothing triggered\n");
         break;

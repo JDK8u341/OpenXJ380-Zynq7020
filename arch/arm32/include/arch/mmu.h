@@ -214,6 +214,25 @@
 #define MMU_L1_ATTR_XN  (1u << 4)
 #define MMU_L2_ATTR_XN  (1u << 0)
 
+/*
+ * 带 XN 的段属性。
+ *
+ * ⚠ XN 与 AP 受不同的机制管辖,别混为一谈:
+ *     AP   —— 只在 DACR 该域为 client 模式时才参与判定,
+ *             manager 模式下被完全忽略,任何权限错误都不报;
+ *     XN   —— **始终生效**,与 DACR 无关。
+ *
+ *   所以即使在 manager 模式下(本项目当前状态),加了 XN 的区域
+ *   一旦被取指就会立刻产生权限故障。这让 XN 成为当前唯一能真正
+ *   约束住内核自身的属性位。
+ *
+ * 哪些区域加、哪些不加,理由见 src/mmu.c 区域表的注释 ——
+ * 简单说:只有**确定是纯数据**的区域才加。
+ */
+#define MMU_ATTR_NORMAL_NC_XN   (MMU_ATTR_NORMAL_NC | MMU_L1_ATTR_XN)
+#define MMU_ATTR_DEVICE_XN      (MMU_ATTR_DEVICE | MMU_L1_ATTR_XN)
+#define MMU_ATTR_STRONG_ORDERED_XN (MMU_ATTR_STRONG_ORDERED | MMU_L1_ATTR_XN)
+
 /* ------------------------------------------------------------------ */
 /* CP15 相关位定义                                                      */
 /* ------------------------------------------------------------------ */

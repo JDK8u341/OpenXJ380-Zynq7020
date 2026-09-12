@@ -379,14 +379,18 @@ int main(void)
         /* -- PS 外设:UART1 -- */
         check_u32(mmu_l1_index(0xE0001000u), mmu_l1_index(0xE0000000u),
                   "UART1 must share a section with the start of PS peripherals");
-        check_u32(table[mmu_l1_index(0xE0001000u)] & 0xFFFFFu, 0xC06u,
-                  "UART1 section must be Device");
+        check_u32(table[mmu_l1_index(0xE0001000u)] & 0xFFFFFu, MMU_ATTR_DEVICE_XN & 0xFFFFFu,
+                  "UART1 section must be Device + XN");
 
         /* -- SLCR / SCU / GIC -- */
-        check_u32(table[mmu_l1_index(0xF8000000u)] & 0xFFFFFu, 0xC06u, "SLCR must be Device");
-        check_u32(table[mmu_l1_index(0xF8F00000u)] & 0xFFFFFu, 0xC06u, "SCU must be Device");
-        check_u32(table[mmu_l1_index(0xF8F01000u)] & 0xFFFFFu, 0xC06u, "GIC distributor must be Device");
-        check_u32(table[mmu_l1_index(0xF8F00100u)] & 0xFFFFFu, 0xC06u, "GIC CPU interface must be Device");
+        check_u32(table[mmu_l1_index(0xF8000000u)] & 0xFFFFFu, MMU_ATTR_DEVICE_XN & 0xFFFFFu,
+                  "SLCR must be Device + XN");
+        check_u32(table[mmu_l1_index(0xF8F00000u)] & 0xFFFFFu, MMU_ATTR_DEVICE_XN & 0xFFFFFu,
+                  "SCU must be Device + XN");
+        check_u32(table[mmu_l1_index(0xF8F01000u)] & 0xFFFFFu, MMU_ATTR_DEVICE_XN & 0xFFFFFu,
+                  "GIC distributor must be Device + XN");
+        check_u32(table[mmu_l1_index(0xF8F00100u)] & 0xFFFFFu, MMU_ATTR_DEVICE_XN & 0xFFFFFu,
+                  "GIC CPU interface must be Device + XN");
 
         /* -- 高位 OCM 别名:与低位属性一致 -- */
         check_u32(table[mmu_l1_index(0xFFF00000u)], 0x11DE2u | 0xFFF00000u,
@@ -454,6 +458,68 @@ int main(void)
 
             check_u32(mismatched, 0u, "every mapped section must be an identity mapping");
         }
+    }
+
+    /* ============================================================== */
+    /* 10b. XN(不可执行)的取舍 —— 哪些区域标、哪些刻意不标           */
+    /* ============================================================== */
+    {
+        static unsigned int table[MMU_L1_ENTRY_COUNT];
+        unsigned int ocm_low;
+        unsigned int ocm_high;
+        unsigned int ddr;
+        unsigned int ps;
+        unsigned int slcr;
+        unsigned int pl;
+
+        mmu_build_l1_table(table);
+
+        ocm_low  = table[mmu_l1_index(0x00020000u)];
+        ocm_high = table[mmu_l1_index(0xFFFF0000u)];
+        ddr      = table[mmu_l1_index(0x00100000u)];
+        ps       = table[mmu_l1_index(0xE0001000u)];
+        slcr     = table[mmu_l1_index(0xF8F01000u)];
+        pl       = table[mmu_l1_index(0x41200000u)];
+
+        /* -- 纯数据区域必须带 XN -- */
+        check((ps & MMU_L1_ATTR_XN) != 0u, "PS peripherals must be non-executable");
+        check((slcr & MMU_L1_ATTR_XN) != 0u, "SLCR/SCU/GIC must be non-executable");
+
+        /* -- 刻意不标 XN 的两处,各有一个具体理由 -- */
+        /*
+         * 低 1MB:计划里的 SMP 方案要用 OCM 放 CPU1 的启动跳板,
+         * 那段代码将来就要在 OCM 里执行。现在标成不可执行会在做 SMP 时
+         * 炸掉,而且那个失败离今天的改动很远,很难联想到。
+         */
+        check((ocm_low & MMU_L1_ATTR_XN) == 0u,
+              "low OCM stays executable: the SMP trampoline will live there");
+        /*
+         * PL:将来可能有需要取指的东西(软核 BRAM / 从 PL 加载的代码段),
+         * 而当前这块 PL 只是个占位的 AXI GPIO,没理由替未来的设计做决定。
+         */
+        check((pl & MMU_L1_ATTR_XN) == 0u, "PL stays executable on purpose");
+        /* DDR 里有内核代码本身 */
+        check((ddr & MMU_L1_ATTR_XN) == 0u, "DDR must stay executable: the kernel runs from it");
+
+        /*
+         * -- 别名一致性:高位 OCM 必须与低位**逐位相同** --
+         *
+         * 两者是同一块物理内存的两种映射。以不同属性映射同一物理位置
+         * 在架构上是 UNPREDICTABLE —— 缓存属性不同会导致数据不一致,
+         * XN 不同会导致"同一段代码换个地址就取指失败"。
+         *
+         * 这条断言把"别只改一边"钉死。之前就是因为高位的地址和属性
+         * 都写错过(误以为是 0xFFF00000,实际 BSP 里是 0xFFFF0000)。
+         */
+        check_u32(ocm_low & MMU_SECTION_MASK, 0x00000000u, "low OCM maps physical address 0");
+        check_u32(ocm_high & MMU_SECTION_MASK, 0xFFF00000u,
+                  "the high OCM region still starts at 0xFFF00000 (1MB granularity)");
+        /*
+         * 关键的一条:两者的**属性位必须逐位相同**。
+         * 描述符低 20 位是属性(段基址在 bits[31:20]),所以直接比这 20 位。
+         */
+        check((ocm_high & 0xFFFFFu) == (ocm_low & 0xFFFFFu),
+              "high and low OCM must agree on cacheability AND executability");
     }
 
     /* ============================================================== */

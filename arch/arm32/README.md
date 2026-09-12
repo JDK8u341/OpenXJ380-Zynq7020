@@ -426,18 +426,29 @@ C:\AMDDesignTools\2025.2\Vitis\bin\xsdb.bat tmp-test/jtag/run_kernel_uart.tcl <1
 python tmp-test/run_and_capture.py COM4 9600 2 <1|2|3|4>
 ```
 
-**实测结果**（四个用例各跑一遍，注入前 `ticks` 与 `irqcount` 均相等）：
+**实测结果**（五个用例各跑一遍，注入前 `ticks` 与 `irqcount` 均相等）：
 
 | 选择器 | 异常 | 关键证据 |
 |---|---|---|
-| 1 | Data Abort | `DFAR=0x50000000`、`DFSR=0x08`（synchronous external abort）、`pc=0x001008CC`、`r3=0x50000000` |
-| 2 | Undefined Instruction | `pc=0x0010091C`（UDF 指令处）、`r4=0x00000002`（选择器）|
-| 3 | Prefetch Abort | `IFAR=0x50000000`、`IFSR=0x08`、`pc=0x50000000`、`r4=0x00000003` |
+| 1 | Data Abort | `DFAR=0x50000000`、`DFSR=0x08`（synchronous external abort）、`pc=0x00100914`、`r3=0x50000000` |
+| 2 | Undefined Instruction | `pc=0x00100934`（UDF 指令处）、`r4` 为选择器 |
+| 3 | Prefetch Abort（未映射）| `IFAR=0x50000000`、`IFSR=0x08`、`pc=0x50000000` |
 | 4 | SVC | `!!! SVC (no syscall layer yet) - diagnostic only, returning !!!`，随后 `SVC returned normally` |
+| 5 | Prefetch Abort（XN）| `IFAR=0xE0001000`、**`IFSR=0x0D`（permission fault, section）**、`pc=0xE0001000` |
 
-前三个停机 PC 分别为 `0x001000D8` / `0x00100104` / `0x0010011C`，
-正是 `boot/vectors.S` 中三个向量各自的 `wfe` 自旋循环 ——
+前三个停机 PC 分别落在 `boot/vectors.S` 中三个向量各自的 `wfe` 自旋循环里 ——
 证明处理函数返回后确实停在了预期位置。
+
+**用例 3 与 5 的对比是验证 XN 的唯一手段**：两者都产生 Prefetch Abort，
+但 `IFSR` 完全不同 ——
+
+- 3 访问的 `0x50000000` 背后没有从设备 → `0x08` 外部异常；
+- 5 访问的 `0xE0001000` 是**已映射**的 UART → `0x0D` 权限故障（被 XN 拦下）。
+
+所以**光看到"Prefetch Abort"不能说明 XN 生效了**，必须核对 `IFSR`。
+反过来，如果 XN 没写进描述符，用例 5 就不是"报个错"这么简单：
+`blx 0xE0001000` 会把 UART 寄存器的内容当作指令执行，
+行为完全不可预测。这个用例本身就是 XN 价值的最好说明。
 
 **SVC 与前三个有本质区别**：它的向量 `_vec_svc` 没有 `wfe` 自旋，
 处理完就 `pop {r0-r12, lr}` / `movs pc, lr` 返回到 SVC 的下一条指令。
@@ -450,14 +461,101 @@ python tmp-test/run_and_capture.py COM4 9600 2 <1|2|3|4>
 "Synchronous external abort"（访问了没有从设备的地址）。上一版就写错了这个
 提示，反而误导排障 —— 现在用 `fsr_status_text()` 显式查表。
 
-### 5. 其它待办（M2 及以后）
+### 5. MMU 与地址转换（M2，已在板上启用）
 
-- MMU / 页表（`include/mm/page.h` 的 `PTE_*` 全部是 x86 语义，必须重做）
+**现状：MMU 已打开，1MB 段恒等映射，系统在地址转换下正常运行。**
+
+x86 侧的 `include/mm/page.h` 用的是 4 级页表 + `PTE_*` 位语义，
+那套词表在 ARMv7 上**没有对应位置**（`PTE_FRAME_ALLOCATED = 1<<62`、
+`PTE_NO_EXECUTE = 1<<63` 在 32 位短描述符里无处安放），
+所以是整体重做，而不是改几个常量。
+
+| | x86_64 | ARMv7-A 短描述符 |
+|---|---|---|
+| 级数 | 4 | 2 |
+| 项宽 | 64 位 | **32 位** |
+| 一级表 | 512 项 | **4096 项**（4GB / 1MB）|
+| 基本粒度 | 4KB | L1 段 = 1MB，L2 小页 = 4KB |
+| 权限 | U/S 位 | AP[2:0] 三级 + Domain 域 |
+| 内存类型 | PWT/PCD 两位 | TEX[2:0]+C+B+S 组合 |
+| 不可执行 | NX = bit63 | XN，**L1 与 L2 位置不同** |
+
+文件分工：
+
+```
+include/arch/mmu.h        描述符定义、区域表 API、CP15 位定义（纯头文件）
+src/mmu.c                 纯逻辑：描述符编解码、区域表、建表 ← 宿主单测
+src/mmu_hw.c              硬件侧：页表实体、CP15 配置、开 MMU ← 只能上板验证
+boot/kernel.ld            .mmu_tbl 段（NOLOAD，16KB 对齐 + 两条 ASSERT）
+```
+
+拆成 `mmu.c` / `mmu_hw.c` 是必须的：`mmu.c` 被 `tests/test_arm32_mmu.py`
+直接编译，一旦引入 `mcr`/`mrc` 内联汇编宿主就编不过，那部分逻辑也就没法单测。
+这与 `uart_baud.c` / `uart_ps.c` 的拆法同源。
+
+**区域表**（`src/mmu.c`，未列出的地址一律为 fault）：
+
+| 范围 | 属性 | 说明 |
+|---|---|---|
+| `0x00000000`–`0x000FFFFF` | Normal NC | OCM（实测 192KB）+ 心跳 |
+| `0x00100000`–`0x3FFFFFFF` | Normal WB | DDR，内核在这里运行 |
+| `0x40000000`–`0xBFFFFFFF` | Strongly-Ordered | PL（AXI GP0/GP1）|
+| `0xE0000000`–`0xE02FFFFF` | Device **+XN** | PS 外设（UART/I2C/SPI/SD/QSPI…）|
+| `0xF8000000`–`0xF8FFFFFF` | Device **+XN** | SLCR / SCU / GIC / PL310 |
+| `0xFFF00000`–`0xFFFFFFFF` | Normal NC | 高位 OCM 别名 + BootROM |
+
+**三处与 Xilinx 原表的有意偏离**，理由都写在代码里：
+
+1. **低 1MB 用不可缓存**。`0x20000` 是 JTAG 唯一的心跳观测通道，
+   而 JTAG 走 DAP/AXI 直接读物理内存、**不经过 CPU 的 L1/L2**。
+   这段一旦是写回可缓存，心跳写进去只是躺在 cache 里，JTAG 读到的是陈旧值 ——
+   偏偏 MMU 刚开的那几次调试最依赖它。OCM 是片上存储，不可缓存的代价很小。
+2. **高位 OCM 别名与低位逐位相同**。同一物理内存的两种映射若属性不同，
+   架构上是 UNPREDICTABLE。另外**地址也修正过**：BSP 的
+   `XPAR_PS7_RAM_1 = 0xFFFF0000`，不是想当然的 `0xFFF00000`；
+   本区域从 `0xFFF00000` 起是段粒度（1MB）所致，Xilinx 原表也记录了同样限制。
+3. **未列出的地址填 fault**，而不是像 Xilinx 那样把大片保留区也填成有效映射。
+   Xilinx 表覆盖的 NAND/NOR/QSPI-XIP 在这块板子上都不存在；
+   填成 fault 能让误访问立刻暴露，而不是发一次可能挂死 AXI 总线的事务。
+
+**XN（不可执行）的取舍** —— 只有确定是纯数据的区域才标：
+
+| 区域 | XN | 理由 |
+|---|---|---|
+| PS 外设 / SLCR-GIC | ✅ | 纯数据 |
+| 低 1MB（OCM）| ❌ | 计划里的 SMP 方案要用 OCM 放 CPU1 启动跳板，那段代码将来要在 OCM 里执行 |
+| PL | ❌ | 将来可能有需要取指的东西（软核 BRAM / 从 PL 加载的代码段）；当前 PL 只是占位设计 |
+| DDR | ❌ | 内核代码本身在这里 |
+
+⚠ **XN 与 AP 受不同机制管辖**：AP 只在 DACR 该域为 client 模式时才参与判定，
+而 **XN 始终生效**。所以即使在 manager 模式下 XN 也是当前唯一能真正约束内核自身的属性位。
+
+**DACR 已从全 manager 切到全 client**：现在 AP 位才真正参与判定。
+行为上应当完全不变（所有区域 AP 都是全权限，系统只跑在 PL1）——
+这一点本身就是最好的验证：切过去如果坏了，说明某个描述符的 AP 位是错的。
+这一步是为 M4 用户态铺路，趁故障原因最单纯的时候把这条路径验证通。
+
+**开 MMU 的过程可诊断**：每阶段写心跳槽 16，挂死时读回即为最后进入的阶段
+（0=未开始 1=已建表 2=已配 TTBR0/DACR 3=正要开 4=已开 `0xEE`=自检失败）。
+
+**当前只开了地址转换（`SCTLR.M`），未开 D-Cache / I-Cache**，这是有意的风险切分：
+打开 D-Cache 前必须让整个数据缓存失效，否则残留脏行会在之后被写回、
+覆盖正确数据；而"整块 D-Cache 失效"在 ARMv7 上不是一条指令，
+要按 set/way 遍历（依赖 CCSIDR 读出的缓存几何），属缓存维护范畴 ——
+`arch/cpu.h` 现有原语全是按地址的（MVA 形式），恰好没有整块失效。
+所以缓存维护与开缓存一起留给 M2-5。代价是系统仍很慢，
+换来的是 M2-3 的失败原因**只有一种**：页表错了。
+
+### 6. 其它待办（M3 及以后）
+
 - 缓存维护与 Cortex-A9/PL310 勘误 —— 建议 vendor Xilinx 的 `xil_cache.c`
   与 `xil_errata.h`（MIT 许可），见计划 §2.15
+- 设备/驱动描述层（方案已定：C 静态描述符表 + probe 循环；
+  PL 部分暂缓，等真正做 PL 设计时再引入生成器）
 - SMP：`sev` + OCM 跳板替代 x86 的 INIT-SIPI-SIPI
 - SVC 入口接上真正的系统调用层（`_vec_svc` 目前只做诊断）
 - 中断嵌套与在 SVC 模式下运行处理函数（现在是 IRQ 模式 + 自己的栈）
+- 4KB 小页（当前只有 1MB 段；需要更细粒度才能给 DMA 缓冲单独设属性）
 
 ---
 

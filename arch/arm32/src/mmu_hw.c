@@ -94,15 +94,27 @@ void mmu_enable(void)
     arch_write_ttbr0((u32)(uintptr_t)g_mmu_l1_table | TTBR0_ATTR_XILINX);
 
     /*
-     * 4. DACR 设为全 manager(每个域 2 位,共 16 个域)。
+     * 4. DACR 设为全 client。
      *
-     *    manager 模式下描述符里的 AP 位**被完全忽略**,不会产生权限故障。
-     *    这是有意的降级:本阶段还没有用户态,没有需要保护的边界,
-     *    而 AP 写错会导致内核自己都访问不了内存,把"页表错"和
-     *    "权限错"两种故障混在一起。等 M4 引入用户态再切 client 模式。
-     *    见 arch/mmu.h 里 MMU_DACR_* 的说明。
+     *    client 模式下**描述符里的 AP 位才真正参与判定**;
+     *    manager 模式(0xFFFFFFFF)下 AP 被完全忽略,任何权限错误都不报。
+     *
+     *    之前用过 manager,现在切成 client 是刻意的推进:
+     *
+     *      - 现在所有区域的 AP 都是 0b011(全权限),而且系统只跑在
+     *        PL1(SVC/IRQ/ABT 都是 PL1),所以**行为上应当完全不变** ——
+     *        这一点本身就是最好的验证:如果切过去坏了,说明某个描述符的
+     *        AP 位是错的,而不是"权限太严"。
+     *
+     *      - 更重要的是为 M4 铺路。等有了用户态,AP 会承载
+     *        "用户页不可被内核以外的东西写"这类真实语义。
+     *        在还没有用户态、故障原因最单纯的时候先把这条路径验证通,
+     *        比将来和用户态的问题混在一起查要容易得多。
+     *
+     *    ⚠ 注意 AP 与 XN 受不同机制管辖:即使退回 manager 模式,
+     *      XN(不可执行)也**始终生效**。见 arch/mmu.h 的说明。
      */
-    arch_write_dacr(0xFFFFFFFFu);
+    arch_write_dacr(MMU_DACR_ALL(MMU_DACR_CLIENT));
 
     /*
      * 5. 失效 TLB 与分支预测器。

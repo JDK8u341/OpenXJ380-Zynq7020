@@ -246,23 +246,51 @@ mmu_l1_check_t mmu_l1_table_check(const u32 *table)
  * 属性取值见头文件;每个都标注了位域解码。
  */
 static const mmu_region_t g_regions[] = {
+    /*
+     * 低 1MB:OCM(实测 192KB)+ 保留空洞 + 心跳。
+     *
+     * **刻意不加 XN**,尽管这里几乎全是数据。理由:
+     *   计划里的 SMP 方案是"CPU1 从 OCM 跳板启动"(见 ZYNQ7020_PORT_PLAN
+     *   §SMP)。那段跳板代码将来就要放在 OCM 里执行,现在标成不可执行
+     *   会在做 SMP 时炸掉,而且那个失败离今天的改动很远、很难联想到。
+     *   OCM 就这么一块,等真要加固时应当用 4KB 页把跳板区单独划出来,
+     *   而不是在 1MB 段粒度上做一个将来必须撤销的决定。
+     *
+     * 不可缓存同样是有意的:0x20000 是 JTAG 唯一的心跳观测通道,
+     * JTAG 走 DAP/AXI 直接读物理内存、**不经过 CPU 的 L1/L2**。
+     * 这段一旦是写回可缓存,心跳写进去只是躺在 cache 里,
+     * JTAG 读到的是陈旧值 —— 偏偏 MMU 刚开的那几次调试最依赖它。
+     */
     {MMU_LOW_1MB_BASE, MMU_LOW_1MB_SIZE, MMU_ATTR_NORMAL_NC, "OCM + heartbeat (JTAG-visible)"},
     {PLAT_DDR_BASE, PLAT_DDR_SIZE, MMU_ATTR_NORMAL_WB, "DDR"},
     /*
-     * PL 用强序,与 Xilinx 一致。
-     * 本板只在 0x41200000 挂了 AXI GPIO,其余地址访问会 AXI 解码失败;
+     * PL 用强序,与 Xilinx 一致,也**不加 XN**。
+     *
      * 强序不做推测访问,正是这里想要的(见计划 §2.15 的 ARM 794073)。
+     * 不加 XN 是因为 PL 里将来可能有需要取指的东西(软核的 BRAM、
+     * 或从 PL 加载的代码段),而当前这块 PL 就是个占位的 AXI GPIO,
+     * 没有任何理由替未来的设计做决定。
      */
     {0x40000000u, 0x80000000u, MMU_ATTR_STRONG_ORDERED, "PL (AXI GP0/GP1)"},
-    /* PS 外设:UART0/1、I2C、SPI、CAN、GEM、GPIO、QSPI、SD 等 */
-    {0xE0000000u, 0x00300000u, MMU_ATTR_DEVICE, "PS peripherals"},
-    /* SLCR、SCU、GIC、全局定时器、私有定时器控制 */
-    {0xF8000000u, 0x01000000u, MMU_ATTR_DEVICE, "SLCR / SCU / GIC"},
+    /* PS 外设:UART0/1、I2C、SPI、CAN、GEM、GPIO、QSPI、SD 等。纯数据,加 XN */
+    {0xE0000000u, 0x00300000u, MMU_ATTR_DEVICE_XN, "PS peripherals"},
+    /* SLCR、SCU、GIC、全局/私有定时器、PL310。纯数据,加 XN */
+    {0xF8000000u, 0x01000000u, MMU_ATTR_DEVICE_XN, "SLCR / SCU / GIC"},
     /*
-     * 高位 OCM 别名。注意这一段(1MB 粒度)实际上把
-     * OCM 别名、BootROM 与若干保留区都圈了进去 ——
-     * 1MB 粒度下无法细分,所以整体按不可缓存处理:
-     * 这里没有任何东西需要被缓存,但误缓存 BootROM 会有麻烦。
+     * 高位 OCM 别名。
+     *
+     * ⚠ 这里的地址与大小是**按 BSP 实测数据修正过的**:
+     *     xparameters.h: XPAR_PS7_RAM_0 = 0x00000000..0x0002FFFF (192KB)
+     *                    XPAR_PS7_RAM_1 = 0xFFFF0000..0xFFFFFDFF (~64KB)
+     *   也就是说 OCM 的高位别名在 **0xFFFF0000**,而不是 0xFFF00000。
+     *   本区域从 0xFFF00000 起、覆盖 1MB,是由于段粒度(1MB)无法再细分,
+     *   把 OCM 别名、BootROM 与若干保留区一并圈了进来 ——
+     *   Xilinx 的 translation_table.S 里也明确记录了这个同样的限制。
+     *
+     * 属性必须与低位 OCM **完全一致**(不可缓存、可执行):
+     * 两者是同一块物理内存的两种映射,以不同属性映射同一物理位置
+     * 在架构上是 UNPREDICTABLE。整个 1MB 里没有东西需要被缓存,
+     * 而误缓存 BootROM 会有麻烦,所以整体按不可缓存处理。
      */
     {0xFFF00000u, 0x00100000u, MMU_ATTR_NORMAL_NC, "OCM high alias / BootROM"},
 };
