@@ -14,6 +14,7 @@
  *   - 通过 OCM 心跳向 JTAG 汇报状态,不依赖串口
  */
 
+#include <arch/cache.h>
 #include <arch/console.h>
 #include <arch/cpu.h>
 #include <arch/fault_test.h>
@@ -318,7 +319,41 @@ void kmain(void)
     }
     console_puts("\n");
 
-    /* ---- 7. 主循环 ---- */
+    /* ---- 7. 缓存几何 ---- */
+    /*
+     * 这里只是**读取并打印**,不使能缓存 —— 使能是下一步(M2-5b)的事。
+     *
+     * 之所以要先单独做这一步:几何解码里三个字段全是"减一/减四"存储的
+     * (见 arch/cache.h),少加一个 1 不会报错,只会让之后的整块失效
+     * 少覆盖一行/一路,于是残留脏行在某个时刻被写回、静默覆盖正确数据。
+     * 先把真实芯片的 CLIDR/CCSIDR 读出来对照,比等缓存开了之后
+     * 再出问题去猜要容易得多。
+     *
+     * 已知答案:Cortex-A9 的 L1 是 32KB / 4 路 / 32 字节行。
+     */
+    {
+        cache_geometry_t dgeo  = cache_discover(false, 0u);
+        cache_geometry_t igeo  = cache_discover(true, 0u);
+        u32              clidr = arch_read_clidr();
+        bool             d_ok  = (dgeo.total_bytes == 32768u) && (dgeo.ways == 4u) && (dgeo.sets == 256u) &&
+                                 (dgeo.line_bytes == 32u);
+        bool             i_ok  = (igeo.total_bytes == 32768u) && (igeo.ways == 4u);
+
+        console_printf(" Cache CLIDR : 0x%08X  (LoC=%u LoUIS=%u L1type=%u)\n", clidr, cache_loc(clidr),
+                       cache_louis(clidr), cache_level_type(clidr, 0u));
+        console_printf(" Cache L1 D  : %u B, %u-way, %u sets, %u B/line\n", dgeo.total_bytes, dgeo.ways,
+                       dgeo.sets, dgeo.line_bytes);
+        console_printf(" Cache L1 I  : %u B, %u-way, %u sets, %u B/line\n", igeo.total_bytes, igeo.ways,
+                       igeo.sets, igeo.line_bytes);
+        console_printf(" Cache check : %s (expect D and I both 32KB 4-way 32B/line 256 sets)\n",
+                       (d_ok && i_ok) ? "MATCH" : "MISMATCH");
+        console_printf(" Caches now  : D=%s I=%s (enabling is the next step)\n",
+                       (arch_read_sctlr() & SCTLR_C) ? "on" : "off",
+                       (arch_read_sctlr() & SCTLR_I) ? "on" : "off");
+    }
+    console_puts("\n");
+
+    /* ---- 8. 主循环 ---- */
     /*
      * 节奏完全由全局定时器决定,不依赖软件延时循环 ——
      * 这样即使 CPU 频率变化,闪烁频率也保持一致。

@@ -235,7 +235,88 @@ static inline void arch_tlb_invalidate_page(uintptr_t va)
 /* 使整个指令缓存失效 */
 static inline void arch_icache_invalidate_all(void)
 {
+    /* ICIALLU */
     __asm__ volatile("mcr p15, 0, %0, c7, c5, 0" ::"r"(0) : "memory");
+    arch_dsb();
+    arch_isb();
+}
+
+/* ------------------------------------------------------------------ */
+/* 缓存几何(CLIDR / CCSIDR / CSSELR)                                   */
+/* 注意这三个的 opcode2 与其它 CP15 寄存器不同,是 mrc p15, 1/2, ...  */
+/* ------------------------------------------------------------------ */
+
+/* Cache Level ID Register:各级缓存类型 + LoC/LoUIS */
+static inline u32 arch_read_clidr(void)
+{
+    u32 value;
+    __asm__ volatile("mrc p15, 1, %0, c0, c0, 1" : "=r"(value));
+    return value;
+}
+
+/* Cache Size ID Register:当前 CSSELR 选中那一级的几何 */
+static inline u32 arch_read_ccsidr(void)
+{
+    u32 value;
+    __asm__ volatile("mrc p15, 1, %0, c0, c0, 0" : "=r"(value));
+    return value;
+}
+
+/*
+ * Cache Size Selection Register。
+ * bit0 = 0 选数据缓存、1 选指令缓存;bits[3:1] = 级号(0 基)。
+ */
+static inline void arch_write_csselr(u32 value)
+{
+    __asm__ volatile("mcr p15, 2, %0, c0, c0, 0" ::"r"(value) : "memory");
+    arch_isb();
+}
+
+static inline u32 arch_read_csselr(void)
+{
+    u32 value;
+    __asm__ volatile("mrc p15, 2, %0, c0, c0, 0" : "=r"(value));
+    return value;
+}
+
+/* ------------------------------------------------------------------ */
+/* 按 set/way 的整块缓存操作                                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 这三个是把 cache_setway_value() 编码出来的值写进 CP15。
+ *
+ * "按 set/way"与"按地址(MVA)"是两套完全不同的操作,用途也不同:
+ *   按地址 —— 针对某段缓冲区,DMA 前后用,粒度精确;
+ *   按 set/way —— 针对整个缓存,只在**打开缓存之前**用,
+ *                 目的是清掉复位后残留的未知内容。
+ *
+ * ⚠ 全志/全清整块缓存在多核下是不安全的(可能丢掉别的核的脏数据),
+ *   所以本项目只在单核启动阶段用,见 src/cache_hw.c 的说明。
+ */
+
+/* DCISW:按 set/way 使数据缓存失效(不写回) */
+static inline void arch_dcache_invalidate_setway(u32 value)
+{
+    __asm__ volatile("mcr p15, 0, %0, c7, c6, 2" ::"r"(value) : "memory");
+}
+
+/* DCCSW:按 set/way 把数据缓存清洗到下级(写回) */
+static inline void arch_dcache_clean_setway(u32 value)
+{
+    __asm__ volatile("mcr p15, 0, %0, c7, c10, 2" ::"r"(value) : "memory");
+}
+
+/* DCCISW:按 set/way 清洗并使数据缓存失效 */
+static inline void arch_dcache_clean_invalidate_setway(u32 value)
+{
+    __asm__ volatile("mcr p15, 0, %0, c7, c14, 2" ::"r"(value) : "memory");
+}
+
+/* BPIALL:使整个分支预测器失效 */
+static inline void arch_branch_predictor_invalidate_all(void)
+{
+    __asm__ volatile("mcr p15, 0, %0, c7, c5, 6" ::"r"(0) : "memory");
     arch_dsb();
     arch_isb();
 }
