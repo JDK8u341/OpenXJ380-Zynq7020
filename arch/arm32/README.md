@@ -713,14 +713,81 @@ L1 基准工作集根本装不进……准确说是**装得进 L1，压根碰不
 | PL310 727915 | Background Clean&Invalidate **by Way** 会导致数据损坏 | **未使用那条路径**（初始化用按 Way 失效，区间用按地址），已在代码里记录规避方法备查 |
 | ARM 775420 | 会中止的数据缓存维护操作可能导致死锁 | 未处理：当前维护操作只作用于已映射的内核缓冲区 |
 
-### 7. 其它待办（M3 及以后）
+### 7. 设备描述层（M3，已在板上验证）
+
+**为什么 ARM 必须有这一层**：x86 是枚举（PCI 配置空间 / ACPI），硬件必须回答
+"你是谁"；ARM 这边连枚举这个概念都不成立。四条落差里最要命的是——
+**PL 侧 IP 的参数读硬件根本读不出来**：AXI GPIO 的数据寄存器宽度恒为 32 位、
+通道数不体现在任何 ID 寄存器里。描述不是可选优化，是唯一的信息来源。
+
+```
+arch/arm32/include/arch/plat_device.h   描述模型（照 DTS 的语义）
+arch/arm32/src/plat_device.c            匹配与 probe 循环（纯逻辑，宿主单测）
+arch/arm32/board/xparameters.h          生成器输入（从 XSA 导出，固化进仓库）
+tools/gen_board_desc.py                 生成器
+arch/arm32/{src,include/arch}/board_devices.*  生成物（提交进仓库，便于 diff）
+arch/arm32/src/board.c                  驱动表、PL 覆盖表、诊断输出
+arch/arm32/src/axi_gpio.c               AXI GPIO 驱动（本层的第一个用户）
+```
+
+**描述模型与落地形式是两个独立的轴**：模型照 DTS（节点 / `compatible` /
+`reg` / `interrupts` / 属性 / `status`），落地形式是"从 `xparameters.h` 生成的
+C 表"。换 DTB 时驱动代码一行都不用动。
+
+**中断号解码收在生成器里**：`_INTERRUPTS` 不是 INTID，是
+"相对号 + 触发类型 + SPI/PPI"的编码，实际 INTID 还要加偏移（SPI +32 / PPI +16）。
+本板实测对照：`SCUTIMER 0x13100d → 29`（私有定时器）、`QSPI 0x4013 → 51`。
+
+板上输出：
+
+```
+ Board devices: 10 nodes (10 active)
+   [on ] axi_gpio_0      0x41200000 irq-   xlnx,axi-gpio-2.0
+   [on ] scutimer        0xF8F00600 irq29  arm,cortex-a9-twd-timer
+   ...
+ Board probe  : total=10 disabled=0 probed=1 unclaimed=9 failed=0
+ LED self-test: AXI GPIO at 0x41200000, 8-bit, dual-channel
+ LED check    : write/readback PASS (6 patterns)
+```
+
+#### 受控 A/B：证明这一层是承重的，而不是装饰
+
+"probed=1"这种日志是**做 probe 的那段代码自己打印的** —— 匹配循环若有
+微妙错误，它照样会打印出一组自洽的数字。这与心跳里那个 LED 图案属于同一类
+"自证"。所以专门做了两次**破坏性实验**，看行为是否随之改变：
+
+| 实验 | 改动 | 板上结果 |
+|---|---|---|
+| **A/B-2** | PL 覆盖表改成永不匹配 | `disabled=1 probed=0`、节点显示 `[pl ]`、`LED WARN`、`ledcheck=0xFFFFFFFF`、**物理 LED 全灭** |
+| **A/B-1** | 从描述里抽掉 `xlnx,is-dual` | 节点仍 `[on ]`、驱动**匹配上了 compatible 但主动拒绝**，因此 `probed=0 failed=1`（不是 `unclaimed`）、LED 同样全灭 |
+
+**A/B-1 顺带在真板上验证了 `failed` 与 `unclaimed` 的区分**：两者都表现为
+"没起来"，但 `unclaimed` 说明描述表里的设备没有任何驱动声明认识它（驱动还没写），
+`failed` 说明有驱动认识但全部放弃（驱动写了但不认这个硬件）——排查方向完全不同。
+
+**这两次实验也回答了"流水灯和 M3 之前一模一样"的疑问**：行为不变是预期的
+（重构不该改变行为），但描述层确实是**承重**的 —— 描述一坏，灯就灭。
+
+#### 一处计划偏差
+
+计划 D6 原文是"PL 节点一律 `enabled = false`"。实际做成了
+**生成器默认 false + 手写覆盖表启用**：因为 `xparameters.h` 只说明
+"**设计里**有这个 IP"，不说明"**比特流已加载**"——后者是运行时事实，
+生成器不该替它做假设。`board.c` 的 `g_pl_present[]` 就是补上那个事实的地方，
+也是"换比特流后该改哪里"的唯一答案。
+
+### 8. 其它待办（AM3 及以后）
 
 - 缓存维护与 Cortex-A9/PL310 勘误 —— **L1 与 L2 均已使能**；
   588369 已规避，727915 未触及相关路径，775420 尚未处理
   （见上方缓存章节的勘误表）
-- 设备/驱动描述层（方案已定：C 静态描述符表 + probe 循环；
-  PL 部分暂缓，等真正做 PL 设计时再引入生成器）
-- SMP：`sev` + OCM 跳板替代 x86 的 INIT-SIPI-SIPI
+- **自检报告与自动校验**（进行中）：把各项自检统一成固定格式回传，
+  配 `tmp-test/verify_board.py` 抓串口解析并给出退出码 ——
+  让"上板验证"成为一条命令，而不是人工读日志
+- **串口 RX 命令通道**：`uart_rx_ready` / `uart_getc` 已实现但**零调用者**，
+  板子目前收不到任何东西。计划接一个极小的行编辑命令通道
+  （`selftest` / `probe` / `dump`），这样不改固件也能现场查
+- AM3 双核：`sev` + OCM 跳板替代 x86 的 INIT-SIPI-SIPI
   （ACTLR 的 SMP 位与维护广播已经在缓存阶段置好了，少一个坑）
 - SVC 入口接上真正的系统调用层（`_vec_svc` 目前只做诊断）
 - 中断嵌套与在 SVC 模式下运行处理函数（现在是 IRQ 模式 + 自己的栈）
