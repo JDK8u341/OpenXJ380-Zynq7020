@@ -1714,6 +1714,35 @@ void kmain(void)
     gic_enable_irq(GIC_INTID_A9_PRIVATE_TIMER);
     console_puts(" IRQ init: timer started\n");
 
+    /*
+     * ★★★ 开中断之前:把"每核指针"显式清零 —— 它是一道**前提**,不能靠复位值 ★★★
+     *
+     * 每条 IRQ 都会走 `arch_vfp_save_current`(存浮点现场的那两条 `bl` 之一),
+     * 它的第一条判据是:
+     *
+     *     TPIDRPRW == 0  ⇒  还没有每核结构,别碰浮点
+     *
+     * 而 **TPIDRPRW 是 CP15 的每核寄存器,复位值 UNKNOWN**:JTAG 的
+     * `rst -system` / `rst -processor` 之后,它可能仍然留着**上一次运行**
+     * 留下的地址。偏偏 `percpu_init_self()` 要等到**栈池之后**才跑(它要用
+     * `__stack_top`),于是这中间的第一发 tick 会拿着一个过期地址去读
+     * `[TPIDRPRW+56]`(也就是 `cur_vfp_d`)—— 只要那个值非 0(上一次运行
+     * 留在 DDR 里的页表描述符、BSS 残影……),它就会把 d0-d15 **存进一个野地址**。
+     *
+     * 实测(坑 52,一次"看起来像变砖"的故障):
+     *     DFAR = 0x82600C02   DFSR = 0x801(对齐故障,写)
+     *     pc   = `arch_vfp_save_current` 里的 `vstmia r0!, {d0-d15}`
+     *     sp   = 引导 SVC 栈,`svc_lr` 落在 `_vec_irq` 里
+     * 串口停在 "IRQ init: timer started" 与 "interrupts enabled" **之间**,
+     * 而且**每次重新加载都复现** —— 因为崩溃发生在写 TPIDRPRW 之前,
+     * 那个过期值一直留着。换个地址布局不同的映像它就"好了",所以
+     * 它的表现是"改一行代码就把板子改坏了",极难归因。
+     *
+     * ⇒ 所以这里**显式写 0**:哨兵的含义必须是"我们建立的",不是"我们假设的"。
+     *   (之后 `percpu_init_self()` 会把它设成真的每核结构地址。)
+     */
+    arch_write_percpu(0u);
+
     irq_global_enable();
     console_puts(" IRQ init: interrupts enabled\n");
 
@@ -4696,6 +4725,23 @@ void kmain(void)
      * 在"不确定哪个 COM 口 / 波特率对不对"的阶段,一个稳定可预期的
      * 周期信号比一次性的启动横幅好找得多。
      */
+
+    /*
+     * ★★★ "整机跑到了这里"的签名 —— 由验证脚本**强制要求** ★★★
+     *
+     * 为什么不靠自检报告:报告是**报告那一刻**的快照。报告之后还有七组
+     * 破坏性对照组(9.73…9.7)要把调度状态搅来搅去,而它们出问题的方式
+     * 通常是**日志中途断掉**(异常 → 停机),那时报告早已打完、项项全绿。
+     *
+     * 实测教训(坑 53):M4-11.1 的第一次验证只看了"报告全绿 + 我自己那条 A/B
+     * 检出",而**整机在 9.78 之前就 Data Abort 了** —— 直到事后逐行比对
+     * 完整日志才发现(`No-starve A/B` / `Smp-pick A/B` 那几行压根没出现)。
+     * ⇒ 把"跑完了"变成**机器可判**的:这一行必须出现,否则验证失败
+     *   (见 tmp-test/verify_board.py 的 POST_SIGNATURE)。
+     */
+    console_excl_begin();
+    console_printf(" Boot complete: all post-report A/B groups done, entering main loop\n");
+    console_excl_end();
 
     for (;;) {
         u32 gt    = timer_read_ticks_low();

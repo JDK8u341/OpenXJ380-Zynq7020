@@ -50,6 +50,17 @@ END = "=== SELF-TEST END ==="
 SUMMARY_RE = re.compile(r"=== SELF-TEST SUMMARY: (\d+) passed, (\d+) failed ===")
 CHECK_RE = re.compile(r"^CHECK (\S+)\s*=\s*(\d+)\s+\(expect (\S+) (\d+)\)\s+(PASS|FAIL)$")
 
+# ★ 报告之后的"整机还活着"签名(内核主循环之前打的那一行)★
+#
+# 为什么需要它(坑 53):自检报告是**报告那一刻**的快照。报告之后还有七组
+# 破坏性对照组会把调度状态搅乱,而它们坏掉的方式通常是**日志中途断掉**
+# (异常 → 停机)—— 那时报告早已打完、97 项全绿。实测踩过一次:
+# M4-11.1 的第一次验证只看了报告与自己那条 A/B,而整机在 9.78 之前就
+# Data Abort 了,直到逐行比对完整日志才发现。
+#
+# ⇒ 于是把"跑完了"变成机器可判的:**缺了这一行,即使 SUMMARY 全过也算失败**。
+POST_SIGNATURE = "Boot complete:"
+
 DEFAULT_PORT = "COM4"
 DEFAULT_BAUD = 9600
 XSDC = r"C:\AMDDesignTools\2025.2\Vitis\bin\xsdb.bat"
@@ -233,6 +244,21 @@ def main() -> int:
         dump = ROOT / "verify_board_raw.txt"
         dump.write_text(text, encoding="utf-8", errors="replace")
         print(f"串口原文已存到 {dump}", file=sys.stderr)
+        return 1
+
+    # ★ 报告之后的存活检查:见 POST_SIGNATURE 的说明 ★
+    #
+    # ⚠ 它**必须**在报告判定之后单独判,而且报错信息要写清"报告是通过的" ——
+    #   否则读到 FAIL 的人会去报告里找原因,而报告里没有原因。
+    if POST_SIGNATURE not in text:
+        print(f"\n验证失败: 自检报告通过了({passed} passed),但串口里没有 "
+              f"{POST_SIGNATURE!r} —— 说明**整机没能跑完报告之后的对照组**"
+              f"(异常/停机/卡住)。", file=sys.stderr)
+        print("  ⇒ 报告只覆盖它自己那一刻;报告之后还有七组破坏性对照组,"
+              "它们坏掉的方式就是日志中途断掉。", file=sys.stderr)
+        dump = ROOT / "verify_board_raw.txt"
+        dump.write_text(text, encoding="utf-8", errors="replace")
+        print(f"  串口原文已存到 {dump}", file=sys.stderr)
         return 1
 
     if not args.quiet:
