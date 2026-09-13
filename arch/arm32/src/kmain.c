@@ -34,6 +34,7 @@
 #include <arch/shell.h>
 #include <arch/smp.h>
 #include <arch/timer.h>
+#include <arch/vmap.h>
 #include <arch/types.h>
 #include <arch/uart_ps.h>
 
@@ -73,6 +74,17 @@ palloc_t g_palloc;
 #define HEAP_PAGES 8192u
 
 heap_t g_heap;
+
+/*
+ * M4-4:细粒度映射用的 L2 表池与实例。
+ * 池必须 1KB 对齐(L1 描述符的低 10 位是表遍历属性,不是地址)。
+ */
+static u32    g_l2_pool[4 * VMAP_L2_ENTRIES] __attribute__((aligned(1024)));
+static vmap_t g_vmap;
+
+static u32 g_vmap_selftest;
+static u32 g_vmap_split_ok;
+static u32 g_vmap_live_ok;
 
 /* 物理页分配器的自检与冒烟结果,供自检报告使用 */
 static u32 g_palloc_selftest;
@@ -775,6 +787,129 @@ void kmain(void)
         }
     }
 
+    /* ---- 9.44 细粒度映射(M4-4) ---- */
+    g_vmap_selftest = vmap_selftest();
+
+    {
+        uintptr_t region = 0;
+
+        /*
+         * ⚠ 要 512 页(2MB)再**向上对齐到 1MB**,而不是直接要 256 页。
+         *
+         * 为什么:palloc 只保证 4KB 对齐,而"拆一个段覆盖整段"这个假设
+         * 要求区间必须落在**单个 1MB 段**内。第一版直接要 256 页,
+         * 拿到 0x00176000 —— 它跨了两个段(0x00100000 与 0x00200000),
+         * 而只拆了第一个,于是后半段仍是段映射,逐页核对在第 138 页
+         * 读到 VMAP_RESULT_SECTION 就失败了。
+         *
+         * (vmap_map 自己会按需拆段,所以映射本身不错;错的是
+         *  "拆一次就覆盖整段"这个测试假设。)
+         */
+        if (palloc_alloc_pages(&g_palloc, 512u, &region) == PALLOC_OK) {
+            region = (region + (1u << MMU_SECTION_SHIFT) - 1u) & ~((uintptr_t)(1u << MMU_SECTION_SHIFT) - 1u);
+        }
+        if (region != 0u) {
+            vmap_attr_t  normal = vmap_attr_normal();
+            vmap_err_t   e_init;
+            vmap_err_t   e_split;
+            u32          l1_before;
+            u32          l1_after;
+            u32          i;
+            u32          split_ok = 1u;
+            u32          live_ok  = 0u;
+            u32          bad_page = 0xFFFFFFFFu;
+            u32          bad_got  = 0u;
+
+            l1_before = g_mmu_l1_table[vmap_l1_index((u32)region)];
+
+            /*
+             * ⚠ 这里保留**完整的错误码**,不再二值化。
+             *   上一轮把它压成 split_ok 布尔值,结果是"失败了但不知道哪一步",
+             *   白白多花一轮。验证代码的信息量本身就是产出的一部分。
+             */
+            /*
+             * ⚠ l2_pool_pa 必须是**池自己的物理地址**(u32)g_l2_pool,
+             *   不是 region —— region 是要被映射的那段数据。
+             *
+             *   上一轮这里填成了 (u32)region,于是 L1 描述符指向了数据区,
+             *   硬件会把那块内存里的数据当成 L2 描述符读。症状是
+             *   l1_after = 0x001761E1 的后半段恰好等于 region —— 一眼可辨,
+             *   但当时把错误码二值化了,看不到这个数。
+             */
+            e_init  = vmap_init(&g_vmap, g_mmu_l1_table, g_l2_pool, (u32)(uintptr_t)g_l2_pool, 4u,
+                                (u32)region, (u32)region + (1u << MMU_SECTION_SHIFT));
+            e_split = (e_init == VMAP_OK) ? vmap_split_section(&g_vmap, (u32)region)
+                                          : VMAP_ERR_NOT_INIT;
+
+            l1_after = g_mmu_l1_table[vmap_l1_index((u32)region)];
+
+            console_printf(" Vmap dbg    : region=0x%08X  l1_before=0x%08X l1_after=0x%08X\n",
+                           (u32)region, l1_before, l1_after);
+            console_printf(" Vmap dbg    : init_err=%u split_err=%u  l2_used=%u\n", (u32)e_init,
+                           (u32)e_split, g_vmap.l2_used);
+
+            if (e_init != VMAP_OK || e_split != VMAP_OK) {
+                split_ok = 0u;
+            } else {
+                for (i = 0; i < VMAP_L2_ENTRIES; i++) {
+                    u32 va  = (u32)region + (i << VMAP_PAGE_SHIFT);
+                    u32 got = vmap_lookup(&g_vmap, va);
+
+                    if (got == 0u || got == VMAP_RESULT_SECTION || (got & ~0xFFFu) != va) {
+                        bad_page = i;
+                        bad_got  = got;
+                        split_ok = 0u;
+                        break;
+                    }
+                }
+            }
+
+            if (split_ok == 0u && bad_page != 0xFFFFFFFFu) {
+                console_printf(" Vmap dbg    : first bad page=%u got=0x%08X\n", bad_page, bad_got);
+            }
+
+            g_vmap_split_ok = split_ok;
+
+            if (split_ok) {
+                volatile u32 *page0 = (volatile u32 *)region;
+                volatile u32 *page1 = (volatile u32 *)(region + VMAP_PAGE_SIZE);
+                vmap_err_t    e_u;
+                vmap_err_t    e_m;
+
+                page0[0] = 0x11111111u;
+                page1[0] = 0x22222222u;
+
+                e_u = vmap_unmap(&g_vmap, (u32)region);
+                e_m = vmap_map(&g_vmap, (u32)region, (u32)(region + VMAP_PAGE_SIZE), &normal);
+
+                if (e_u == VMAP_OK && e_m == VMAP_OK) {
+                    arch_tlb_invalidate_all();
+                    arch_dsb();
+                    arch_isb();
+
+                    live_ok = (page0[0] == 0x22222222u) ? 1u : 0u;
+
+                    (void)vmap_unmap(&g_vmap, (u32)region);
+                    (void)vmap_split_section(&g_vmap, (u32)region);
+                    (void)vmap_map(&g_vmap, (u32)region, (u32)region, &normal);
+                    arch_tlb_invalidate_all();
+                    arch_dsb();
+                    arch_isb();
+                }
+
+                console_printf(" Vmap dbg    : unmap_err=%u map_err=%u readback=0x%08X\n", (u32)e_u,
+                               (u32)e_m, page0[0]);
+            }
+
+            g_vmap_live_ok = live_ok;
+
+            console_printf(" Vmap        : region=0x%08X split=%s live=%s\n", (u32)region,
+                           g_vmap_split_ok ? "PASS" : "FAIL", g_vmap_live_ok ? "PASS" : "FAIL");
+        } else {
+            console_puts(" Vmap        : palloc FAILED\n");
+        }
+        }
+
     /* ---- 9.45 内核堆(M4-3) ---- */
     /*
      * 堆区**一次性拿一大块连续内存**,不依赖"用完再要一页接上"。
@@ -970,6 +1105,10 @@ void kmain(void)
      * 起来了但没置 online),而心跳里的 stage 槽正好区分它们。
      * 合成一项会把这条线索丢掉。
      */
+    selftest_report("vmap_selftest", g_vmap_selftest, 0u, SELFTEST_EQ);
+    selftest_report("vmap_board_split", g_vmap_split_ok, 1u, SELFTEST_EQ);
+    selftest_report("vmap_board_live", g_vmap_live_ok, 1u, SELFTEST_EQ);
+
     selftest_report("heap_selftest", g_heap_selftest, 0u, SELFTEST_EQ);
     selftest_report("heap_smoke", g_heap_smoke, 1u, SELFTEST_EQ);
     /* 至少 32MB 可用 —— 判据写小了等于没判 */
