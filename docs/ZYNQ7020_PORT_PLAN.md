@@ -13,9 +13,10 @@
 
 ### 0.5.1 一句话状态
 
-**M0–M3 全部完成并板上验证；AM3 五个子阶段实现完成（26 项自检里带过）；
-M4-1/2/3/4 完成，其中 M4-4 在压缩前刚板上验证通过（35 passed / 0 failed）。
-下一步是 M4-5（内核栈管理 + guard page）。**
+**M0–M3 全部完成并板上验证；AM3 五个子阶段实现完成；
+M4-1/2/3/4/5 全部完成并板上验证（当前 **41 passed / 0 failed**）。
+M4-5 的 guard page 已经拿到**第三级证据**（破坏性 A/B 成立）。
+下一步是 M4-6：PCB/TCB 结构 —— 但它的第一步不是写代码，是读源 OS。**
 
 ### 0.5.2 分支与提交
 
@@ -35,7 +36,8 @@ M4-1/2/3/4 完成，其中 M4-4 在压缩前刚板上验证通过（35 passed / 
 | M4-1 krlibc | `2103ab3` | 宿主 2 passed；errno 与源 OS 逐值比对 |
 | M4-2 页分配器 | `6642292` | 29 passed / 0 failed（顺带炸出 FPU 雷）|
 | M4-3 内核堆 | `273c2cc` | 32 passed / 0 failed |
-| M4-4 细粒度映射 | `fb0c3d9` `051d712` `65b2061` `8bde8aa` | **35 passed / 0 failed** |
+| M4-4 细粒度映射 | `fb0c3d9` `051d712` `65b2061` `8bde8aa` | 35 passed / 0 failed |
+| M4-5 内核栈池 + guard page | `d78798a` | **41 passed / 0 failed**；`guard_trip.py` 的 A/B 成立（关掉 guard 就变成静默损坏）|
 
 ### 0.5.3 构建与验证命令（照抄即可）
 
@@ -56,6 +58,12 @@ $ninja = "C:\Users\VeryS\AppData\Local\Programs\CLion\bin\ninja\win\x64\ninja.ex
 # 上板:命令通道端到端
 & $py tmp-test\shell_test.py --load
 
+# 上板:guard page 的破坏性 A/B(会故意让内核停在 Data Abort 现场,这是预期)
+& $py tmp-test\guard_trip.py --load
+
+# 上板:FSR 译码回归(改过译码表就要跑,要重新加载三次)
+& $py tmp-test\fsr_decode_check.py
+
 # 只加载不判定的原始串口捕获(诊断用)
 & "C:\AMDDesignTools\2025.2\Vitis\bin\xsdb.bat" tmp-test\jtag\run_kernel_uart.tcl
 ```
@@ -72,6 +80,8 @@ $ninja = "C:\Users\VeryS\AppData\Local\Programs\CLion\bin\ninja\win\x64\ninja.ex
 - PL LED = 双通道 AXI GPIO @ `0x41200000`(无中断)
 - 心跳区 OCM `0x00020000`,magic `0x4F583338`;故障注入选择器 `0x00020080`
 - DDR `0x00100000` + `0x3FF00000`;内核物理加载 `0x00100000`
+- 内核堆 32MB、内核栈池 32 槽 x 1MB(+每槽 1 页 guard),都是启动时向 palloc
+  一次性要的连续区,地址不固定(串口上会打出来)
 - **MIO bank1 实际 1.8V**(核心板 `VCCIO_BANK1→VCC1P8`),bank0 3.3V。
   当前 XSA 已修正,加载器在 `ps7_init` 后有**硬校验**(`tmp-test/zynq/ps7_mio_bank1_check.tcl`)
 - 板子当前是**交叉组合**:PS 配置取自 `opjtmp.xsa`,PL 比特流取自 `AXI_GPIO_1_SOFT`
@@ -93,6 +103,9 @@ $ninja = "C:\Users\VeryS\AppData\Local\Programs\CLion\bin\ninja\win\x64\ninja.ex
 | 11 | **堆不能按需向 palloc 增长** | `heap_extend` 要求增长区紧邻,而 `palloc_alloc_pages()` **不保证相邻**。改为启动时一次性要 32MB 连续区 |
 | 12 | **测试区间必须与 L1 段对齐** | `palloc` 只保证 4KB 对齐;若测试假设"拆一次覆盖整段",区间跨段时后半段仍是段映射 → 逐页核对读到 `VMAP_RESULT_SECTION` |
 | 13 | **`largest_free` 是派生量** | 忘了在 alloc/free 时重算,自检的"统计与实际一致"立刻报错。它是静默失真(没有调用方读它做决定)|
+| 14 | **`DFSR` 不能用 `fsr & 0x1F` 取状态** | **DFSR 的 bits[7:4] 是 Domain**,正好压在 `FS[3:0]` 上面;`FS[4]` 在 **bit10**。本内核 domain=15,于是每个状态码凭空 +0x10:真值 `0x07`(translation fault, level 2)读成 `0x17`→"保留/未知"。以前只触发过 L1 **fault 项**的故障(域位为 0)和取指路径(IFSR **没有** Domain 字段),所以一直没暴露 —— guard page 的 L1 项是页表描述符、domain=15 才炸出来。取法是 `(fsr & 0xF) \| ((fsr >> 10) & 0x10)` |
+| 15 | **`vmap_map` 前必须先 `unmap`** | 拆段会把**整段 256 页**都填成恒等映射,而 `vmap_map` 对已存在的 4KB 映射一律拒绝(刻意不静默覆盖)。所以"把一个页变成我要的映射"是 **split → unmap → map** 三步,漏了中间的 unmap 的症状是**第一页成功、从第二页起全部 `ALREADY`** |
+| 16 | **栈的 guard 页要在栈的下面** | 栈向下长,guard 必须在低地址一侧。槽布局是 `[guard][栈页...]`;写成 `[栈页...][guard]` 会让"槽 i 的 guard"与"槽 i-1 的栈顶页"重叠 |
 
 ### 0.5.6 ★ 验证纪律(这个项目最贵的一课)★
 
@@ -113,29 +126,28 @@ AM3(不释放 CPU1 → 5 项 SMP 检查全 FAIL)、MIO 电压(来回切 `[11:9]`
   `vmap_err_t` 压成了布尔 `split_ok`,于是只知道"失败了",**白白多花一整轮上板时间**。
   改成打印错误码 + `l1_before/after` 后,两个 bug 一次全部暴露。
 
-### 0.5.7 续接点:M4-5 内核栈管理
+### 0.5.7 续接点:M4-6 PCB / TCB 结构
 
-**目标**:给任务提供内核栈,并且**栈溢出必须被当场抓住**。
+**M4-5 已完成**(提交 `d78798a`)。它的三级证据、炸出来的 FSR 译码 bug、
+以及两条已知限制都写在 `arch/arm32/README.md` 的「M4-5」一节,不在这里重复。
 
-**依赖已具备**:M4-4 能在 4KB 粒度上控制单个页(置 XN、只读、**或者不映射**)——
-guard page 正是"栈下方留一页不映射"。
+**下一步 M4-6 的第一步不是写代码,而是调研源 OS:**
 
-**设计**:
-- 栈区从**预留的一段虚拟地址范围**里发(不是随手拿 DDR)—— 便于统一设 guard;
-- 每个栈 = N 页映射 + **下方 1 页未映射**(guard);
-- 栈顶对齐 8 字节(ARM 硬浮点 ABI 要求);
-- 分配/释放判定逻辑**纯化**,宿主可测(沿用 `palloc`/`heap`/`vmap` 的分层)。
+    读 include/task/pcb.h 与 kernel/task/pcb.cpp(90.8 KB),
+    产出三份清单:架构无关 / 架构相关 / 源 OS 有而我们暂不需要。
 
-**验收方式(第三级证据,不是读回)**:
-1. 正常使用:分配若干栈、写入边界内的数据、释放 —— 全过;
-2. ★ **故意写溢出**:从栈顶向下写到 guard page → **必须触发 Data Abort**,
-   而且故障地址必须落在 guard 页内;
-3. 破坏性 A/B:**去掉 guard** 再跑同一段溢出代码 → 这次**不该**触发 fault
-   (而是静默踩进相邻内存)—— 这一条才证明 guard 是承重的。
+已经确认、直接可用的两条结论(见 §0.5.9):
 
-**注意**:第 2 步会让内核进异常处理。现有的 `c_data_abort_handler` 会打印现场并停机,
-所以这一项要在**自检的最后**做,或者做成"注入式"的(由故障注入选择器触发),
-避免它把后面的自检挡住。
+- 源 OS **每任务两个内核栈**:`kernel_stack` + `syscall_stack`,各 1MB
+  (`include/proto.hpp` 的 `CONFIG_KERNEL_TASK_STACK_SIZE`)。
+  M4-5 的栈池已按"32 栈 = 16 任务"的口径开好。
+- 源 OS 有**每任务 FP 上下文**:`fpu_context_t {uint8_t fxsave_area[512]}` 放进 PCB,
+  `scheduler.cpp:121-122` 每次切换都 `save/restore`。ARM 侧对应
+  **d0–d31(256B)+ FPSCR(4B)** 放进 TCB,M4-7 做。
+
+**M4-5 留给 M4-7 的一笔账**:`kstack_tlb_flush_range` 只失效**本核** TLB。
+现在栈只由 CPU0 用;等任务真跑在 CPU1 上时,CPU1 那边可能还留着启动阶段的
+段表项,**guard 对它是失效的**。届时要 TLBIMVAA 广播或 IPI 让对端自己刷。
 
 ### 0.5.8 未决项(已知、未解决,不要当成已完成)
 
@@ -1090,6 +1102,41 @@ CPU0 在 SEV 之前对要交接的数据做 `cache_clean_invalidate_range()`。
 | AM3-4 | per-CPU 中断表（**PPI 每核银行化**，见 §2.6）| ⬜ |
 | AM3-5 | spinlock + SGI 做 IPI；两核各自 1 kHz tick | ⬜ |
 
+**M4-5 内核栈池 + guard page(2026-09-13,提交 `d78798a`)**
+
+计划里 M4-5 的验收写的是"故意写溢出栈,验证被 guard page 当场抓住"。
+做出来之后比这句话多了一层,而那一层才是关键:
+
+> 只做"故意溢出 → 报错"是不够的 —— 它只证明了"这里确实报错了",
+> 证明不了"报错是因为 guard"。
+
+所以做成一组**受控 A/B**,一次加载里跑完:
+
+| 阶段 | 做法 | 结果 |
+|---|---|---|
+| B(**对照组**)| 选择器 8:把 guard 页临时映射成普通可读写页,跑同一段溢出 | 无异常,64 个字静默写进 guard 页,内核继续推进 |
+| C | 选择器 6:同一段代码、同一批地址,guard 生效 | Data Abort,`DFAR = base-4`,`FS[4:0]=0x07`(translation fault, level 2),WnR=1 |
+
+**同一个地址、同一条指令,只在"这一页映射与否"上不同,行为随之改变** ——
+这才是第三级证据。板级自检 41 passed / 0 failed(比 M4-4 多 6 项)。
+
+**这一步的产出不只是"能用了",还有三个 bug:**
+
+1. **`DFSR` 译码一直是错的**(`fsr & 0x1F` 把 Domain 当成了 `FS[4]`)。
+   以前没暴露,是因为只触发过 L1 fault 项的故障(域位为 0)和 IFSR(没有 Domain 字段);
+   guard page 的 L1 项是页表描述符、domain=15,这才炸出来。
+   ⚠ 改动动的是**所有**故障诊断路径共用的译码,所以按"改了就要重验"的规矩,
+   M1 阶段的三条路径(选择器 1/3/5)用 `tmp-test/fsr_decode_check.py` 重跑过。
+2. **`kstack_alloc` 的顺序错了** —— 先映射栈页、最后处理 guard,会导致
+   "guard 落在上一个未拆的段上时,分配失败后**回滚也清不掉它**"。
+   宿主自检抓到(第 82 项),并做了 A/B 确认自检确实能抓到。
+3. **`AP=0b000` 的 guard"看到段就拆、拆完就返回"** → 拆段填出来的是**恒等映射**,
+   guard 静默变成普通可读写页,而且返回 `VMAP_OK`。自检第 91 项抓到。
+
+**顺带记下一条会反复用到的 `vmap` 使用契约**:把一个页变成我要的映射是
+**split → unmap → map** 三步,漏掉 unmap 的症状是"第一页成功、从第二页起全部
+`ALREADY`"。M4A-1 的 fs / DMA 缓冲也要按这个来。
+
 ### 4.3 "上板可验证"是硬要求
 
 从 M3 开始，**每一个子阶段都必须有板上证据**，且证据形式分三档，
@@ -1371,7 +1418,7 @@ L2 表池的物理地址。于是 L1 描述符指向数据区,硬件会把那块
 2. **L1 表的 16KB 对齐是 TTBR0 的硬件要求**,纯逻辑测试里用 8192 即可
    (Windows 上静态数组的最大对齐就是 8192)。真实内核的 `g_mmu_l1_table`
    仍由链接脚本保证 16KB 对齐。
-| **M4-5** | **内核栈管理**（栈池 + **guard page**）| M4-4 | **故意写溢出栈**，验证被 guard page 当场抓住 |
+| **M4-5** | **内核栈管理**（栈池 + **guard page**）| M4-4 | ✅ **已完成**：对照组（关掉 guard → 静默损坏）+ guard 生效（DFAR 落在 guard 页里）—— 见 §4.2 |
 
 **M4-4 为什么必须在这一组里**：现在 MMU 只有 1MB 段（`arch/arm32/src/mmu.c`）。
 段映射**做不出 guard page** —— 栈溢出会静默踩进相邻内存。
