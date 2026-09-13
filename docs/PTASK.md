@@ -17,11 +17,16 @@
 
 ## 1. 一句话现状
 
-**M0–M4-10 已完成并板上验证；M4-11.1（串口排他换成源 OS 的 yield 型互斥）也已完成
-（板级自检 91 passed / 0 failed，七组破坏性 A/B 全部检出）。**
+**M0–M4-11 全部完成并板上验证（板级自检 97 passed / 0 failed，八组破坏性 A/B 全部检出）。**
+M4-11 的三步都结掉了：**11.1**（串口排他换成源 OS 的 yield 型互斥，D13）、
+**11.2**（线程退出路径 `DEATH` + 让出 + `wfi`，D14）、**11.3**（`sched_park_self` 退场，并入 11.2）。
 
-**接下来是 M4-11.2：线程退出路径（D14 结案）** —— 按 §4.0 的决定，
-**只做源 OS 两段式的第一段（`DEATH` + 让出 + `wfi`），不引入回收器**。
+**按 §4.0 的决定：不回收。** 池 32 → **64** 槽（实测一次启动的**真实峰值 33**），
+`kstack_peak_used` / `kstack_headroom` 是**永久容量判据**。
+
+★ 11.2 期间炸出三个坑（51/52/53），其中两个是**先前就潜伏**的 ——
+见计划 §0.5.5 与 README 的 M4-11.2 一节。**下一步待用户拍板**：
+用户态归属哪个阶段（计划 §0.5.7 末尾）、心跳区扩容（计划 §0.5.8）。
 
 ---
 
@@ -183,8 +188,8 @@ kill_thread0(task)                       pcb.cpp:462-492
 | 每核队列/计数器/idle | ✅ | ✅（M4-10）| — |
 | 选核 | 挑最短队列（严格小于；APP→CPU0）| ✅ 纯逻辑层 `sched_pick_cpu()`，宿主穷尽测 | — |
 | **idle 的 level** | BSP = 0（漏赋值）、AP = 1 | ★ 两个都显式 = 1 ★ | **记偏离 D16**：与源 OS **意图**一致、与其 BSP **实际行为**不同。⚠ 这个偏离**有连锁后果**：见 D17 |
-| 线程退出 | 两段式；第二段对 kernel_group 不可达 | ❌ 只有 `sched_park_self()`（永久 WAIT）| **D14，M4-11.2**（★ 只做第一段：`DEATH` + 让出 + `wfi`）|
-| 释放栈/TCB | `kill_thread0`（唯一路径，被 `Cannot kill System process.` 挡住）| ❌ 无 | **D14：决定不做**（尊重源 OS；代价是池只增不减 ⇒ 容量判据）|
+| 线程退出 | 两段式；第二段对 kernel_group 不可达 | ✅ **已同源**：`sched_thread_exit()` = `DEATH` → 让出 → `wfi`（`thread_finish()` 走它）| **D14 已结案（M4-11.2）**；`sched_park_self()` 已删（源 OS 没有它）|
+| 释放栈/TCB | `kill_thread0`（唯一路径，被 `Cannot kill System process.` 挡住）| ❌ 无 | **D14：决定不做**（尊重源 OS）；代价是池只增不减 ⇒ 池 32→64 + 容量判据（实测峰值 33）|
 | 回收者 | `reaper_thread`（只扫进程；且僵尸不在它的条件里，链本身是断的）| ❌ 无 | **不做**（§4.0）|
 | 全局 `scheduler_lock` | 有（罩 add/remove）| ❌ 刻意没引（M4-10 时没有第二个用户）| **不做**：没有 remove 就没有第二个用户（D10/D11 的规矩）|
 | mutex | yield 型 | ✅ **已有**（`src/mutex.c` 纯层 + `src/mutex_kern.c` 钩子），串口排他用的就是它 | **D13 已结案（M4-11.1，`25f46ad`）**；偏离 D17（等锁那一下睡一个 tick）|
@@ -272,14 +277,18 @@ kill_thread0(task)                       pcb.cpp:462-492
 2. 于是**池容量就是硬约束**：`KSTACK_SLOTS` 由"每次启动的内核线程数上限"决定
    （启动自检已经用到约 30/32），用量与余量**每次启动都打出来**；
 3. `sched_park_self()` 退场（源 OS 没有这个函数），`thread_finish()` 改走退出；
-4. **判据（板的）**：
-   - `kthread_exit_reached` —— 至少有一个线程真的走过退出路径（不是"编译过"而已）；
-   - `kthread_exit_death` —— 退出后它在队列名册里的 `status == DEATH`（源 OS 的语义，
-     **不是** WAIT）：这条同时是 §5 耦合项 3 的前提（监视器名单里的线程不会变成"可运行但不动"）；
-   - `kstack_peak_used` / `kstack_headroom` —— 容量与余量，**永久判据**；
-   - 破坏性 A/B：**退一步用 `sched_park_self()`（旧的 WAIT 挂起）** ⇒ 线程照样不动了，
-     但名册里 `status` 是 WAIT 而不是 DEATH ⇒ `kthread_exit_death` 计数为 0。
-     这条 A/B 证明的是"**退出语义真的接上了**"，而不是"线程恰好停住了"。
+4. **判据（板的，★ 已全部落地 ★）**：
+   - `kthread_exit_reached` —— 至少有一个线程真的走过退出路径（不是"编译过"而已）✓ `= 1`
+   - `kthread_exit_death` —— 去**名册里数** `status == DEATH` 的线程（源 OS 的语义，
+     **不是** WAIT）✓ `= 16`；这条同时是 §5 耦合项 3 的前提
+   - `kthread_exit_refused` —— "有代码想停 idle" 的次数 ✓ `= 0`
+   - `kthread_exit_lock_guard` —— §5 耦合项 4 那条绊线的**正向对照**（报告区间里
+     kmain 正持着串口锁，问一句必须为真）✓ `= 1`；`kthread_exit_held_lock` ✓ `= 0`
+   - `kstack_peak_used` / `kstack_headroom` —— 容量与余量，**永久判据** ✓ `20/33 of 64`
+   - 破坏性 A/B（第八组）：**退一步用 `sched_park_self()`**（旧的 WAIT 挂起）⇒
+     线程照样不动了，但名册里 `status` 是 WAIT 而不是 DEATH ⇒ `DEATH` 计数不涨 ✓ 检出
+     （实测 `death 16→17` vs 对照组停在 17）。这条 A/B 证明的是
+     "**退出语义真的接上了**"，而不是"线程恰好停住了"。
 
 > （原方案 A 的细节 —— 垂死线程置 DEATH、回收者遍历两个核的调度队列挑
 > "DEATH 且不在任何核 current 上"的目标、摘节点 + 还栈 + 还 TCB、补全局
@@ -313,7 +322,7 @@ kill_thread0(task)                       pcb.cpp:462-492
 | 步 | 内容 | 判据 |
 |---|---|---|
 | ~~**11.1**~~ | ~~`mutex` + `console_excl` 换成它（D13 结案）~~ | **✅ 已完成（`25f46ad`）**。宿主：递归/EDEADLK/EPERM/EBUSY/EINVAL/让出次数逐值（`tests/test_arm32_mutex.py`，12 节）；板上 5 条判据全 PASS（`console_excl_wait=1`、`console_excl_sched_off=0ms`、`console_excl_alive=1`、两条绊线 0），饥饿监视器 `skipped` 1→**0**；第七组破坏性 A/B 检出（`+0ms/+19` vs `+1200ms/+0`）<br>★ 过程中新增**两个坑（48 全局计数 vs 真锁、49 照抄"让出"的前提）与一条偏离（D17 等锁睡一个 tick）**，还有一条判据方法论（坑 50：A/B 的"活着"观测量不能押在别人相位上）|
-| **11.2** | **线程退出路径（★ 不回收 ★）**：`sched_thread_exit()` = `status = DEATH` → 让出 → `wfi`（源 OS `process_exit` 的形状，`pcb.cpp:494-505`）+ `thread_finish()` 改走它 + **`sched_park_self()` 退场**（源 OS 没有这个函数）| 见 §4.3 方案 B 的四条：`kthread_exit_reached`、`kthread_exit_death`（名册里 `status == DEATH`）、`kstack_peak_used` / `kstack_headroom`（永久容量判据）+ 破坏性 A/B（退回 `sched_park_self` ⇒ 计数为 0）|
+| ~~**11.2**~~ | ~~线程退出路径（★ 不回收 ★）+ `sched_park_self` 退场~~ | **✅ 已完成**。板上 97/0；六条判据全 PASS：`kthread_exit_reached=1`、`kthread_exit_death=16`（**去名册里数**出来的）、`kthread_exit_refused=0`、`kthread_exit_lock_guard=1`（绊线的**正向对照**）、`kthread_exit_held_lock=0`、`kstack_peak_used=20`（报告时刻）/ **33**（一次启动的真实峰值）；第八组破坏性 A/B 检出（`death 16→17` vs 对照组不涨）<br>★ 池 32 → **64**（`KSTACK_MAX_SLOTS` 的设计上限）：实测峰值 33 ⇒ 32 槽确实越界<br>⚠ 头两次上板都是"**报告全绿但整机在报告之后崩了**" ⇒ 坑 51（11.1 埋下的：把"修污染"的机制用到没有污染的场景）+ 坑 52/53（先前潜伏的每核指针哨兵 + 验证方法）|
 | **耦合项** | **只剩 §5 的第 4 条**：`mutex->owner` —— 退出路径上带一条**绊线**（退出时若发现自己还持着串口锁就计数 + 报警）| 那条计数的判据恒为 0；它的**正向对照**在同一份报告里（故意触发一次让绊线响）|
 
 **（原"做之前先做的两件事"已作废）**：§4.2 的五个问题仍然可以问作者，

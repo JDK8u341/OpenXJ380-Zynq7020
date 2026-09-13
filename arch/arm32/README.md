@@ -2564,6 +2564,123 @@ Console A/B : yield-lock vs disable-lock -> DETECTED
 
 ---
 
+### M4-11.2：线程退出路径（D14 结案，板上 97/0）
+
+要证的事一句话：**线程"干完活"走的是源 OS 那条退出路径（标记 `DEATH`），
+而不是我们自己的"挂起"** —— 而按 2026-09-13 的决定，**退出不释放任何资源**。
+
+#### 做了什么
+
+| 项 | 内容 |
+|---|---|
+| `sched_thread_exit()`（`src/sched_kern.c`） | ← 源 OS `process_exit()` `pcb.cpp:494-505` + `kill_thread()` `:447-458`：唯一拒绝条件是 `TASK_IDLE_LEVEL` ⇒ `status = DEATH` ⇒ `sched_yield()` ⇒ `for(;;) arch_wfi()`（**不返回**）|
+| `thread_finish()`（`src/kmain.c`） | 探针的收尾改走它（原来走 `sched_park_self()`）。★ **它的尾部循环第一次是活的**（D14 那句"不可达"到此为止）|
+| `sched_park_self()` | **删除** —— 源 OS 没有这个函数，而 11.2 之后它没有调用者（D10/D11 的规矩）|
+| 池容量 | `KSTACK_SLOTS` **32 → 64**（`KSTACK_L2_TABLES` 40 → 72）。理由**变了**：原来是"16 个任务 × 2 栈"，现在"**不回收 ⇒ 池容量 = 每次启动能创建的内核线程数上限**"。上限是硬的（`KSTACK_MAX_SLOTS` 就是 64）|
+| 收尾不复活死者 | 新增 `probe_park()`：各对照组收尾原来无条件 `status = WAIT`，现在**已退出的（DEATH）不动** —— 否则会把"它死了"这件事从名册上抹掉，而 11.2 的判据正是去名册里数 DEATH |
+
+#### 板上判据（6 条，都在报告里）
+
+```
+kthread_exit_reached      真的有线程走到过退出路径（非空转条件）
+kthread_exit_death    ★   去**名册里数** status == DEATH 的线程 ≥ 1 ★
+                          这是"退出语义照源 OS"的证据：它是 DEATH，不是 WAIT
+kthread_exit_refused      "有代码想停 idle" 的次数（源 OS 也会拒绝）== 0
+kthread_exit_lock_guard   ★ 绊线的**正向对照**：报告区间里 kmain 正持着串口锁，
+                          问一次必须为真 ⇒ 证明下面那条绊线接在正确的信号上
+kthread_exit_held_lock    "持着串口锁退出" 的次数 == 0
+kstack_peak_used          池的峰值用量（数值本身要能看见）
+```
+
+`kthread_exit_held_lock` 是 **`docs/PTASK.md` §5 第 4 条耦合项**的处置：
+`mutex->owner` 在源 OS 里**从不注销**，而"线程会退出"让它第一次变得可达 ——
+持锁退出会把那把锁**永久**带走（下一次打印一直等下去，不报任何东西）。
+按"不改源 OS 行为"的决定，处置是**报警 + 正向对照**，而不是发明
+源 OS 没有的"退出时注销 owner"。
+
+#### 实测
+
+```
+ Kernel stack: 64 slots x 1024 KB (+4 KB guard) at 0x023AA000
+ Kernel stack: peak_used=20 of 64 (headroom=44)  threads: exit=16 death=16 refused=0
+ CHECK kthread_exit_reached    = 1  (expect == 1)   PASS
+ CHECK kthread_exit_death      = 16 (expect >= 1)   PASS
+ CHECK kthread_exit_refused    = 0  (expect == 0)   PASS
+ CHECK kthread_exit_lock_guard = 1  (expect == 1)   PASS
+ CHECK kthread_exit_held_lock  = 0  (expect == 0)   PASS
+ CHECK kstack_peak_used        = 20 (expect <= 60)  PASS
+ SELF-TEST: 97 passed / 0 failed
+ ...
+ Kernel stack: final peak_used=33 of 64 (headroom=31)  threads: exit=25 death=25
+ Boot complete: all post-report A/B groups done, entering main loop
+```
+
+★ **两个数都要看**：报告那一刻只用掉 **20** 个槽，而**报告之后**那七组对照组
+还要再造十几个（按"不回收"它们同样不还）⇒ 一次启动的**真实峰值是 33**。
+32 槽的旧池在这里正好越界 —— 所以"扩到 64"是**实测依据**，不是估的。
+
+★ 顺带纠正一个先前的猜测：前几轮我一直按"启动自检要造三十来个线程、池已经贴边"
+来说（那是从名册长度 `runq=(16,4)` 推的）。报告那一刻的实测是 20 —— 接近上限的
+是**报告之后**那段。⇒ 容量的答案只能取"最终峰值"，所以它现在也打出来了。
+
+#### ★ 这一步顺带炸出三个坑（51/52/53）—— 后两个是**先前就潜伏**的
+
+11.2 写完第一次上板：报告全绿 + 我那条 A/B 检出，但**整机在报告之后崩了**。
+逐行比对完整日志才看清：`No-starve A/B` / `Smp-pick A/B` 那两行压根没出现。
+
+- **坑 51（11.1 就埋下了）**：9.76/9.77 用了 9.75 那套 `ctx` 快照/还原。
+  它唯一的用途是**修 `reloc_skip` 造成的污染**；在没有污染的场景里用它，等于把
+  窗口里**真的跑过的线程恢复到过期现场**（它的栈早被自己后来的执行用过）⇒
+  一被调度就跳进垃圾。11.1 之前它潜伏着：那时状态线程被"关调度"冻在报告里
+  （实测 `late=4539388 us`）、窗口内根本不动，于是"恢复过期现场"恰好是空操作；
+  11.1 让它恢复准时（`late≈300us`）之后，这段代码**第一次真的被执行到**。
+- **坑 52（更早埋下的，与本次改动无关）**：`arch_vfp_save_current` 的前提是
+  `TPIDRPRW == 0 ⇒ 还没有每核结构，别碰浮点`，而 **TPIDRPRW 的复位值 UNKNOWN**
+  （JTAG 的 `rst -system` / `rst -processor` 之后可能留着上一次运行的地址）；
+  `percpu_init_self()` 又晚在栈池之后才跑 ⇒ 这中间的第一发 tick 会拿过期地址
+  去读 `cur_vfp_d`，读到非 0 就把 d0-d15 **存进野地址**。实测 `DFAR=0x82600C02`、
+  `DFSR=0x801`、pc 落在 `vstmia r0!, {d0-d15}`，而且**每次重新加载都复现**
+  （崩在写 TPIDRPRW 之前 ⇒ 过期值一直留着），看起来像"改一行代码就把板子改坏"。
+  ⇒ 开中断前显式 `arch_write_percpu(0)`。
+- **坑 53（验证方法本身）**：报告是"报告那一刻"的快照，而报告之后还有七组破坏性
+  对照组，它们坏掉的方式是**日志中途断掉**。⇒ 内核在主循环前打一行
+  ` Boot complete: ...`，`verify_board.py` 把它做成**强制要求**：缺了它，
+  即使 SUMMARY 全过也算失败（实测当场生效：91 passed 仍判失败）。
+
+三个坑各有提交：`7afd0f7`（51）、`deb286d`（52+53）。
+
+#### 破坏性 A/B（第八组）：同一段等待，只换"干完活之后怎么停"
+
+```
+ Exit A/B    : death=16 -> 17 (probe ran=1)  legacy: death=17 (probe ran=1)
+ Exit A/B    : exit-path(DEATH) vs wait-park(WAIT) -> DETECTED
+```
+
+两个探针做的是同一件事（调 `thread_finish()`），唯一的差别是
+`sched_set_exit_legacy(1)` 把退出路径退回**旧的 `WAIT` 挂起**。
+两边"线程不再被选中"完全一样 ⇒ **只看"它停了没有"判不出来**；
+能判出来的是名册上的状态，而那是**去名册里数**出来的
+（`sched_runq_count_status()`，独立于退出路径自己报的数）。
+
+非空转条件两项：两个探针都必须造出来、而且都真的跑到了那一步（`probe ran=1`）——
+否则"计数没涨"只是因为什么都没发生（坑 43 的同一类）。
+
+#### 明确**没有**做的事（都是决定，不是没做完）
+
+- **不回收**：没有 reaper、没有 `remove_task`、没有 `free` TCB/栈。
+  源 OS 的 `kill_thread0()` 对挂在 `kernel_group` 上的线程没有任何可达路径
+  （`kill_proc` 直接拒绝），而决定是**不改源 OS 的行为**。
+- **不补全局 `scheduler_lock`**：源 OS 用它罩 `add`/`remove`，我们没有 `remove`
+  ⇒ 那把锁**没有第二个用户**（D10/D11 的规矩）。D12 那条"等 M4-11 有 remove 时补上"
+  到此改写为**不做**，理由记在这条上。
+- **不注销 `mutex->owner`**：见上面的绊线。
+
+代价（长期约束，不是待修的缺陷）：**池只增不减** ⇒ `kstack_peak_used` 与
+`kstack_headroom` 从"临时哨兵"升级为**永久容量判据**；任何"每请求一个线程"的
+新用法都必须先解决容量（扩池已经用到设计上限 64）。
+
+---
+
 ### 12. 其它待办（AM3 及以后）
 
 - 缓存维护与 Cortex-A9/PL310 勘误 —— **L1 与 L2 均已使能**；
