@@ -91,6 +91,12 @@ python tools/gen_ninja.py --out build-arm.ninja --arch arm32
 ninja -f build-arm.ninja arm32        # 产物 out/kernel-arm.elf
 ```
 
+> ⚠ `ninja format`（`tools/ninja_build.py:400`）的根目录列表里**没有 `arch/arm32`** ——
+> 它只格式化 `kernel` / `driver` / `graphics` / `font` / `lib` / `include`。
+> 所以本目录的代码**不归 clang-format 管**，风格靠 AGENTS.md 的约定与一致性维持：
+> 4 空格缩进、120 列、函数体大括号独占一行、指针的 `*` 跟变量名。
+> 别拿 `clang-format` 的输出当成"这里没格式化好" —— 用它去改会把注释对齐打散。
+
 工具链自动探测，可用环境变量覆盖：
 
 | 变量 | 默认 | 说明 |
