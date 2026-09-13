@@ -2084,6 +2084,7 @@ switched=30 preempted=27 invalid=0
 | D13 | **串口排他用的是"关调度"，不是锁** | `src/console.c` 的 `console_excl_begin/end` | 只有一个常驻线程会打印（1Hz 状态行），关调度期间没别的上下文能跑，互斥成立 | **M4-11.1**。⚠ **计划原写"可睡眠的 `mutex` 到位后换成它"—— 那句话是错的**：源 OS 的 `mutex` 是 **yield 型**（`mutex.cpp:21-22` 的注释明说"不把线程切到 WAIT"），根本没有可睡眠互斥。⇒ 换成**源 OS 那个 yield mutex**。好处不是"不占 CPU"，而是①语义与源 OS 一致（递归/持有者/销毁）②打印期间**别的上下文还能跑**（`sched_off_total_ns` 因此几乎不再增长 ⇒ 饥饿监视器的 `skipped` 会掉到 ~0，这就是它的判据）。**绝不能用自旋锁**：一行 60~80ms，持锁者会被抢占，等锁者自旋（还关中断）就再也没人放锁 |
 | ★ D14 ★ | ★ **线程没有退出路径 —— 尾部那段终止循环不可达** ★ | `src/kmain.c` 的 `thread_finish()`；6 个调用点 | 自检探针"干完活"之后 `sched_park_self()` 就永久挂起了 | **M4-11.2**。源 OS 的对应物是 `pcb.cpp:501-504`（`kill_thread` 之后 `while (true) hlt`）—— 也就是说 **`wfi` 在这里是对的**（它的正当用途是"永久停住"，不是"idle 省电"），只是**现在还到不了那个循环**。<br>⚠ **但"释放栈 + 释放 TCB"不是垂死线程干的**（计划原话写错了）：源 OS 里 `kill_thread()` 只置 `DEATH`，`kill_thread0(task)` 那一行**是注释掉的**；真正的释放发生在**回收路径**（`kill_proc0` → `kill_thread0` → `remove_task` + `free(thread)`），由一个**常驻 reaper 线程**（`reaper.cpp:48-61`）挑"`status == DEATH` **且不在任何核的 `current_task` 上**"的目标。<br>⇒ ARM 侧两段式：垂死线程"置 DEATH + 让出 + wfi"，回收线程"摘队列 + 还栈 + 还 TCB"（数据源适配：没有进程组 ⇒ 遍历两核调度队列）|
 | ~~★ D15 ★~~ | ~~★ **新线程的 vruntime 漏了 `- WAKEUP_CREDIT`** ★~~ | `src/sched.c` 的 `sched_entity_init()` | — | **已结案(M4-10.1,`ccb7156`)**。源 OS 是 `base > CREDIT ? base - CREDIT : 0`(`scheduler.cpp:294`),M4-8 写成了 `= base`(把参数当成了"当前时刻")⇒ 新线程比源 OS 晚 4ms 才被优先考虑。<br>★ **宿主单测当时是"跟着实现一起写错的"**:它断言 `vruntime == base`,所以一路全绿。改正时把判据**对着源 OS 逐值重写**(含 `base<credit`、`base==credit` 两个边界) |
+| D16 | ★ **偏离(不是退化)：idle 的 `task_level` 我们显式设成 `TASK_IDLE_LEVEL`，源 OS 的 BSP idle 实际是 0** ★ | `src/sched_kern.c` 的 `sched_register_boot_idle` / `sched_register_ap_idle` | 源 OS 里 AP idle 显式设 `TASK_IDLE_LEVEL(1)`（`smp.cpp:154`），而 **BSP idle 从不赋 `task_level`**（`main.cpp:520-541`，memset 后保持 **0 = `TASK_KERNEL_LEVEL`**）| **不打算"照抄"这个 0**（已按意图实现）。理由：level 0 会让 BSP idle 变成**可调度候选**（`is_task_schedulable` 只排除 level 1），而它 `context0.rip == 0` ⇒ 被选中时 `timer_handle` **放弃这次切换**（白做一次派发）、并且被 EEVDF 计费。这显然是**漏赋值**而不是设计 ⇒ 我们两个 idle 都设 1，与源 OS 的**意图**（idle 不可停、不作候选）一致。★ 细节与向作者确认的问题见 `docs/PTASK.md` §2.4/§4.2 |
 | ~~D3~~ | ~~内核用硬浮点编译~~ | — | — | **已结案：不是退化，是照源 OS 的设计。** 见下方「FP 上下文」一节 |
 
 
@@ -2343,7 +2344,10 @@ adv    == K    ★ 负载是真的：4 个线程都真的在推进
 
 **没有新增退化条目** —— 这一步是新判据 + 新仪器，不是退化。
 
-### M4-10：SMP 调度 —— 两个核都在跑线程（已完成，板上 81/0）
+### M4-10：SMP 调度 —— 两个核都在跑线程（已完成，板上 86/0）
+
+> ★ **task 子系统（调度/线程/生命周期）的分层事实、与源 OS 的差异、以及
+> M4-11 的重新规划都在 `docs/PTASK.md`** —— 本节只讲 M4-10 这一步本身。
 
 **范围照源 OS**（★ 全树搜 `balance|migrat|load_avg|steal` **零命中** ⇒
 **不发明均衡器**）：每核 idle、每核队列、创建时挑最短队列、应用级钉 CPU0。
