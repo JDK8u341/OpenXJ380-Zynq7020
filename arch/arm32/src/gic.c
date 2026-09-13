@@ -10,6 +10,7 @@
 #include <arch/cpu.h>
 #include <arch/io.h>
 #include <arch/irq.h>
+#include <arch/percpu.h>
 #include <arch/platform.h>
 
 /* ------------------------------------------------------------------ */
@@ -25,6 +26,7 @@
 #define GICD_IPRIORITYR 0x0400u /* 优先级,每个 INTID 一个字节 */
 #define GICD_ITARGETSR  0x0800u /* 目标 CPU 掩码,每个 INTID 一个字节 */
 #define GICD_ICFGR      0x0C00u /* 触发方式,每 16 个 INTID 一个寄存器(每 INTID 2 位) */
+#define GICD_SGIR       0x0F00u /* 软件产生中断(SGI / IPI) */
 
 /* ------------------------------------------------------------------ */
 /* CPU Interface 寄存器偏移                                            */
@@ -273,26 +275,53 @@ void gic_eoi(u32 intid)
 
 void c_irq_handler(arm_irq_frame_t *frame)
 {
-    u32 intid;
-    u32 cpu_intid; /* 只取 INTID 字段,忽略 CPU 号(spec 里高 3 位是 CPU id) */
+    u32       intid;
+    u32       cpu_intid; /* 只取 INTID 字段,忽略 CPU 号(spec 里高 3 位是 CPU id) */
+    percpu_t *pc;
 
     (void)frame;
 
     intid     = gic_acknowledge();
     cpu_intid = intid & 0x3FFu; /* ICCIAR 的 [9:0] 才是 INTID */
 
-    g_irq_stats.irq_count++;
+    /*
+     * 中断统计按核分开(AM3-4)。
+     *
+     * 为什么必须分开:两核各自有 1kHz 私有定时器,tick 计数要能和
+     * "本核处理了多少次中断"对账。若共用一份全局计数,CPU1 的 tick
+     * 会把 CPU0 的对账搅乱 —— 而那种"对不上"看起来像丢了中断,
+     * 排查方向会被完全带偏。
+     *
+     * g_irq_stats 保留为 **CPU0 的总账**:irq_get_stats() 的既有调用方
+     * (启动自检里的 irq_ticks_eq_irq)语义不变。
+     */
+    pc = percpu_self();
+    if (pc != NULL) {
+        pc->irq_count++;
+    }
+
+    /* g_irq_stats 保留为 CPU0 的总账,既有调用方的语义不变 */
+    if (pc == NULL || pc->cpu_id == 0u) {
+        g_irq_stats.irq_count++;
+    }
 
     /*
      * 1023 是虚假中断:可能是电平中断在 EOI 之前已被撤销。
      * 这类中断不需要也不能 EOI,直接返回。
      */
     if (cpu_intid == GIC_INTID_SPURIOUS) {
-        g_irq_stats.spurious_count++;
+        if (pc == NULL || pc->cpu_id == 0u) {
+            g_irq_stats.spurious_count++;
+        }
         return;
     }
 
-    g_irq_stats.last_intid = cpu_intid;
+    if (pc != NULL) {
+        pc->last_intid = cpu_intid;
+    }
+    if (pc == NULL || pc->cpu_id == 0u) {
+        g_irq_stats.last_intid = cpu_intid;
+    }
 
     if (cpu_intid <= GIC_INTID_MAX && g_irq_table[cpu_intid].handler != NULL) {
         g_irq_table[cpu_intid].handler(cpu_intid, g_irq_table[cpu_intid].arg);
@@ -301,7 +330,9 @@ void c_irq_handler(arm_irq_frame_t *frame)
          * 没有登记处理函数。仍然必须 EOI,否则这个中断源会一直堵着,
          * 把整个 CPU 接口的后续中断都挡住。
          */
-        g_irq_stats.unhandled_count++;
+        if (pc == NULL || pc->cpu_id == 0u) {
+            g_irq_stats.unhandled_count++;
+        }
     }
 
     gic_eoi(intid);
@@ -455,4 +486,46 @@ void c_data_abort_handler(arm_irq_frame_t *frame)
     console_printf("  DFSR     = 0x%08X   (%s)\n", dfsr, fsr_status_text(dfsr));
     dump_regs(frame);
     dump_halt();
+}
+
+/* ------------------------------------------------------------------ */
+/* 每 CPU 的 GIC 配置(AM3-4)                                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 本核的 CPU 接口初始化。
+ *
+ * ⚠ GICC_CTLR / GICC_PMR 是**每核银行化**的:CPU0 在 gic_init() 里写过,
+ *   对 CPU1 没有任何影响。CPU1 必须自己再写一遍,否则它的 CPU 接口
+ *   一直是关的 —— 表现为"CPU1 的中断永远不来,而 distributor 那边
+ *   看上去什么都配好了"。
+ *
+ * Distributor 不用重配(它是全局的,gic_init() 已经弄好)。但要注意:
+ * **PPI 与 SGI 段(INTID 0..31)的使能位在 distributor 里同样是按核
+ * 银行化的** —— 所以 CPU1 也得自己 gic_enable_irq(自己的 PPI)。
+ */
+void gic_cpu_init(void)
+{
+    mmio_write32(PLAT_GIC_CPU_BASE + GICC_PMR, 0xF0u);
+    mmio_write32(PLAT_GIC_CPU_BASE + GICC_CTLR, 1u);
+    arch_dsb();
+}
+
+/*
+ * 发一个 SGI(软件产生中断,即 IPI)。
+ *
+ * GICD_SGIR 的字段:
+ *   [15:0]  INTID(0..15 才是 SGI)
+ *   [23:16] 目标核掩码(当 [25:24] = 0b01 时有效)
+ *   [25:24] 目标过滤:0b01 = 只发给掩码里的核
+ *
+ * 用 SGI 而不是"写一个共享变量然后 SEV":SEV 只是唤醒 WFE,
+ * 如果目标核正在跑而不是在 WFE,那个"通知"就丢了。SGI 走的是
+ * 中断控制器,一定能进中断向量。
+ */
+void gic_send_sgi(u32 intid, u8 cpu_mask)
+{
+    mmio_write32(PLAT_GIC_DIST_BASE + GICD_SGIR,
+                 ((u32)(cpu_mask & 0xFFu) << 16) | (1u << 24) | (intid & 0xFu));
+    arch_dsb();
 }

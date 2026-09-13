@@ -47,7 +47,9 @@ typedef struct
 
     u32 mpidr;       /* 本核读到的 MPIDR 原始值(诊断用) */
     u32 loops;       /* 本核主循环计数 */
-    u32 irq_count;   /* 本核处理过的中断数 */
+    u32 ticks;       /* 本核私有定时器的 1kHz 中断次数 */
+    u32 ipi_count;   /* 本核收到的 SGI(核间中断)次数 */
+    u32 irq_count;   /* 本核处理过的中断总数 */
     u32 last_intid;  /* 本核最后处理的中断号 */
     u32 spin_retry;  /* 本核加锁重试次数(锁竞争诊断) */
 

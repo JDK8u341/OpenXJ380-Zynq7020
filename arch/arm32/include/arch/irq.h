@@ -42,6 +42,23 @@
 #define GIC_INTID_A9_PRIVATE_TIMER 29u
 #define GIC_INTID_A9_GLOBAL_TIMER  30u
 
+/*
+ * SGI(核间中断)相关的约定(AM3-5)。
+ *
+ * cpu_mask 是"目标核掩码",与 SPI 的 ITARGETSR 用的是同一套位:
+ * bit0 = CPU0, bit1 = CPU1。
+ */
+#define GIC_SGI_TARGET_CPU0 0x01u
+#define GIC_SGI_TARGET_CPU1 0x02u
+#define GIC_SGI_TARGET_ALL  0x03u
+
+/*
+ * 本项目用 SGI 0 做通用通知(IPI)。
+ * SGI 号只有 0..15 可用,而 0..15 在 GIC 里是**每核私有**的,
+ * 不存在和别的驱动抢的问题。
+ */
+#define GIC_INTID_SMP_IPI 0u
+
 /* ------------------------------------------------------------------ */
 /* 异常现场帧                                                          */
 /* ------------------------------------------------------------------ */
@@ -70,6 +87,16 @@ void vectors_install(void);
  * 完成后中断尚未全局使能 —— 由 irq_global_enable() 打开。
  */
 void gic_init(void);
+
+/*
+ * 本核的 GIC CPU 接口初始化(AM3-4)。
+ * GICC_CTLR/GICC_PMR 是每核银行化的,CPU0 写过对 CPU1 无效 ——
+ * 每个核都必须自己调一次。
+ */
+void gic_cpu_init(void);
+
+/* 发 SGI(核间中断)。intid 取 0..15,cpu_mask 见 GIC_SGI_TARGET_* */
+void gic_send_sgi(u32 intid, u8 cpu_mask);
 
 /* 打开 CPU 的中断响应(CPSR 的 I 位清零) */
 void irq_global_enable(void);

@@ -7,6 +7,7 @@
 #include <arch/cache.h>
 #include <arch/cpu.h>
 #include <arch/heartbeat.h>
+#include <arch/irq.h>
 #include <arch/mmu.h>
 #include <arch/percpu.h>
 #include <arch/platform.h>
@@ -28,6 +29,13 @@
  * 所以由 CPU0 在放它起来之前先把这块信息填进 percpu 表。
  */
 extern char __stack1_top[];
+
+/*
+ * 压力测试的参与函数在文件末尾定义,但 cpu1_main 的主循环要用它。
+ * 必须在这里给出 static 的前向声明 —— 少了它,C 会按隐式声明
+ * 把它当成非 static,于是和后面的 static 定义冲突(实测报错)。
+ */
+static void smp_stress_participate(void);
 
 void smp_release_cpu1(void)
 {
@@ -173,6 +181,24 @@ void cpu1_main(void)
      * ⚠ online 也必须由本核自己置。由 CPU0 代写是错的:
      *   那只能证明"CPU0 觉得 CPU1 该起来了"。
      */
+    /*
+     * ---- 5. 本核中断(AM3-4) ----
+     *
+     * GICC_CTLR/GICC_PMR 以及 SGI/PPI 的使能位**都是按核银行化的**,
+     * CPU0 在 gic_init() 里配过,对 CPU1 一点作用都没有。
+     * 漏了这一步的症状很隐蔽:distributor 那边看上去什么都配好了,
+     * 而 CPU1 的中断永远不来。
+     */
+    gic_cpu_init();
+    smp_enable_ipi_this_cpu();
+    gic_enable_irq(GIC_INTID_A9_PRIVATE_TIMER);
+
+    /* 私有定时器同样按核银行化 —— CPU1 要有自己的 1kHz */
+    a9_timer_start_tick(1000u);
+    irq_global_enable();
+    HB[HB_SLOT_CPU1_STAGE] = HB_CPU1_STAGE_IRQ;
+
+    /* ---- 6. 报到 ---- */
     percpu_publish_self();
 
     HB[HB_SLOT_CPU1_ID]     = pc->cpu_id;
@@ -182,15 +208,180 @@ void cpu1_main(void)
     arch_dsb();
     cpu_sev(); /* 通知可能正在 WFE 等它的 CPU0 */
     /*
-     * ---- 5. 本核主循环 ----
-     * 这一轮(AM3-1/2/3)还没有本核中断,所以只是计数 + 让出。
-     * per-CPU 中断与 SGI 在 AM3-4/5 接上。
+     * ---- 7. 本核主循环 ----
      *
      * 心跳里的 loops 只在本核内递增,CPU0 通过读 percpu 表拿到它 ——
      * 这是"CPU1 真的在独立推进"而不是"CPU0 打印了一个数字"的证据。
+     *
+     * 中断已经开着:本核的 1kHz tick 与 SGI 都会在这里被打断处理。
+     * 压力测试由 CPU0 用 go/done 握手触发,见 smp_stress_run()。
      */
     for (;;) {
         pc->loops++;
+        smp_stress_participate();
         cpu_relax();
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* AM3-4 / AM3-5                                                       */
+/* ------------------------------------------------------------------ */
+
+/* ---- SGI 处理:本核收到了多少次 IPI ---- */
+static void smp_ipi_handler(u32 intid, void *arg)
+{
+    percpu_t *pc;
+
+    (void)intid;
+    (void)arg;
+
+    pc = percpu_self();
+    if (pc != NULL) {
+        pc->ipi_count++;
+    }
+}
+
+int smp_register_ipi(void)
+{
+    return irq_register(GIC_INTID_SMP_IPI, smp_ipi_handler, NULL);
+}
+
+void smp_enable_ipi_this_cpu(void)
+{
+    /*
+     * SGI/PPI 段(INTID 0..31)的**使能位在 distributor 里是按核银行化的**,
+     * 所以每个核都要自己开一次。CPU0 开过对 CPU1 无效。
+     */
+    gic_enable_irq(GIC_INTID_SMP_IPI);
+}
+
+void smp_send_ipi_to_cpu1(void)
+{
+    gic_send_sgi(GIC_INTID_SMP_IPI, GIC_SGI_TARGET_CPU1);
+}
+
+/* ---- spinlock 互斥性压力测试 ---- */
+#define SMP_LOCK_FREE 0xFFFFFFFFu
+
+static spin_t       g_stress_lock = SPIN_INIT;
+static volatile u32 g_stress_owner      = SMP_LOCK_FREE;
+static volatile u32 g_stress_counter;
+static volatile u32 g_stress_violations;
+static volatile u32 g_stress_go;
+static volatile u32 g_stress_done1;
+
+static void smp_stress_critical(u32 rounds)
+{
+    percpu_t *pc = percpu_self();
+    u32       me = (pc != NULL) ? pc->cpu_id : 0u;
+    u32       i;
+
+    for (i = 0; i < rounds; i++) {
+        spin_lock(&g_stress_lock);
+
+        /*
+         * 互斥判据:进临界区时 owner 必须是"空闲"。
+         * 若另一个核同时在临界区里,这里就会看到非空闲值 ——
+         * 这比"最后计数对不对"更直接:计数只反映**丢了更新**,
+         * 而两个核同时进去才是锁坏掉的定义。
+         */
+        if (g_stress_owner != SMP_LOCK_FREE) {
+            g_stress_violations++;
+        }
+        g_stress_owner = me;
+
+        g_stress_counter++;
+
+        g_stress_owner = SMP_LOCK_FREE;
+        spin_unlock(&g_stress_lock);
+    }
+}
+
+/*
+ * CPU1 主循环里调用的"参与一次压力测试"。
+ * 用 go/done 两个标志握手,而不是让 CPU1 无条件跑 ——
+ * 否则测试窗口无法界定,"计数应该等于多少"就没有意义了。
+ */
+static void smp_stress_participate(void)
+{
+    if (g_stress_go != 0u && g_stress_done1 == 0u) {
+        smp_stress_critical(SMP_STRESS_ROUNDS);
+        arch_dsb();
+        g_stress_done1 = 1u;
+        cpu_sev(); /* 通知可能在自旋等待的 CPU0 */
+    }
+}
+
+smp_stress_result_t smp_stress_run(void)
+{
+    smp_stress_result_t r;
+    u64                 start;
+    u32                 i;
+
+    g_stress_counter    = 0u;
+    g_stress_violations = 0u;
+    g_stress_owner      = SMP_LOCK_FREE;
+    g_stress_done1      = 0u;
+    arch_dsb();
+
+    g_stress_go = 1u;
+    arch_dsb();
+
+    /* CPU0 自己那一份 */
+    smp_stress_critical(SMP_STRESS_ROUNDS);
+
+    /* 等 CPU1 做完。必须带超时 —— 无限等会把可诊断的降级变成挂死 */
+    start = timer_read_us();
+    while (g_stress_done1 == 0u) {
+        if ((u32)(timer_read_us() - start) > 2000000u) {
+            break;
+        }
+        cpu_relax();
+    }
+
+    g_stress_go = 0u;
+    arch_dmb();
+
+    r.counter    = g_stress_counter;
+    r.violations = g_stress_violations;
+    r.cpu1_ran   = g_stress_done1;
+    r.ipi_sent   = 0u;
+    r.ipi_seen   = 0u;
+
+    /*
+     * ---- IPI:SGI 不排队,所以必须发一个等一个 ----
+     *
+     * ⚠ GIC 的 SGI 是**边沿触发且不排队**的:同一个 INTID 在目标核
+     *   还没应答时再发一次,那次会被**直接丢弃**,而不是变成第二次中断。
+     *   实测连发 16 次、目标核只收到 5 次 —— 这不是故障,是 SGI 的定义。
+     *
+     *   所以这里每发一个就等它被处理掉(看计数有没有变)再发下一个,
+     *   这样 "sent == seen" 才是一条成立的判据。
+     */
+    for (i = 0; i < SMP_IPI_ROUNDS; i++) {
+        u32 before = 0u;
+
+        if (percpu_for(1u) != NULL) {
+            before = percpu_for(1u)->ipi_count;
+        }
+
+        smp_send_ipi_to_cpu1();
+        r.ipi_sent++;
+
+        /*
+         * 等这一次被处理。用全局定时器给上限,不用魔数空转 ——
+         * 万一 IPI 通路真的坏了,这里会超时而不是死等。
+         */
+        start = timer_read_us();
+        while ((u32)(timer_read_us() - start) < 5000u) {
+            cpu_relax();
+            arch_dmb();
+            if (percpu_for(1u) != NULL && percpu_for(1u)->ipi_count != before) {
+                r.ipi_seen++;
+                break;
+            }
+        }
+    }
+
+    return r;
 }

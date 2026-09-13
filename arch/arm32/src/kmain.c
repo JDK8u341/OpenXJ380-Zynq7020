@@ -52,6 +52,9 @@ extern char __stack_top[];
  */
 #define CPU1_BOOT_TIMEOUT_US 200000u
 
+/* SMP 压力测试的结果,供自检报告使用 */
+static smp_stress_result_t g_smp_stress;
+
 /*
  * 心跳槽位定义在 arch/heartbeat.h —— 它是跨模块契约:
  * 写这个区的除了本文件,还有那些"中途可能回不来、必须自己留标记"
@@ -84,7 +87,8 @@ static volatile u32 g_tick_first;
 
 static void tick_handler(u32 intid, void *arg)
 {
-    u32 now;
+    u32       now;
+    percpu_t *pc;
 
     (void)intid;
     (void)arg;
@@ -93,8 +97,24 @@ static void tick_handler(u32 intid, void *arg)
      * 必须先清定时器的中断标志再返回。
      * 私有定时器是电平式输出,不清标志的话 GIC 会立刻再报一次,
      * 表现为"进了中断就再也出不来",而且从寄存器上看一切正常。
+     *
+     * 这一步同时也把 tick 记到**本核**的 percpu 上(a9_timer_clear_irq 内部做)。
      */
     a9_timer_clear_irq();
+
+    /*
+     * ⚠⚠ 下面这些全局量(g_tick_seen / g_tick_last_gt / g_tick_max_gap)
+     *    是 **CPU0 的诊断状态**,而这个中断处理函数是两核共用的 ——
+     *    CPU1 的 tick 也会走到这里。不隔离的话 CPU1 会把 CPU0 的计数
+     *    覆盖掉,而症状是"ticks 和 irq_count 对不上"这种看起来像
+     *    丢中断的现象(实测踩到,自检里的 irq_ticks_eq_irq 直接报 FAIL)。
+     *
+     *    本核自己的 tick 计数已经在 percpu 里,不受影响。
+     */
+    pc = percpu_self();
+    if (pc != NULL && pc->cpu_id != 0u) {
+        return;
+    }
 
     now = timer_read_ticks_low();
 
@@ -703,6 +723,26 @@ void kmain(void)
 
         HB[HB_SLOT_CPU1_ONLINE] = cpu1_ok ? 1u : 0u;
         HB[HB_SLOT_CPU1_LOOPS]  = g_percpu[1].loops;
+
+        /*
+         * IPI 的处理函数注册在**共享**的中断表里,所以只需注册一次;
+         * 但 SGI 的使能位是按核银行化的,CPU0 要自己开一次。
+         * (CPU1 在 cpu1_main 里开它自己那份。)
+         */
+        if (smp_register_ipi() != 0) {
+            console_puts(" SMP WARN    : SGI 0 已被占用,IPI 未启用\n");
+        }
+        smp_enable_ipi_this_cpu();
+
+        if (cpu1_ok) {
+            smp_stress_result_t r = smp_stress_run();
+
+            console_printf(" SMP stress  : lock counter=%u/%u violations=%u cpu1_ran=%u\n", r.counter,
+                           2u * SMP_STRESS_ROUNDS, r.violations, r.cpu1_ran);
+            console_printf(" SMP IPI     : sent=%u seen=%u\n", r.ipi_sent, r.ipi_seen);
+
+            g_smp_stress = r;
+        }
     }
 
     /* ---- 10. 启动自检总账 ---- */
@@ -772,6 +812,38 @@ void kmain(void)
      */
     selftest_report("smp_cpu1_online", g_percpu[1].online, 1u, SELFTEST_EQ);
     selftest_report("smp_cpu1_stage", HB[HB_SLOT_CPU1_STAGE], HB_CPU1_STAGE_ONLINE, SELFTEST_EQ);
+
+    /*
+     * 每核 1kHz tick(AM3-5)。
+     *
+     * 判据是"两核各自在推进",而不是"两核计数相等" ——
+     * 相等的判据会在 CPU1 的 tick 恰好停下时也成立(两边都冻住)。
+     * 这里发两次采样、要求 CPU1 的计数确实增长了。
+     */
+    {
+        u32 t0 = g_percpu[1].ticks;
+
+        timer_delay_us(20000u); /* 20ms -> 1kHz 下应当涨约 20 */
+
+        selftest_report("smp_cpu1_ticks_advance", (g_percpu[1].ticks > t0) ? 1u : 0u, 1u, SELFTEST_EQ);
+    }
+
+    /*
+     * IPI 判据是 sent == seen,不是 ">= 某个数"。
+     * 每个 IPI 都是等目标核处理完才发下一个,所以漏掉任何一个都是真问题。
+     */
+    selftest_report("smp_ipi_received", g_smp_stress.ipi_seen, g_smp_stress.ipi_sent, SELFTEST_EQ);
+    selftest_report("smp_lock_violations", g_smp_stress.violations, 0u, SELFTEST_EQ);
+
+    /*
+     * 计数必须正好是两倍轮数。
+     * 少了说明丢了更新(锁没起作用),多了说明有核重复计数 ——
+     * 两种都是真问题,所以用等号而不是"大于等于"。
+     */
+    selftest_report("smp_lock_counter", g_smp_stress.counter, 2u * SMP_STRESS_ROUNDS, SELFTEST_EQ);
+    HB[HB_SLOT_CPU1_TICKS]    = g_percpu[1].ticks;
+    HB[HB_SLOT_IPI_COUNT]     = g_percpu[1].ipi_count;
+    HB[HB_SLOT_SMP_VIOLATION] = g_smp_stress.violations;
     /*
      * ⚠ 这里查 MPIDR,不查 cpu_id。
      *

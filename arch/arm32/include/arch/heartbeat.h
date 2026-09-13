@@ -138,6 +138,16 @@
 #define HB_SLOT_CPU1_LOOPS  27u /* CPU1 主循环计数(证明它在独立推进) */
 #define HB_SLOT_CPU1_MPIDR  28u /* CPU1 读到的 MPIDR 原始值 */
 
+/*
+ * ⚠ 这三项之后,32 槽的预留区就满了(故障注入选择器就在 0x20080)。
+ *   再加东西必须先扩容 PLAT_HEARTBEAT_REGION_SLOTS 并同步下移选择器,
+ *   否则静态断言会拦住 —— 那是好事:两个结构撞车的症状是
+ *   "内核莫名进了 Data Abort",而心跳看上去一切正常。
+ */
+#define HB_SLOT_CPU1_TICKS  29u /* CPU1 自己的 1kHz tick 计数 */
+#define HB_SLOT_IPI_COUNT   30u /* CPU1 收到的 SGI 次数 */
+#define HB_SLOT_SMP_VIOLATION 31u /* spinlock 互斥违例数(0 = 正常) */
+
 /* CPU1 阶段的取值。0 表示还没开始 */
 #define HB_CPU1_STAGE_IDLE      0u    /* 尚未被唤醒 */
 #define HB_CPU1_STAGE_ENTERED   1u    /* 已进入 cpu1_main */
@@ -145,7 +155,8 @@
 #define HB_CPU1_STAGE_MMU       3u    /* 本核 MMU 已开 */
 #define HB_CPU1_STAGE_COHERENT  4u    /* SCU + ACTLR 已配 */
 #define HB_CPU1_STAGE_CACHE     5u    /* 本核 L1 已开 */
-#define HB_CPU1_STAGE_ONLINE    6u    /* 已置 online,进入主循环 */
+#define HB_CPU1_STAGE_IRQ       6u    /* 本核 GIC 接口 + 私有定时器中断已开 */
+#define HB_CPU1_STAGE_ONLINE    7u    /* 已置 online,进入主循环 */
 #define HB_CPU1_STAGE_FAILED    0xEEu /* 中途失败 */
 
 /* MMU 阶段的取值。0 表示还没开始 */
@@ -157,7 +168,7 @@
 #define HB_MMU_STAGE_FAILED     0xEEu /* 自检未通过,主动放弃开 MMU */
 
 /* 已定义的槽位数。越界写会踩到后面的故障注入选择器 */
-#define HB_SLOT_COUNT     29u
+#define HB_SLOT_COUNT     32u
 
 /* 心跳区预留的槽位容量(见 platform.h 的 PLAT_HEARTBEAT_REGION_SLOTS) */
 #define HB_SLOT_CAPACITY  PLAT_HEARTBEAT_REGION_SLOTS

@@ -11,6 +11,7 @@
  */
 
 #include <arch/io.h>
+#include <arch/percpu.h>
 #include <arch/platform.h>
 #include <arch/timer.h>
 
@@ -159,7 +160,28 @@ void a9_timer_clear_irq(void)
     mmio_write32(PLAT_PRIVATE_TIMER_BASE + PT_ISR, 1u);
     arch_dsb();
 
-    g_tick_count++;
+    /*
+     * tick 计数按核分开(AM3-5)。
+     *
+     * 私有定时器本身是每核银行化的,所以两核各自 1kHz —— 共用一份
+     * 全局计数会让它变成 2kHz,而"启动时长"这类基于它的推导会整体偏快,
+     * 且看不出哪里不对。
+     *
+     * g_tick_count 保留为 **CPU0 的 ticks**:a9_timer_get_ticks() 的
+     * 既有调用方(启动横幅里的 uptime)语义不变。
+     */
+    {
+        percpu_t *pc = percpu_self();
+
+        if (pc != NULL) {
+            pc->ticks++;
+            if (pc->cpu_id == 0u) {
+                g_tick_count++;
+            }
+        } else {
+            g_tick_count++; /* percpu 还没建好(极早期),按 CPU0 记 */
+        }
+    }
 }
 
 u64 a9_timer_get_ticks(void)
