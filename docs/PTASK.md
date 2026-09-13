@@ -5,13 +5,19 @@
 > `文件:行号`，可以照行号复核；凡是**没核实**的都显式标了"未核实"。
 >
 > 相关文档：
+> - `docs/ZYNQ7020_PORT_STATUS.md` = **对外**的现状说明（能做什么/不能做什么/改了什么/怎么构建/怎么测）
+> - `docs/ZYNQ7020_INTEGRATION_PLAN.md` = **与上游合流的路线**（哪些层复用、哪些 ABI/API 不变、
+>   `arch/arm32` 怎么接进上层抽象；本文件里那些"将来要接回上游"的结论，落点在那份文件里）
 > - `docs/ZYNQ7020_PORT_PLAN.md` §0.5.7 = 阶段续接点（本文件是它的"task 专题分册"）
 > - `arch/arm32/README.md` §11 = ARM 侧每个模块的设计/踩坑记录
 >
 > 基线：源 OS 仓库 `https://github.com/xingji-studio/OpenXJ380`，`main` = **`08e5c9c`**
-> （= 我们这条分支的基点；2026-02 拉取后 `main` 仍停在这里）。
-> ⚠ 本地 `kernel/**`、`include/**` 与上游 `08e5c9c` **一字未改**（`git diff HEAD -- kernel include` 为空），
-> 所以本文件引用的行号就是上游的行号。
+> （= 我们这条分支的基点；2026-09-13 复核时上游 `main` 仍停在这里）。
+> ⚠ 本地 `kernel/**`、`include/**` 与上游 `08e5c9c` **一字未改**：
+> 判据是 **`git diff 08e5c9c HEAD -- kernel include` 为空**（逐目录复核见
+> `docs/ZYNQ7020_PORT_STATUS.md` §2 —— 上游 8 个目录共 0 个文件被改）。
+> 本文件早先写的是 `git diff HEAD -- kernel include`，那个命令只能证明"工作区没有未提交改动"，
+> 强度不够，已改正；结论本身不变。所以本文件引用的行号就是上游的行号。
 
 ---
 

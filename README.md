@@ -1,155 +1,144 @@
-# OpenXJ380
+# OpenXJ380 · Zynq-7020（ARMv7-A）移植分支
 
-OpenXJ380 是一个面向 x86_64 平台的独立操作系统内核项目。项目包含 UEFI 引导程序、单体内核、XAPI 用户态 API、一个命令行示例程序、可加载内核模块，以及用于生成 FAT 磁盘镜像的构建和分发工具。
+> ## ⚠️ 这个仓库**不完善、不可使用、正在开发中（WIP / 开发中 / 未完成）**
+>
+> **This repository is a WORK IN PROGRESS. It is NOT complete and NOT usable as a product.**
+>
+> - 它是 [xingji-studio/OpenXJ380](https://github.com/xingji-studio/OpenXJ380)（x86_64 UEFI 内核）的一个 **fork**，
+>   内容是"**把内核底座移植到 Xilinx Zynq-7020（双核 Cortex-A9 / ARMv7-A）**"的实验分支。
+> - **没有用户态、没有系统调用、没有文件系统、没有 shell 程序、没有网络、没有 GUI**。
+>   它**不是一个能跑应用的操作系统**，目前只是"内核 + 板上自检"。
+> - **只在一台开发板（AC880-CB，XC7Z020）上验证过**，换板子基本不能直接跑。
+> - **上游那套 x86_64 系统在本分支里一行未改，也没有被验证过**（本分支没有跑过上游构建/镜像/QEMU）。
+> - 请当成**实验记录**；接口、行为、文档都可能随时改。
+>
+> 想知道"现在到底能做什么、不能做什么" ⇒ 先读 **[`docs/ZYNQ7020_PORT_STATUS.md`](docs/ZYNQ7020_PORT_STATUS.md)**。
 
-当前项目仍在积极开发中，适合对操作系统、内核、驱动和低层用户态运行时感兴趣的开发者参与和研究。
+---
 
-> GUI 状态：GUI 相关功能已于 2026-08-04 移除，原因是该实现尚不够成熟。当前项目不提供图形界面、窗口系统或 GUI 应用。
+## 一分钟速览
 
-[贡献者名单](CONTRIBUTOR.md)
+| 项 | 值 |
+|---|---|
+| 上游项目 | `https://github.com/xingji-studio/OpenXJ380`（Apache-2.0，x86_64 UEFI 内核） |
+| 本分支 | `feat/zynq7020-arm-port`，基点 = 上游 `main` 的 **`08e5c9c`** |
+| 目标硬件 | Xilinx **Zynq-7020**（XC7Z020，双核 Cortex-A9，ARMv7-A + VFPv3） |
+| 目标状态 | **M0 – M4-11 已完成并板上验证**：板级自检 **97 项全绿**，**8 组破坏性 A/B 全部检出** |
+| 目前能力 | JTAG 加载 `out/kernel-arm.elf` → UART 输出启动日志 + 97 项自检报告 + 串口命令通道（10/10） |
+| 目前**不具备** | 用户态 / syscall / 文件系统 / 网络 / 块设备 / 模块加载 / 异常恢复 |
+| 工具链 | Vitis 2025.2 的 `arm-xilinx-eabi-gcc` 13.3.0（**Windows**；Linux 未验证） |
+| 上游代码改动 | **`kernel/`、`include/`、`driver/`、`user/`、`lib/`、`boot/`、`kmod/`、`resources/` = 0 个文件**（可机械复核，见下） |
 
-## 特性概览
+---
 
-- UEFI 引导与图形输出初始化。
-- 面向 x86_64 的单体内核，内核入口为 `KernelMain`。
-- 内建驱动、文件系统、进程/线程、内存管理和系统调用基础设施。
-- XAPI 用户态运行时与 API，以及一个命令行示例程序。
-- 可动态加载的内核模块，包括 E1000 网络、xHCI USB 和基于 lwIP 的网络服务。
-- 面向可加载模块的产品扩展接口（OpenXJ380 Socket ABI）：键鼠中断钩子、帧缓冲配置、电源动作与系统调用钩子。
-- 支持通过编译宏关闭内置图形、控制台与输入输出，构建无头（headless）内核。
-- 基于 Ninja 的构建图生成、磁盘镜像制作和 QEMU 运行流程。
-
-## 产品扩展接口（OpenXJ380 Socket ABI）
-
-内核通过 `include/openxj380/` 下的头文件向可加载模块（`.sys`）开放一组产品级扩展接口（Socket ABI）。接口符号经 `EXPORT_SYMBOL` 导出，模块通过内核动态链接器解析调用。
-
-- 键鼠扩展接口（`include/openxj380/socket.h`）：
-  - `OpenXJ380Socket_RegisterMouseHook` / `OpenXJ380Socket_UnregisterMouseHook`
-  - `OpenXJ380Socket_RegisterKeyboardHook` / `OpenXJ380Socket_UnregisterKeyboardHook`
-  - 注册后，内核会在每个键鼠中断事件上回调钩子（`OpenXJ380Socket_MouseInterrupte` / `OpenXJ380Socket_KeyboardInterrupt`）。事件信息由 `OpenXJ380MouseInterruptInfo` / `OpenXJ380KeyboardInterruptInfo` 结构体承载，包含来源（PS/2、USB）、路由、按钮/滚轮增量、坐标、键值与 Shift/Ctrl/Alt/Win/Caps 等修饰键状态。控制器 I/O 与中断应答仍由内核持有，模块只能读取事件，不能从可加载模块操作控制器寄存器。
-  - `OpenXJ380Socket_FramebufferConfig` 返回帧缓冲配置指针。
-  - `OpenXJ380Socket_PowerAction` 触发重启或关机（`XPOWER_REBOOT` / `XPOWER_SHUTDOWN`）。
-- 系统调用钩子（`include/openxj380/syscall.h`）：`OpenXJ380Socket_RegisterSyscallHook` / `OpenXJ380Socket_UnregisterSyscallHook` / `OpenXJ380Socket_DispatchSyscall`，可在系统调用分发路径上拦截或扩展。
-- 内核动态链接器同时支持解析 C++ 修饰符号名与 `EXPORT_SYMBOL_OBJECT` 导出的对象。
-
-## 无头构建（关闭内置输入输出）
-
-内核支持编译宏 `OPENXJ380CONFIG_CLEAR_RUN`，用于关闭内置图形、控制台与输入输出。将该宏加入内核及内置驱动的编译选项（例如向 `CPP_FLAGS`/`C_FLAGS` 追加 `-DOPENXJ380CONFIG_CLEAR_RUN`）后，`include/openxj380/config.h` 会将以下宏置 1：
-
-- `OPENXJ380_GUI_DISABLED`：禁用系统调用钩子等 GUI 相关能力。
-- `OPENXJ380_CONSOLE_DISABLED`：`console_init` / `console_write` 变为空操作。
-- `OPENXJ380_INPUT_OUTPUT_DISABLED`：关闭内置输入输出，包括 PS/2 键盘鼠标初始化、串口输出、XHCI/USB 初始化、HDA 音频与 XAPI 输入输出（`Input` / `Output` / `Getch` 等），并跳过模块自动装载。
-
-关闭内置输入输出后，键鼠事件仍会通过上述 Socket ABI 钩子转发给可加载模块，由产品层自行处理输入。
-
-## 目录结构
-
-```text
-boot/                  UEFI 引导程序与 EFI 交接逻辑
-kernel/                内核核心子系统和启动入口
-driver/                链接到内核镜像的内建驱动
-graphics/、font/       不参与当前构建的历史图形与字体代码
-include/               内核和模块共享的 ABI 头文件
-lib/                   基础支持代码
-kmod/                  可加载内核模块
-user/                  XAPI 运行时/API 与一个命令行示例程序
-resources/             写入系统资源目录的文件
-Bf/                    可选的镜像/软件包静态资源（部分源码包不附带）
-third_party/           引入的第三方代码
-```
-
-## 开发环境
-
-推荐使用 Linux 或 WSL。以下命令以 Debian/Ubuntu 为例，安装完整的构建、镜像和 QEMU 运行依赖：
+## 与上游差在哪（可复核）
 
 ```bash
-sudo apt update
-sudo apt install -y \
-    clang lld nasm ninja-build \
-    mtools gdisk dosfstools \
-    qemu-system-x86 qemu-utils ovmf
+# 本分支相对上游基点的全部改动：155 个文件、+44494 / −4 行
+git diff --stat 08e5c9c HEAD
+
+# 上游内核/用户态有没有被动过（答案：0 个文件）
+git diff --name-only 08e5c9c HEAD -- kernel include driver user lib boot kmod resources
 ```
 
-构建依赖 `Python 3`、Clang/LLD、NASM 和 Ninja。生成镜像还需要 `mtools`、`gdisk` 与 `dosfstools`；运行镜像需要 QEMU。可通过生成后的 Ninja 目标检查本机工具链：
+| 位置 | 性质 |
+|---|---|
+| `arch/arm32/**` | **全新**（70 个文件）：启动汇编、异常向量与帧、MMU/缓存、页分配器、内核堆、栈池 + guard page、调度器（纯逻辑层 + 内核侧）、互斥锁、SMP、GIC、UART、定时器、板级描述层、自检、串口 shell |
+| `tests/test_arm32_*.py` | **全新**（16 个）：ARM 侧宿主单元测试（纯逻辑层在这里穷尽测） |
+| `tmp-test/**` | **全新**（62 个）：板级验证脚本 + JTAG Tcl（加载、抓串口、解析报告、命令通道测试、故障注入） |
+| `docs/ZYNQ7020_*.md`、`docs/PTASK.md` | **全新**：移植现状 / 集成路线 / 移植计划 / task 子系统专题分册 |
+| `tools/gen_ninja.py` | **修改**（+261 / −4，纯新增）：加 `--arch arm32` 与独立的 ARM 构建图 |
+| `tools/gen_board_desc.py` | **新增**（496 行）：从 XSA 导出的 `xparameters.h` 生成板级设备描述表 |
+| `.gitignore` | **修改**（+11）：忽略 ARM 产物与调试日志 |
+| **上游其余部分** | **一字未改**（`OLD_README.md` 就是上游 README 的逐字节备份） |
+
+**为什么这么切**：移植遵循"**先在旁边把底座做起来，不碰上游**"。
+好处是"哪些是移植新增的"永远可以用一条 `git diff` 回答；代价是**今天两边还没合流**
+（怎么合流见 `docs/ZYNQ7020_INTEGRATION_PLAN.md`）。
+
+---
+
+## 构建（ARM 分支）
+
+**环境**：Windows + Vitis 2025.2（自带 `arm-xilinx-eabi-gcc` 13.3.0）+ Python 3 + Ninja。
 
 ```bash
-python3 tools/gen_ninja.py --out build.ninja
-ninja -f build.ninja check.tools
+# 生成 ARM 构建图（与上游 x86 图完全独立，互不影响）
+python tools/gen_ninja.py --out build-arm.ninja --arch arm32
+
+# 构建 → out/kernel-arm.elf（ELF32 / ARM / EABI5）
+ninja -f build-arm.ninja arm32
 ```
 
+编译选项与 AMD 官方 standalone BSP 对齐：
 
-Rust no-std 目标库可通过 `RUST_TARGET_LIBDIR` 显式指定，避免构建图生成依赖开发者个人 rustup 路径。详细说明见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
-
-## 构建
-
-构建图由 `tools/gen_ninja.py` 生成。首次构建或构建规则更新后，执行：
-
-```bash
-python3 tools/gen_ninja.py --out build.ninja
-ninja -f build.ninja all
+```
+-mcpu=cortex-a9 -marm -mfpu=vfpv3 -mfloat-abi=hard -mno-unaligned-access
+-ffreestanding -nostdlib -nostdinc -fno-builtin -Wall -Wextra -Werror -O2 -std=gnu11
 ```
 
-`all` 会构建 UEFI 引导程序、内核、XAPI、命令行示例程序和默认内核模块。产物位于 `out/`，包括 `BOOTX64.efi`、`kernel.krl`、`shell.elf` 和模块文件。
+> ⚠ 上游 x86_64 的构建流程**未受影响**（不带 `--arch` 仍是 `python3 tools/gen_ninja.py --out build.ninja`
+> → `ninja -f build.ninja all` → `ninja -f build.ninja vdisk`），但**本分支没有验证过它** ——
+> 上游构建/镜像/QEMU 的说明见 [`OLD_README.md`](OLD_README.md) 与 [`docs/BUILD.md`](docs/BUILD.md)。
 
-常用目标：
+---
 
-```bash
-ninja -f build.ninja kmods       # 仅构建可加载内核模块
-ninja -f build.ninja check       # 运行源码检查
-ninja -f build.ninja format      # 格式化第一方源码
-ninja -f build.ninja gen.clangd  # 生成 clangd 配置
-ninja -f build.ninja clean       # 删除构建产物
-```
+## 上板与测试
 
-## 创建镜像与运行
+| 层 | 命令 | 判据 |
+|---|---|---|
+| 宿主单元测试 | `python -m pytest tests/ -q` | **9 failed / 74 passed** —— 9 项**预先存在且与本移植无关**（busybox 合规/许可清单/DMA 计划/QEMU 固件） |
+| 板级自检 | `python tmp-test/verify_board.py --load` | 97 项 `CHECK` 全绿 **+ 必须出现 ` Boot complete:`**（"报告全绿但整机中途崩掉"会被判失败） |
+| 串口命令通道 | `python tmp-test/shell_test.py --load` | **10/10** |
+| 原始串口抓取 | `python tmp-test/run_and_capture.py COM4 9600 60` | hex + ASCII 双份，用于排查"波特率/线路/静默"三类问题 |
+| 破坏性 A/B | 固件内置 8 组 | 搬帧 / VFP 现场 / 扫描唤醒 / 无饥饿 / 选核 / 不换栈 / 串口锁 / 线程退出 |
 
-构建完成后，使用以下命令制作 UEFI 可启动磁盘镜像：
+**两层分工（本项目最贵的一课）**：
+**策略**（选取顺序、补偿、不变量）的判据在**宿主**（板上证明不了策略 —— 等权负载下任何策略都会通过）；
+**机制**（切换、抢占、双核、锁、退出路径）的判据在**板上**，而且只认**破坏性 A/B**。
 
-```bash
-ninja -f build.ninja vdisk
-```
+板级前提（换环境会踩）：PS UART1 @ `0xE0001000` / MIO48-49 / **9600 8N1** / 主机 `COM4`；JTAG 用 Vitis `xsdb`；
+PL LED 在 `0x41200000`；心跳区 OCM `0x00020000`（32 槽已满）。
 
-该命令生成 `XJ380.img`，并将内核、模块、命令行示例程序和资源按系统目录布局写入镜像。镜像制作通常需要写入分区和文件系统的权限；默认配置下，运行 QEMU 时也可能使用 `sudo`。
+---
 
-使用 QEMU 启动并在需要时自动创建镜像：
+## 文档索引（**先读哪个看这里**）
 
-```bash
-ninja -f build.ninja run
-```
+### 这个 fork 特有的（新增）
 
-已有 `XJ380.img` 时可直接启动：
+| 文件 | 回答什么问题 |
+|---|---|
+| ★ [`docs/ZYNQ7020_PORT_STATUS.md`](docs/ZYNQ7020_PORT_STATUS.md) ★ | **今天是什么状态**：能不能用、改了什么、怎么构建、怎么测、实现了什么、**明确没实现什么**、新增代码与上游代码的依赖关系 |
+| ★ [`docs/ZYNQ7020_INTEGRATION_PLAN.md`](docs/ZYNQ7020_INTEGRATION_PLAN.md) ★ | **将来怎么与上游合流**：上游代码在**哪些层**会起作用、哪些 **ABI/API 保持不变**（复用或小改）、`arch/arm32` 怎么接进原有上层抽象、分阶段路线与待拍板决策 |
+| [`docs/ZYNQ7020_PORT_PLAN.md`](docs/ZYNQ7020_PORT_PLAN.md) | **完整移植计划 + 逐阶段工作记录**（§0.5.1 一句话状态、§0.5.2 提交表、§0.5.5 坑表 54 条、§0.5.7 续接点、§0.5.8 未决项、§4.5/§4.6 分阶段） |
+| [`docs/PTASK.md`](docs/PTASK.md) | **task 子系统专题分册**：源 OS 的调度/线程/生命周期事实（带 `文件:行号`）、与移植版的差异、"不回收"那次决定的完整推演 |
+| [`arch/arm32/README.md`](arch/arm32/README.md) | **ARM 侧每个模块的设计与踩坑记录** + 退化/偏离清单（D1…D17） |
+| [`OLD_README.md`](OLD_README.md) | **上游根 README 的逐字节备份**（本文件替换了它） |
 
-```bash
-ninja -f build.ninja justrun
-```
+### 上游原有的（本分支未改）
 
-常用运行参数可通过环境变量调整：
+| 文件 | 内容 |
+|---|---|
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 上游架构边界与分层 |
+| [`docs/BUILD.md`](docs/BUILD.md)、[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) | 上游构建/开发环境（Linux/WSL、QEMU、镜像） |
+| [`AGENTS.md`](AGENTS.md) | 代码风格与工程规矩（4 空格、120 列、`#pragma once`…；本分支同样遵守） |
+| [`CONTRIBUTOR.md`](CONTRIBUTOR.md)、[`LICENSE`](LICENSE)、[`LICENSES.md`](LICENSES.md)、[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | 贡献者、许可与第三方组件声明 |
+| `tests/`、`tmp-test/` | 宿主单元测试 / 板级验证脚本（见上表） |
 
-```bash
-DEBUG=0 SMP=2 SUDO=0 KVM=0 DISPLAY_BACKEND=gtk ninja -f build.ninja run
-```
+---
 
-- `DEBUG`：默认 `1`，启用 QEMU 调试端口并在启动时暂停。
-- `SMP`：虚拟 CPU 数量，默认 `4`。
-- `SUDO`：是否通过 `sudo` 启动需要权限的流程，默认 `1`。
-- `KVM`：是否启用 KVM，默认 `1`。
-- `DISPLAY_BACKEND`：QEMU 显示后端，默认 `gtk`。
-- `OVMF_FIRMWARE`：UEFI 固件路径。默认会查找常见发行版路径，例如
-  `/usr/share/edk2/x64/OVMF.4m.fd` 和 `/usr/share/OVMF/OVMF_CODE.fd`。
+## 许可
 
-## 开发说明
+沿用上游 **Apache License 2.0**（见 [`LICENSE`](LICENSE)）。第三方组件的许可与分发要求见
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) 与 [`LICENSES.md`](LICENSES.md)。
+本分支新增的代码（`arch/arm32/**`、`tests/test_arm32_*.py`、`tmp-test/**`、本 fork 的文档）
+按同一许可发布；版权与来源说明保留在上游文件与 `THIRD_PARTY_NOTICES.md` 中。
 
-- 内核核心代码位于 `kernel/`；只有必须随内核启动的驱动才应放入 `driver/`。
-- 可选或可动态装载的功能应放入 `kmod/`，模块入口为 `dlmain`。
-- `user/` 仅保留 `user/xapi/` 提供的运行时/API 和 `cli_shell.cpp` 命令行示例；不再包含其他用户态应用或 GUI 实现。
-- `third_party/` 和 `kmod/netserver/lwip/` 中的代码来自上游，除非进行有计划的上游同步，否则不要直接修改。
-- `kernel/build_config.h` 和 `.clangd` 是生成文件，不应手动维护。
-- 架构边界见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，可复现构建和镜像资源说明见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
+---
 
-版本信息目前需要同时更新 `tools/stage_image_base.sh` 与 `kernel/build_settings.h`。
+## 反馈
 
-## 许可与第三方组件
-
-本项目采用 [Apache License 2.0](LICENSE)。仓库包含多个第三方组件，其各自的许可和分发要求见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 及对应源码目录。
-
-第三方组件所要求公开的许可证已存放在 /usr/share/doc/xj380 下。
+- **上游 x86_64 的问题** → 提给 [上游仓库](https://github.com/xingji-studio/OpenXJ380)。
+- **ARM 移植的问题** → 提到本 fork，并带上：板型号、`verify_board.py` 的完整串口输出
+  （脚本会把原文存到 `verify_board_raw.txt`）、以及你是否改过 `arch/arm32/**`。
+- ⚠ 再次提醒：这是**实验分支**，接口与行为不保证稳定；**不要用在任何真实用途上**。
