@@ -28,6 +28,7 @@
 #include <arch/kstack.h>
 #include <arch/led.h>
 #include <arch/mmu.h>
+#include <arch/mutex.h>
 #include <arch/palloc.h>
 #include <arch/percpu.h>
 #include <arch/platform.h>
@@ -639,6 +640,19 @@ static volatile u32 g_status_wakes;
 static volatile u32 g_status_late_last_us;
 static volatile u32 g_status_late_max_us;
 static volatile u32 g_status_printed;
+static u32          g_status_created; /* 状态线程造出来了吗(判据的适用条件)*/
+
+/*
+ * ★ M4-11.1:报告区间的两个起点 ★
+ *
+ * `g_report_off0`  :进排他窗口**之前**的"被人为关掉调度"的累计时长
+ * `g_report_wakes0`:同一时刻状态线程醒过的次数
+ *
+ * 报告里那两条判据取的就是它们与本刻的差值 —— 于是"报告期间整个系统
+ * 停摆了几毫秒""状态线程还有没有在跑"是直接量出来的,不是推出来的。
+ */
+static u64 g_report_off0;
+static u32 g_report_wakes0;
 
 static void status_thread(void *arg)
 {
@@ -2728,14 +2742,24 @@ void kmain(void)
          */
         sched_set_pick_cpu0(1u);
         /*
-         * ★ 把排他输出的钩子装上 ★
+         * ★ 把排他输出的钩子装上 —— M4-11.1 起它是一把**锁**,不是"关调度" ★
          *
-         * `console_excl_begin/end` 用"关调度"实现互斥(见 arch/console.h),
-         * 但 `console.c` **不认识调度器** —— 它只持一对函数指针。
+         * `console_excl_begin/end` 的互斥由内核提供,但 `console.c`
+         * **不认识调度器** —— 它只持一对函数指针。
          * 装在这里是因为从这一刻起才会有第二个写者(周期状态线程)。
          * 在此之前没装钩子,排他是空操作 —— 那正是对的:只有一个写者。
+         *
+         * ⚠ 换成 yield 型互斥(源 OS `mutex.cpp`)之后,自检报告那几秒
+         *   **调度器照常跑**:状态线程照常醒、照常被调度,只是打印要等锁。
+         *   旧做法(关调度)的代价与它为什么在单核假设下才成立,
+         *   见 src/mutex_kern.c 与退化清单 D13。
+         *
+         * ⚠ 顺序:`sched_register_boot_idle()` 必须在**这一步之前**吗?
+         *   不必 —— 本函数只创建锁对象;真正取"当前任务"是**第一次打印**时
+         *   才发生的,而那一定在 idle 注册之后(下面几行)。
+         *   但两者都在这段 `sched_disable()` 窗口里,所以顺序无关紧要。
          */
-        console_set_excl_hooks(sched_disable, sched_enable);
+        console_mutex_init();
 
         g_yield_a        = 0u;
         g_yield_b        = 0u;
@@ -2974,6 +2998,7 @@ void kmain(void)
             if (st == NULL || ld == NULL) {
                 console_puts(" Sched sleep : kthread_create FAILED\n");
             } else {
+                g_status_created = 1u; /* 判据的适用条件 —— 见 M4-11.1 那两条 */
                 /* 3 秒:够状态线程醒 2~3 次,也够负载线程跑完 2.4 秒 */
                 wait_ms_wall(3000u);
 
@@ -3370,11 +3395,28 @@ void kmain(void)
      * 状态行线程随时可能插进来把某一行劈成两半 —— 上板实测过一次,
      * `=== SELF-TEST END ===` 被劈开,`verify_board.py` 直接判"报告不完整"。
      *
-     * ⚠ 代价:报告要打几秒钟,这几秒里**整个系统停摆**(状态线程也醒不过来)。
-     *   所以状态行的 `late` 在报告之后会偏大 —— 那是这个排他的直接后果,
-     *   不是调度器的问题。`sched_sleep_latency` 的判据取自报告**之前**的
-     *   那一段(相 4),所以不受影响。
+     * ★ M4-11.1:这个排他从"关调度"换成了**一把 yield 型互斥**(D13 结案)★
+     *
+     * 换之前:报告打几秒钟,这几秒里**整个系统停摆** —— 所有线程都醒不过来,
+     * 于是饥饿监视器必须把"停摆"从"饥饿"里减掉(`sched_off_total_ns`)。
+     * 换之后:调度器照常跑,状态线程照常醒、照常被调度,只是**打印要等锁**。
+     *
+     * 两件事因此可以直接量出来,而且都写进了报告:
+     *   `console_excl_sched_off_ms` —— 报告区间里"调度被人为关掉"的毫秒数
+     *                                 (旧做法 = 整个报告长度,现在应当 ≈ 0);
+     *   `console_excl_alive_wakes`  —— 报告区间里状态线程**醒过几次**
+     *                                 (旧做法恒为 0 —— 它压根没机会跑)。
+     *
+     * ⚠ 一个必须写清的边界:报告通道是排他的,但 kmain 里那些**没有包在
+     *   `console_excl_*` 里的打印**(还有 100 多处)是"尽力而为"的 ——
+     *   状态行有可能插进它们中间。旧做法下它们**顺带**受保护(那时排他 =
+     *   关调度,而关着调度就只有本核一个写者)。
+     *   ⇒ 机器判定的通道不受影响(它包住了),人读的诊断行可能被劈开。
+     *     这是有意的取舍:把整段 `console_printf` 都做成取锁的,会让
+     *     **异常处理路径上的打印**(它不能睡眠)与持锁者撞成死锁。
      */
+    g_report_off0    = sched_off_total_ns();
+    g_report_wakes0  = g_status_wakes;
     console_excl_begin();
 
     selftest_report("uart_present", uart_present ? 1u : 0u, 1u, SELFTEST_EQ);
@@ -3699,6 +3741,43 @@ void kmain(void)
                     1u, SELFTEST_EQ);
 
     /*
+     * ---- ★ M4-11.1:排他输出用的那把锁(D13 结案)★ ----
+     *
+     * 三条判据 + 两条绊线,各自失败的含义完全不同:
+     *
+     *   `console_excl_wait`      这把锁**真的被竞争过**吗(让出次数 > 0)。
+     *                            恒为 0 的话,"互斥成立"就只是一句空话 ——
+     *                            一把没人争的锁,谁都能"通过"。
+     *                            ⚠ 适用条件:第二个写者(周期状态线程)存在。
+     *                            它没造出来时这条判据不成立,所以一起判。
+     *   `console_excl_sched_off` 报告区间里"调度被人为关掉"的毫秒数。
+     *                            旧做法(关调度)等于整个报告长度(几秒);
+     *                            现在应当 ≈ 0。阈值 50ms 区分的是"几毫秒"与
+     *                            "几千毫秒",不是一个需要精调的边界。
+     *   `console_excl_alive`     报告区间里状态线程**醒过几次**。旧做法恒为 0:
+     *                            那几秒整个系统是停摆的。这一条与上一条一起,
+     *                            就是"换成锁之后系统没有停摆"的直接证据。
+     */
+    selftest_report("console_excl_wait",
+                    ((g_status_created != 0u) && (console_mutex_yields() > 0u)) ? 1u : 0u, 1u,
+                    SELFTEST_EQ);
+    selftest_report("console_excl_sched_off",
+                    (u32)((sched_off_total_ns() - g_report_off0) / 1000000ull), 50u, SELFTEST_LE);
+    selftest_report("console_excl_alive",
+                    ((g_status_created != 0u) && ((g_status_wakes - g_report_wakes0) >= 1u)) ? 1u : 0u,
+                    1u, SELFTEST_EQ);
+    /*
+     * 两条绊线(都必须恒为 0):
+     *   `console_mutex_off_wait`  "在关调度的窗口里等锁" —— 那时让出与睡眠都
+     *                            不发生,同核上的持锁者拿不到 CPU ⇒ 死锁且不报错。
+     *   `console_mutex_errors`    状态机返回非 0 —— 生产路径上不可能发生
+     *                            (递归锁 + console.c 的深度计数挡住嵌套)。
+     */
+    selftest_report("console_mutex_off_wait", console_mutex_off_yields(), 0u, SELFTEST_EQ);
+    selftest_report("console_mutex_errors",
+                    console_mutex_lock_errors() + console_mutex_unlock_errors(), 0u, SELFTEST_EQ);
+
+    /*
      * `invalid_ctx` 必须恒为 0:它不是"发生过多少件坏事"的计数,
      * 而是"调度器有没有挑到过不可切换的上下文"。挑了就是有 bug ——
      * 正常路径上 idle 的 pc==0 只在注册与第一次切走之间成立,
@@ -3779,6 +3858,132 @@ void kmain(void)
     HB[HB_SLOT_SELFTEST_FAILED] = selftest_summary();
     console_puts("\n");
     console_excl_end(); /* ★ 报告区间结束,状态行线程可以继续说话了 ★ */
+
+    /* ---- 9.74 串口排他锁的破坏性对照组(必须在自检报告**之后**)---- */
+    /*
+     * ## 对照的是什么
+     *
+     * 两段**完全一样**的负载:拿住排他、等 1200ms 墙钟、放开。
+     * 唯一变的是"拿住"这件事的实现:
+     *
+     *   A(生产路径)  源 OS 的 yield 型互斥(`console_mutex_set_legacy(0)`)
+     *   B(对照组)    退回 M4-11.1 之前的"关调度"(`console_mutex_set_legacy(1)`)
+     *
+     * 于是同一件事有两个**可测的**侧面:
+     *
+     *   `sched_off`  窗口内"调度被人为关掉"的毫秒数
+     *                A:≈ 0(锁不关调度)      B:≈ 窗口长度(1200)
+     *   `alive`      窗口内"系统在跑"的证据 = 饥饿监视器**完成的窗口数**
+     *                + 状态线程**醒过**的次数 + 它**等锁重试**过的次数
+     *                A:≥ 1(实测十几)         B:== 0(整个系统停摆)
+     *
+     * ⚠ `alive` 为什么是**三个计数相加**,而不是只看状态线程:
+     *   实测踩到过两次(第二、三次上板)——
+     *     ① 报告期间状态线程就已经卡在"等锁重试"里了,它的"醒来"计数在
+     *        **进入重试循环之前**就加过了 ⇒ A 窗口里那个数增量为 0;
+     *     ② 就算补上"重试次数",A 窗口是 1.2s 而状态线程的周期是 1s ⇒
+     *        **窗口边界正好错过一次唤醒**时它仍然是 0(第三次上板就是这样)。
+     *   ⇒ 判据不能押在"另一个线程的相位恰好落进窗口"上。饥饿监视器的周期是
+     *     **64ms**(前一个窗口的三十分之一),它在窗口里完成多少次是**确定**的:
+     *     A 里十几次,B 里 0 次(调度关着,它一次都跑不起来)。
+     *     状态线程那两个计数留着,是因为它们在 A 里额外证明"打印确实被竞争过"。
+     *
+     * ⚠ 判据是**两个侧面都对上**才算"检出" —— 只看 `sched_off` 的话,
+     *   "窗口里其实什么都没跑"也会让 A 看起来很好。
+     *
+     * ⚠ 基准(三个计数)在 B 里必须**关掉调度之后**再取:那一刻起没有别人
+     *   能跑,读到的就是确定值(否则那一瞬间刚好有一次唤醒/一个窗口结束时,
+     *   `alive == 0` 就会假失败)。A 里没有这个讲究 —— A 要的正是"它照常在跑"。
+     *
+     * ⚠ `console_mutex_set_legacy()` 只在"没有窗口开着"时才接受切换
+     *   (锁是空的、调度是开的),被拒会计数;这里的两处切换都在窗口之间,
+     *   所以 `refused` 应当是 0 —— 一起打出来,免得"切换其实没生效"被读成
+     *   "两组一样"。
+     */
+    {
+        u64 off_a0;
+        u64 off_a1;
+        u64 off_b0;
+        u64 off_b1;
+        u32 w_a0;
+        u32 w_a1;
+        u32 w_b0;
+        u32 w_b1;
+        u32 y_a0;
+        u32 y_a1;
+        u32 y_b0;
+        u32 y_b1;
+        u32 c_a0;
+        u32 c_a1;
+        u32 c_b0;
+        u32 c_b1;
+        u32 off_a_ms;
+        u32 off_b_ms;
+        u32 win_a;
+        u32 wake_a;
+        u32 wait_a;
+        u32 win_b;
+        u32 wake_b;
+        u32 wait_b;
+        u32 refused0 = console_mutex_legacy_refused();
+        bool detected;
+
+        /* ---- A:生产路径(锁)---- */
+        console_mutex_set_legacy(0u);
+        off_a0 = sched_off_total_ns();
+        w_a0   = g_status_wakes;
+        y_a0   = console_mutex_yields();
+        c_a0   = g_starve_checks;
+        console_excl_begin();
+        wait_ms_wall(1200u);
+        console_excl_end();
+        off_a1 = sched_off_total_ns();
+        w_a1   = g_status_wakes;
+        y_a1   = console_mutex_yields();
+        c_a1   = g_starve_checks;
+
+        /* ---- B:对照组(关调度)---- */
+        console_mutex_set_legacy(1u);
+        console_excl_begin(); /* ← 旧做法:这一句就是 sched_disable() */
+        off_b0 = sched_off_total_ns();
+        w_b0   = g_status_wakes; /* 三个基准都在关掉之后取 —— 见上面那条说明 */
+        y_b0   = console_mutex_yields();
+        c_b0   = g_starve_checks;
+        wait_ms_wall(1200u);
+        off_b1 = sched_off_total_ns();
+        w_b1   = g_status_wakes;
+        y_b1   = console_mutex_yields();
+        c_b1   = g_starve_checks;
+        console_excl_end();
+        console_mutex_set_legacy(0u);
+
+        off_a_ms = (u32)((off_a1 - off_a0) / 1000000ull);
+        off_b_ms = (u32)((off_b1 - off_b0) / 1000000ull);
+        win_a    = c_a1 - c_a0;
+        wake_a   = w_a1 - w_a0;
+        wait_a   = y_a1 - y_a0;
+        win_b    = c_b1 - c_b0;
+        wake_b   = w_b1 - w_b0;
+        wait_b   = y_b1 - y_b0;
+
+        detected = ((off_a_ms <= 50u) && (off_b_ms >= 1000u) &&
+                    ((win_a + wake_a + wait_a) >= 1u) && ((win_b + wake_b + wait_b) == 0u) &&
+                    (console_mutex_legacy_refused() == refused0));
+
+        /*
+         * 三行判定**整段排他**:它们会被日志与人逐行读,而状态行正好在
+         * 这个时刻最活跃(它刚从报告那把锁上被放出来)。不排他的话,
+         * 实测会把状态行劈进 `alive=+...` 中间。
+         */
+        console_excl_begin();
+        console_printf(" Console A/B : lock(1200ms)   -> sched_off=+%u ms alive=+%u (win=+%u wake=+%u wait=+%u)\n",
+                       off_a_ms, win_a + wake_a + wait_a, win_a, wake_a, wait_a);
+        console_printf(" Console A/B : legacy(1200ms) -> sched_off=+%u ms alive=+%u (win=+%u wake=+%u wait=+%u)\n",
+                       off_b_ms, win_b + wake_b + wait_b, win_b, wake_b, wait_b);
+        console_printf(" Console A/B : yield-lock vs disable-lock -> %s\n",
+                       detected ? "DETECTED" : "NOT DETECTED");
+        console_excl_end();
+    }
 
     /* ---- 9.75 之前的共同前提:★ 后面的对照组全部钉在 CPU0 ★ ---- */
     /*

@@ -167,41 +167,44 @@ int main(void)
     reset(); console_put_dec32(123456u);              expect("put_dec32", "123456");
 
     /*
-     * ---- 排他输出(M4-8.4):钩子必须**成对、按嵌套深度**调用 ----
+     * ---- 排他输出(M4-8.4;★ M4-11.1 起本文件只做"转发" ★)----
      *
-     * 这条判据的由来:排他区里 9600 波特下要传几十毫秒,而别的上下文随时
-     * 可能插进来把机器可读的自检报告劈成两半。互斥靠"关调度"实现,而
-     * `console.c` 只持一对钩子(不直接认识调度器 —— 否则宿主单测链接不过)。
+     * ⚠ 判据在 M4-11.1 **必须**改,而且理由来自上板实测:
      *
-     * ⚠ 判据的重点在**嵌套**:
-     *   - 进两次只该叫一次 begin(否则内层退出时会把外层的保护撤掉);
-     *   - 出到 0 才叫 end;
-     *   - 多退一次**不许**再叫 end(那同样会让外层失去保护)。
-     *   这三点里任何一点错了,失效都是**静默的** —— 输出照样出得来,
-     *   只是偶尔被插进去。
+     *   原来这里是"按**全局**嵌套深度调用钩子"(进两次只叫一次 begin、
+     *   出到 0 才叫 end、多退一次不叫 end)。那条规则在"排他 = 关调度"的
+     *   前提下成立 —— 调度关着的时候没有别的上下文能跑起来。
+     *
+     *   换成真正的锁之后它就是**漏洞**:全局计数不认识持有者,于是
+     *   B 线程看到 `depth != 0` 就一声不吭地直接打印,锁形同虚设。
+     *   实测症状(第一次带锁上板):状态行被劈进自检报告中间
+     *   (`verify_board.py` 判"报告不完整"),而"锁被竞争过吗"那个计数恒为 0。
+     *
+     *   ⇒ 现在本文件**每一次 begin/end 都如实叫钩子**,嵌套与"多退一次"
+     *     由钩子背后那把**递归互斥**按持有者计数负责(源 OS `rec = true`
+     *     的 `rcc`)。那三条性质在 tests/test_arm32_mutex.py 里逐条钉住,
+     *     这里只钉"转发"这一件事。
      */
     {
-        int before_calls = hook_begin_calls;
-        int ebefore_calls = hook_end_calls;
+        int b = hook_begin_calls;
+        int e = hook_end_calls;
 
         console_excl_begin();
-        check("excl begin calls begin", hook_begin_calls == before_calls + 1);
-        console_excl_begin(); /* 嵌套:不该再叫一次 */
-        check("excl nested no extra begin", hook_begin_calls == before_calls + 1);
-        console_excl_end();   /* 还没到 0:不该叫 end */
-        check("excl inner end no hook", hook_end_calls == ebefore_calls);
+        check("excl begin forwards", hook_begin_calls == b + 1);
+        console_excl_begin(); /* 嵌套:照样如实转发(递归计数在锁那一层)*/
+        check("excl nested forwards", hook_begin_calls == b + 2);
         console_excl_end();
-        check("excl outer end calls hook", hook_end_calls == ebefore_calls + 1);
-
-        /* 多退一次:计数已经是 0,不许再叫 end */
+        check("excl end forwards 1", hook_end_calls == e + 1);
         console_excl_end();
-        check("excl over-end no hook", hook_end_calls == ebefore_calls + 1);
+        check("excl end forwards 2", hook_end_calls == e + 2);
 
-        /* 多退之后仍然能正常配对(计数没被弄成负数) */
+        /* 没装钩子时是空操作:启动早期只有一个写者,那正是对的 */
+        console_set_excl_hooks(NULL, NULL);
         console_excl_begin();
-        check("excl still works after over-end", hook_begin_calls == before_calls + 2);
         console_excl_end();
-        check("excl still pairs", hook_end_calls == ebefore_calls + 2);
+        check("excl without hooks is noop",
+              (hook_begin_calls == b + 2) && (hook_end_calls == e + 2));
+        console_set_excl_hooks(stub_excl_begin, stub_excl_end);
     }
 
     if (failures == 0) {

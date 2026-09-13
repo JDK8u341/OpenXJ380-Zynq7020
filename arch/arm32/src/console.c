@@ -34,17 +34,44 @@ void console_puts(const char *str)
 }
 
 /* ------------------------------------------------------------------ */
-/* ★ 排他输出(M4-8.4)★                                               */
+/* ★ 排他输出(M4-8.4;M4-11.1 起只做"转发")★                          */
 /* ------------------------------------------------------------------ */
 
 /*
- * 嵌套计数。**只在 0 → 1 时叫钩子,1 → 0 时叫另一个** ——
- * 否则内层一退出就把外层的保护撤掉了,而那种失效是静默的:
- * 输出照样出得来,只是偶尔被别的东西插进去。
+ * 本文件**只把"进/出排他区"这件事转给调用方装进来的钩子**,自己不再维护
+ * 任何状态。
+ *
+ * ★ M4-11.1:这里原来有一个**全局**嵌套计数(`g_excl_depth`),规则是
+ *   "进两次只叫一次 begin""出到 0 才叫 end""多退一次不叫 end"。
+ *   那条规则在一个前提下是对的:**同一时刻只有一个写者** —— 而它靠的正是
+ *   "排他 = 关调度"(调度关着的时候别的上下文根本跑不起来)。
+ *
+ *   换成真正的锁之后,那个前提没了,计数反而成了**漏洞**:
+ *   `g_excl_depth` 是**全局**的,不是每个持有者一份。于是 A 线程进了排他区
+ *   (0→1,取到锁),B 线程进来时看到 `depth == 1`,**一声不吭地直接打印** ——
+ *   锁形同虚设。
+ *
+ *   上板实测就是这个症状(2026-09-13,第一次带锁的 M4-11.1):
+ *     - 状态行被劈进自检报告中间,`verify_board.py` 判"报告不完整"
+ *       (声明 90 passed,只解析到 85 条);
+ *     - `console_excl_wait`(那把锁被竞争过吗)恒为 **0**。
+ *
+ *   ⇒ 嵌套从"按**深度**计数"改回"按**持有者**计数",而那正是源 OS
+ *     `mutex_create(mtx, true)` 的递归计数(`rcc`)在做的事(见 src/mutex.c
+ *     与 src/mutex_kern.c)。三件事于是自动成立,而且**每个持有者一份**:
+ *       进两次   ⇒ rcc=2,锁没放;
+ *       内层退出 ⇒ rcc=1,锁还在;
+ *       多退一次 ⇒ `mutex_unlock` 返回 -EPERM(没拿锁的人放不掉),
+ *                  外层保护照样在,而且这个用法错误**会被计数**。
+ *
+ * ⚠ 所以本文件现在不"保护"任何东西:钩子没装时它是空操作(启动早期只有
+ *   一个写者,那正是对的);装了钩子时,互斥成立与否由那把锁负责。
+ *   ⚠ 为什么做成钩子而不是直接调调度器/锁:低层输出模块不能依赖调度器
+ *   (宿主单测编译 console.c 时会因符号未定义而链接失败,实测过),
+ *   而且本项目对同类问题已有先例 —— `kstack` 的 TLB 维护也是函数指针。
  */
 static console_excl_fn g_excl_begin;
 static console_excl_fn g_excl_end;
-static u32             g_excl_depth;
 
 void console_set_excl_hooks(console_excl_fn begin, console_excl_fn end)
 {
@@ -54,29 +81,14 @@ void console_set_excl_hooks(console_excl_fn begin, console_excl_fn end)
 
 void console_excl_begin(void)
 {
-    /*
-     * 钩子由内核在调度器就绪之后装入(`sched_disable` / `sched_enable`)。
-     *
-     * ⚠ 为什么做成钩子而不是直接调:`console.c` 是低层输出模块,
-     *   直接依赖调度器会让宿主单测链接不过(实测过),而且层次反了。
-     *   本项目对同类问题已有先例 —— `kstack` 的 TLB 维护也是函数指针。
-     *
-     * 没装钩子时退化成空操作:启动早期只有一个写者,那正是对的。
-     */
-    if (g_excl_depth == 0u && g_excl_begin != NULL) {
+    if (g_excl_begin != NULL) {
         g_excl_begin();
     }
-    g_excl_depth++;
 }
 
 void console_excl_end(void)
 {
-    if (g_excl_depth == 0u) {
-        return; /* 多退一次不把保护撤掉 —— 那会让外层失去保护 */
-    }
-
-    g_excl_depth--;
-    if (g_excl_depth == 0u && g_excl_end != NULL) {
+    if (g_excl_end != NULL) {
         g_excl_end();
     }
 }
