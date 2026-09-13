@@ -15,6 +15,8 @@
  */
 
 #include <arch/cache.h>
+#include <arch/axi_gpio.h>
+#include <arch/board.h>
 #include <arch/console.h>
 #include <arch/cpu.h>
 #include <arch/fault_test.h>
@@ -129,10 +131,15 @@ void kmain(void)
     /* static: 由 BSS 自动清零。这样在"无串口"路径下打印诊断也不会读未初始化值 */
     static uart_baud_result_t baud_result;
 
-    /* ---- 1. 先把 LED 弄起来 ---- */
+    /* ---- 1. 先把板级反馈弄起来 ---- */
     /*
      * 串口依赖未知的参考时钟,而 LED 只依赖已经验证过的 GPIO 通路。
      * 所以先做 LED:即使后面串口标定失败,板上也一定有可见反馈。
+     *
+     * ⚠ M3 之后 led_init() **只初始化 PS 侧的 MIO7/MIO8**。
+     *   PL 侧的 AXI GPIO 归设备描述层管 —— 它的方向寄存器要按描述
+     *   给出的位宽来配,而那要等 board_probe_all() 跑完。
+     *   这个拆分让 led_init() 能保持"足够早",不依赖任何发现机制。
      */
     led_init();
     HB[HB_SLOT_MAGIC] = PLAT_HEARTBEAT_MAGIC;
@@ -145,11 +152,9 @@ void kmain(void)
      */
     timer_init();
 
-    /* 上电自检:确认 8 个 LED 通路 */
-    led_pl_set(0xFFu);
+    /* PS LED 自检。PL LED 的自检在描述层跑完之后(见第 4 步) */
     led_ps_set(true);
     timer_delay_ms(150);
-    led_pl_set(0x00u);
     led_ps_set(false);
 
     /* ---- 3. 控制台 ---- */
@@ -210,7 +215,7 @@ void kmain(void)
     console_puts("\n");
     console_puts("================================================\n");
     console_puts(" OpenXJ380 / ARMv7-A (Zynq-7020)\n");
-    console_puts(" M0 skeleton - build, link, JTAG load, run\n");
+    console_puts(" M3 - device description layer + driver probe\n");
     console_puts("================================================\n");
 
     console_printf(" CPU          : %u Hz\n", PLAT_CPU_FREQ_HZ);
@@ -236,7 +241,47 @@ void kmain(void)
 
     HB[HB_SLOT_DIRM0] = led_get_dirm0();
 
-    /* ---- 5. 中断子系统(GIC + 周期 tick) ---- */
+    /* ---- 5. 设备描述层 ---- */
+    /*
+     * 位置:在控制台之后、中断与 MMU 之前。
+     *
+     *   - 必须在控制台之后:probe 的结果要能打出来。**没有枚举的 ARM 上,
+     *     "打印全部节点"是唯一能在驱动没起来时区分"驱动写错了"和
+     *     "描述表里根本没有这个节点"的手段**;
+     *   - 必须在中断之前:驱动的 probe 目前都是纯 MMIO 轮询,
+     *     不需要中断;放前面可以让"中断没配好"与"驱动没 probe 上"
+     *     两类问题互不干扰;
+     *   - 必须在 MMU 之前:probe 里访问的都是物理地址。
+     *
+     * 顺序本身也是有意义的:先 dump 再 probe,所以日志里能同时看到
+     * "描述了哪些设备"和"哪些被认领了",而不是只看到结果。
+     */
+    console_puts(" Device description layer\n");
+    board_dump_devices();
+    (void)board_probe_all();
+    console_puts("\n");
+
+    /*
+     * PL LED 自检。
+     *
+     * **挪到这里是有原因的**:PL 侧的 AXI GPIO 现在归描述层管,
+     * 它的方向寄存器由驱动在 probe 时按描述里给出的位宽配置。
+     * 在此之前往 ch2 写数据是无效的 —— 通道还是输入。
+     * 这也正是 M3 想验证的事情之一:自检能跑,就说明
+     * "描述表 -> 匹配 -> probe -> 驱动配置硬件"这条链路真的通了。
+     */
+    if (axi_gpio_ready()) {
+        console_printf(" LED self-test: AXI GPIO at 0x%08X, %u-bit, dual-channel\n",
+                       (u32)axi_gpio_get_base(), axi_gpio_get_width());
+        led_pl_set(0xFFu);
+        timer_delay_ms(150);
+        led_pl_set(0x00u);
+    } else {
+        console_puts(" LED WARN     : AXI GPIO was not claimed - PL LEDs unavailable\n");
+    }
+    console_puts("\n");
+
+    /* ---- 6. 中断子系统(GIC + 周期 tick) ---- */
     /*
      * 顺序有讲究:
      *   1) gic_init() 在关中断状态下配置 Distributor/CPU Interface
@@ -274,7 +319,7 @@ void kmain(void)
 
     HB[HB_SLOT_TICKS] = g_tick_seen;
 
-    /* ---- 6. MMU ---- */
+    /* ---- 7. MMU ---- */
     /*
      * 位置是有意选的:放在中断子系统验证**之后**。
      *
@@ -320,7 +365,7 @@ void kmain(void)
     }
     console_puts("\n");
 
-    /* ---- 7. 缓存几何 ---- */
+    /* ---- 8. 缓存几何 ---- */
     /*
      * 这里只是**读取并打印**,不使能缓存 —— 使能是下一步(M2-5b)的事。
      *
@@ -359,7 +404,7 @@ void kmain(void)
     }
     console_puts("\n");
 
-    /* ---- 8. 使能 L1 缓存 ---- */
+    /* ---- 9. 使能 L1 缓存 ---- */
     /*
      * 顺序不能变:先做 coherency 前置条件(SCU + ACTLR),
      * 再使能缓存。
@@ -510,7 +555,7 @@ void kmain(void)
     }
     console_puts("\n");
 
-    /* ---- 9. 主循环 ---- */
+    /* ---- 10. 主循环 ---- */
     /*
      * 节奏完全由全局定时器决定,不依赖软件延时循环 ——
      * 这样即使 CPU 频率变化,闪烁频率也保持一致。

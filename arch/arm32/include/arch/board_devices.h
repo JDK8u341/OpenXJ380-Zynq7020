@@ -16,15 +16,25 @@
 #include <arch/plat_device.h>
 
 /* 全部设备节点,按 xparameters.h 的实例名排序 */
-extern const plat_device_t g_board_devices[10];
-extern const u32            g_board_device_count;
+/*
+ * ⚠ 非 const:enabled 字段允许运行时修正。
+ *
+ * 生成器描述的是**设计里有什么**(xparameters.h 的来源),
+ * 而"比特流是否真的已加载"是运行时事实 —— 两者不一定一致。
+ * 所以 PL 节点默认 enabled = false,由 board.c 按实际加载的
+ * 比特流在启动时修正。见 arch/arm32/src/board.c。
+ */
+extern plat_device_t g_board_devices[10];
+extern const u32     g_board_device_count;
 
 /*
- * 驱动汇总入口。
+ * 驱动汇总入口 —— **指针数组**。
  *
- * 具体驱动在各自的源文件里,这里只声明一个聚合点 ——
- * 描述表与驱动表都由调用方交给 plat_probe_all(),
- * 本层不依赖具体驱动。(当前尚无驱动接入,定义见 kmain 的登记处)
+ * 为什么不是结构体数组:C 不允许用结构体变量初始化结构体数组,
+ * 而驱动必须能各自住在自己的翻译单元里。见 plat_device.h。
+ *
+ * 定义在 arch/arm32/src/board.c(手写),因为驱动是代码不是数据 ——
+ * 生成器只该产出"硬件是什么",不该产出"谁去驱动它"。
  */
-extern const plat_driver_t g_board_drivers[];
-extern const u32            g_board_driver_count;
+extern const plat_driver_t *const g_board_drivers[];
+extern const u32                  g_board_driver_count;

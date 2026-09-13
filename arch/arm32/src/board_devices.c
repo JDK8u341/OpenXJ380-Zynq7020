@@ -37,7 +37,7 @@ static const plat_prop_t xpar_sdhci0_props[] = {
     {"arasan,clocks", 21u},
 };
 
-const plat_device_t g_board_devices[10] = {
+plat_device_t g_board_devices[10] = {
     {
         .name       = "adc",
         .compatible = "xlnx,zynq-xadc-1.00.a",

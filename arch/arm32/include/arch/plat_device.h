@@ -189,6 +189,12 @@ typedef struct
 /*
  * 遍历设备表,为每个活跃设备找到第一个认领它的驱动。
  *
+ * **drivers 是"驱动指针数组",不是"驱动结构体数组"。**
+ * 这不是风格选择:C 不允许用结构体变量初始化结构体数组
+ * (`{ other_struct_var }` 不是常量表达式),而驱动必须能各自定义在
+ * 自己的翻译单元里 —— 否则每加一个驱动都要把它的实现搬进汇总文件。
+ * 所以汇总表只能是指针数组。
+ *
  * 匹配顺序是**确定的**,便于复现:
  *   外层按设备表顺序,内层按驱动表顺序;
  *   同一设备遇到 probe 失败会继续尝试下一个匹配的驱动。
@@ -196,5 +202,5 @@ typedef struct
  * stats 可为 NULL。
  */
 void plat_probe_all(const plat_device_t *devices, u32 device_count,
-                    const plat_driver_t *drivers, u32 driver_count,
+                    const plat_driver_t *const *drivers, u32 driver_count,
                     void *ctx, plat_probe_stats_t *stats);

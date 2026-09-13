@@ -108,7 +108,7 @@ u32 plat_prop_get_or(const plat_device_t *dev, const char *name, u32 default_val
 /* ------------------------------------------------------------------ */
 
 void plat_probe_all(const plat_device_t *devices, u32 device_count,
-                    const plat_driver_t *drivers, u32 driver_count,
+                    const plat_driver_t *const *drivers, u32 driver_count,
                     void *ctx, plat_probe_stats_t *stats)
 {
     plat_probe_stats_t local = {0, 0, 0, 0, 0};
@@ -147,7 +147,11 @@ void plat_probe_all(const plat_device_t *devices, u32 device_count,
          * 把机会留给排在后面的通用驱动。
          */
         for (r = 0; r < driver_count; r++) {
-            const plat_driver_t *drv = &drivers[r];
+            const plat_driver_t *drv = drivers[r];
+
+            if (drv == NULL) {
+                continue;
+            }
 
             if (!plat_compatible_match(drv->compatible, dev->compatible)) {
                 continue;

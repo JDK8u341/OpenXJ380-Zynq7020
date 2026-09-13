@@ -118,6 +118,15 @@ static int probe_want_dual(const plat_device_t *dev, void *ctx)
     return (dual != 0u) ? PLAT_PROBE_OK : -1;
 }
 
+/* 注意:驱动汇总表是**指针数组** —— C 不允许用结构体变量初始化结构体数组,
+ * 而驱动要能各自住在自己的翻译单元里。见 plat_device.h。 */
+static const plat_driver_t drv_uart_ok = {.compatible = "xlnx,ps7-uart", .probe = probe_accept};
+static const plat_driver_t drv_gpio_ok = {.compatible = "xlnx,axi-gpio-2.0", .probe = probe_accept};
+static const plat_driver_t drv_gpio_dual = {.compatible = "xlnx,axi-gpio-2.0", .probe = probe_want_dual};
+static const plat_driver_t drv_gpio_rej = {.compatible = "xlnx,axi-gpio-2.0", .probe = probe_reject};
+static const plat_driver_t drv_uart_noprobe = {.compatible = "xlnx,ps7-uart", .probe = NULL};
+static const plat_driver_t drv_other = {.compatible = "acme,other", .probe = probe_accept};
+
 /* ================= 测试数据 ================= */
 
 static const plat_prop_t gpio_props[] = {
@@ -216,10 +225,7 @@ int main(void)
             {.name = "orphan", .compatible = "acme,no-driver", .enabled = true},
             {.name = "pl_thing", .compatible = "xlnx,axi-gpio-2.0", .enabled = false}};
 
-        static const plat_driver_t drvs[] = {
-            {.compatible = "xlnx,ps7-uart", .probe = probe_accept},
-            {.compatible = "xlnx,axi-gpio-2.0", .probe = probe_accept},
-        };
+        static const plat_driver_t *const drvs[] = {&drv_uart_ok, &drv_gpio_ok};
 
         plat_probe_stats_t st;
 
@@ -255,10 +261,7 @@ int main(void)
          * 两个驱动声明同一个 compatible:排在前面的只认双通道版本,
          * 排在后面的通吃。is-dual = 1 所以第一个就该认领。
          */
-        static const plat_driver_t drvs_dual_first[] = {
-            {.compatible = "xlnx,axi-gpio-2.0", .probe = probe_want_dual},
-            {.compatible = "xlnx,axi-gpio-2.0", .probe = probe_accept},
-        };
+        static const plat_driver_t *const drvs_dual_first[] = {&drv_gpio_dual, &drv_gpio_ok};
 
         {
             plat_probe_stats_t st;
@@ -276,10 +279,7 @@ int main(void)
          * 这正是 Linux 的语义 —— 一个驱动可以因为"硬件版本不对"而放弃。
          */
         {
-            static const plat_driver_t drvs_reject_first[] = {
-                {.compatible = "xlnx,axi-gpio-2.0", .probe = probe_reject},
-                {.compatible = "xlnx,axi-gpio-2.0", .probe = probe_accept},
-            };
+            static const plat_driver_t *const drvs_reject_first[] = {&drv_gpio_rej, &drv_gpio_ok};
             plat_probe_stats_t st;
 
             trace_reset();
@@ -298,9 +298,7 @@ int main(void)
          * failed 是"驱动写了但不认这个硬件" —— 排查方向完全不同。
          */
         {
-            static const plat_driver_t drvs_all_reject[] = {
-                {.compatible = "xlnx,axi-gpio-2.0", .probe = probe_reject},
-            };
+            static const plat_driver_t *const drvs_all_reject[] = {&drv_gpio_rej};
             plat_probe_stats_t st;
 
             trace_reset();
@@ -317,9 +315,7 @@ int main(void)
     /* ============================================================== */
     {
         static const plat_device_t devs[] = {DEV_UART};
-        static const plat_driver_t drvs[] = {
-            {.compatible = "xlnx,ps7-uart", .probe = NULL},
-        };
+        static const plat_driver_t *const drvs[] = {&drv_uart_noprobe};
         plat_probe_stats_t st;
 
         trace_reset();
@@ -338,7 +334,7 @@ int main(void)
     /* 7. 空表与 NULL:不得崩溃                                        */
     /* ============================================================== */
     {
-        static const plat_driver_t drvs[] = {{.compatible = "x", .probe = probe_accept}};
+        static const plat_driver_t *const drvs[] = {&drv_other};
         plat_probe_stats_t st;
 
         plat_probe_all(NULL, 0u, drvs, 1u, NULL, &st);

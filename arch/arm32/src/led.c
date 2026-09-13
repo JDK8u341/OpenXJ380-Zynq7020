@@ -1,12 +1,31 @@
 /*
- * AC880-CB 的 LED / 开关驱动
+ * AC880-CB 的 LED / 开关
  *
- * 本文件是 M0 阶段的可视输出手段。它同时覆盖了两条不同的
- * 硬件访问路径,这正是后续驱动要复用的两种模式:
- *   1. PL 外设经 AXI 互联访问(AXI GPIO @ 0x41200000)
- *   2. PS 硬核寄存器直接访问(PS GPIO @ 0xE000A000)
+ * 硬件事实(原理图 + AXI_GPIO_1_BSP.xdc 交叉确认):
+ *   PL 侧 8 个 LED : LED0..LED7 -> N22 P22 R18 T18 P20 P21 R20 R21
+ *     走双通道 AXI GPIO @ 0x41200000
+ *       ch1 = 拨码开关(输入)  ch2 = LED(输出)
+ *   PS 侧 MIO7/MIO8: L3_SEL=0 配置为 GPIO,可作 PS LED
+ *
+ * ====================================================================
+ * M3 之后的职责划分
+ * ====================================================================
+ *
+ * **PL 侧(AXI GPIO)的寄存器操作已经移到 src/axi_gpio.c 的驱动里** ——
+ * 基址、通道数、位宽现在全部来自设备描述表,不再硬编码在这里。
+ * 本文件保留的 led_pl_set / sw_read 只是转发,好处是主循环与自检代码
+ * 一行都不用改。
+ *
+ * **PS 侧(PS GPIO MIO7/MIO8)留在这里**,因为它不是发现来的设备:
+ * MIO 引脚的功能由 SLCR 的 L3_SEL 决定,没有"基址/参数"可描述,
+ * 属于板级固有属性,由 platform.h 的常量描述就够了。
+ *
+ * 这个划分本身是有信息的:**不是所有硬件都适合走设备描述层**。
+ * 有基址、有参数、可能缺席的,适合;板级固有的(引脚复用、
+ * 时钟树),硬编码在板级头文件里反而更清楚。
  */
 
+#include <arch/axi_gpio.h>
 #include <arch/io.h>
 #include <arch/led.h>
 #include <arch/platform.h>
@@ -16,20 +35,15 @@
 
 void led_init(void)
 {
-    /* ---- PL 侧:双通道 AXI GPIO ---- */
-
     /*
-     * ch1 接拨码开关,必须保持输入。
-     * 上电 TRI 默认 0xFFFFFFFF(输入),这里显式写回以防万一 ——
-     * 若误设为输出,会和拨码开关驱动对顶。
+     * 这里只初始化 PS 侧。
+     *
+     * ⚠ PL 侧(AXI GPIO)不在这里初始化 —— 它的方向寄存器要按描述层给出的
+     *   位宽来配,而那个信息要等 board_probe_all() 跑完才有。
+     *   所以 led_init() 现在可以**早于描述层**调用,这对启动顺序很重要:
+     *   它是"串口还没起来时唯一的反馈手段",必须足够早。
+     *   PL LED 会在 AXI GPIO 驱动 probe 时被初始化。
      */
-    mmio_write32(PLAT_AXI_GPIO_BASE + AXI_GPIO_CH1_TRI, 0xFFFFFFFFu);
-
-    /* ch2 接 LED,设为输出并清零 */
-    mmio_write32(PLAT_AXI_GPIO_BASE + AXI_GPIO_CH2_TRI, 0x00000000u);
-    mmio_write32(PLAT_AXI_GPIO_BASE + AXI_GPIO_CH2_DATA, 0x00000000u);
-
-    /* ---- PS 侧:MIO7 / MIO8 ---- */
     mmio_set_bits32(PLAT_GPIO_BASE + GPIO_DIRM_0, PS_LED_MASK);
     mmio_set_bits32(PLAT_GPIO_BASE + GPIO_OEN_0, PS_LED_MASK);
 
@@ -43,12 +57,13 @@ void led_init(void)
 
 void led_pl_set(u8 value)
 {
-    mmio_write32(PLAT_AXI_GPIO_BASE + AXI_GPIO_CH2_DATA, (u32)value);
+    /* 转发给描述层找出来的那个 AXI GPIO 驱动 */
+    axi_gpio_led_write(value);
 }
 
 u8 sw_read(void)
 {
-    return (u8)(mmio_read32(PLAT_AXI_GPIO_BASE + AXI_GPIO_CH1_DATA) & 0xFFu);
+    return axi_gpio_switch_read();
 }
 
 void led_ps_set(bool on)
