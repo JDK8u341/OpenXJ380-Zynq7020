@@ -2081,8 +2081,9 @@ switched=30 preempted=27 invalid=0
 | ~~D6~~ | ~~**`sched_tick` 里的 CPU0 护栏**~~ | — | — | **已结案(M4-10.3,`a158e53`)**。拆掉的前提是四件都到位:每核队列、每核 idle、每核 `current_task`/`scheduler_ticks`/计数器、每核 VFP 指针。⚠ 护栏期间它还在**掩盖**一个 bug(见 D12 那条里的 `g_vfp_save_f`) |
 | ~~D12~~ | ~~**就绪队列无锁**~~ | — | — | **已结案(M4-10.4)**。每核一把 **irqsave** 锁(入队在线程上下文、选取在中断上下文 ⇒ 普通自旋锁就是**同核自死锁**),选取整段持锁 —— 与源 OS 的 `select_next_task_safe` 一致(`scheduler.cpp:325-360`)。<br>⚠ 源 OS 另有**全局** `scheduler_lock` 罩 `add_task`/`remove_task`(`:530`/`:564`),M4-10 **刻意没引**:ARM 侧现在只有 add,那把锁**没有第二个用户**(本项目删过两个这样的死物,D10/D11)。**M4-11 有线程退出时必须补上**。<br>★ 顺带:那个全局量 `g_vfp_save_f` 也是同一类问题 —— 它让"每核结构里的 `cur_vfp_f`"变成第二份真相,而双核下第二份真相互相覆盖 ⇒ 已删 |
 | ~~D15~~ | ~~**新线程的 vruntime 漏了 `- WAKEUP_CREDIT`**~~ | — | — | **已结案(M4-10.1,`ccb7156`)**。见下方 M4-10 一节 |
-| D13 | **串口排他用的是"关调度"，不是锁** | `src/console.c` 的 `console_excl_begin/end` | 只有一个常驻线程会打印（1Hz 状态行），关调度期间没别的上下文能跑，互斥成立 | **M4-11.1**。⚠ **计划原写"可睡眠的 `mutex` 到位后换成它"—— 那句话是错的**：源 OS 的 `mutex` 是 **yield 型**（`mutex.cpp:21-22` 的注释明说"不把线程切到 WAIT"），根本没有可睡眠互斥。⇒ 换成**源 OS 那个 yield mutex**。好处不是"不占 CPU"，而是①语义与源 OS 一致（递归/持有者/销毁）②打印期间**别的上下文还能跑**（`sched_off_total_ns` 因此几乎不再增长 ⇒ 饥饿监视器的 `skipped` 会掉到 ~0，这就是它的判据）。**绝不能用自旋锁**：一行 60~80ms，持锁者会被抢占，等锁者自旋（还关中断）就再也没人放锁 |
-| ★ D14 ★ | ★ **线程没有退出路径 —— 尾部那段终止循环不可达** ★ | `src/kmain.c` 的 `thread_finish()`；6 个调用点 | 自检探针"干完活"之后 `sched_park_self()` 就永久挂起了 | **M4-11.2**。源 OS 的对应物是 `pcb.cpp:501-504`（`kill_thread` 之后 `while (true) hlt`）—— 也就是说 **`wfi` 在这里是对的**（它的正当用途是"永久停住"，不是"idle 省电"），只是**现在还到不了那个循环**。<br>⚠ **但"释放栈 + 释放 TCB"不是垂死线程干的**（计划原话写错了）：源 OS 里 `kill_thread()` 只置 `DEATH`，`kill_thread0(task)` 那一行**是注释掉的**；真正的释放发生在**回收路径**（`kill_proc0` → `kill_thread0` → `remove_task` + `free(thread)`），由一个**常驻 reaper 线程**（`reaper.cpp:48-61`）挑"`status == DEATH` **且不在任何核的 `current_task` 上**"的目标。<br>⇒ ARM 侧两段式：垂死线程"置 DEATH + 让出 + wfi"，回收线程"摘队列 + 还栈 + 还 TCB"（数据源适配：没有进程组 ⇒ 遍历两核调度队列）|
+| ~~D13~~ | ~~**串口排他用的是"关调度"，不是锁**~~ | — | — | **已结案（M4-11.1）**。原状：`console_excl_begin/end` = `sched_disable/sched_enable`，只在"单核 + 单写者"下成立，代价是报告那几秒整个系统停摆。⚠ **计划原写"可睡眠的 `mutex` 到位后换成它"—— 那句话是错的**：源 OS 的 `mutex` 是 **yield 型**（`mutex.cpp:21-22` 的注释明说"不把线程切到 WAIT"），根本没有可睡眠互斥。⇒ 已换成**源 OS 那把 yield mutex**（`src/mutex.c` 纯状态机 + `src/mutex_kern.c` 钩子），逐条语义见 `arch/mutex.h`。<br>★ 换的过程里踩到两个**只有真锁才会暴露**的坑，都写进了实现注释并进了计划 §0.5.5（48/49）：①`console.c` 原来那个**全局**嵌套计数在"第二个写者"面前是漏洞（它按深度、不按持有者 ⇒ B 线程看到 `depth != 0` 就直接打印，锁形同虚设）②源 OS 的"等锁 = `scheduler_yield()` 空转"在本移植里**会静默死锁**（它的 BSP idle 是候选，我们的不是 —— 见 D16/D17）。<br>判据：`console_excl_wait`（这把锁真被竞争过）/ `console_excl_sched_off`（报告区间停摆 ≤ 50ms；旧做法是几千 ms）/ `console_excl_alive`（报告期间状态线程照常在跑）+ 两条绊线；破坏性 A/B 见 M4-11.1 一节 |
+| ★ D14 ★ | ★ **线程没有退出路径 —— 尾部那段终止循环不可达** ★ | `src/kmain.c` 的 `thread_finish()`；6 个调用点 | 自检探针"干完活"之后 `sched_park_self()` 就永久挂起了 | **M4-11.2**（★ 已决定**不回收**，见下）。源 OS 的对应物是 `pcb.cpp:501-504`（`kill_thread` 之后 `while (true) hlt`）—— 也就是说 **`wfi` 在这里是对的**（它的正当用途是"永久停住"，不是"idle 省电"），只是**现在还到不了那个循环**。<br>⚠ **但"释放栈 + 释放 TCB"不是垂死线程干的**（计划原话写错了）：源 OS 里 `kill_thread()` 只置 `DEATH`，`kill_thread0(task)` 那一行**是注释掉的**；真正的释放发生在回收路径（`kill_proc0` → `kill_thread0` → `remove_task` + `free(thread)`），而那条路对挂在 `kernel_group` 上的内核线程**不可达**（完整证据链见 `docs/PTASK.md` §2.5/§9.3）。<br>★★ **2026-09-13 决定：不改源 OS 的行为** ⇒ ARM 侧只做**两段式的第一段**（`status = DEATH` → 让出 → `wfi`），**不引入源 OS 没有的回收器**。代价与判据：内核栈池**只增不减**（`KSTACK_SLOTS` 32 × 1 MiB，启动自检约用到 30/32）⇒ `kstack_headroom` 从"D14 的临时哨兵"升级成**永久容量判据**，用量每次启动都打出来 |
+| D17 | ★ **偏离（不是退化）：`mutex` 的"等锁让出"钩子不是纯 yield，而是"睡一个 tick 再重试"** ★ | `src/mutex_kern.c` 的 `hook_yield()` | 源 OS 是 `scheduler_yield(); cpu_relax();`。而 ARM 侧**两个 idle 都刻意不作调度候选**（D16），自检报告又跑在 **idle 上下文**里 ⇒ 纯 yield 的等锁者在 `sched_select_next` 的兜底链（`src/sched.c:467`）里永远赢过 idle：**拿锁的人等放锁的人、放锁的人等拿锁的人让出 CPU** —— 静默死锁，表现为"报告打了一半就没了" | **不打算改回去**（改回去就是死锁）。状态机一个字没动（仍是源 OS 的"不挂等待队列、拿不到就重试"），只把"两次重试之间那一下"从"让出"换成"让出一个 tick"。★ 这是 D16 的**连锁后果**；若将来 idle 变成候选（或报告挪出 idle 上下文），这条偏离应当被重新审视 |
 | ~~★ D15 ★~~ | ~~★ **新线程的 vruntime 漏了 `- WAKEUP_CREDIT`** ★~~ | `src/sched.c` 的 `sched_entity_init()` | — | **已结案(M4-10.1,`ccb7156`)**。源 OS 是 `base > CREDIT ? base - CREDIT : 0`(`scheduler.cpp:294`),M4-8 写成了 `= base`(把参数当成了"当前时刻")⇒ 新线程比源 OS 晚 4ms 才被优先考虑。<br>★ **宿主单测当时是"跟着实现一起写错的"**:它断言 `vruntime == base`,所以一路全绿。改正时把判据**对着源 OS 逐值重写**(含 `base<credit`、`base==credit` 两个边界) |
 | D16 | ★ **偏离(不是退化)：idle 的 `task_level` 我们显式设成 `TASK_IDLE_LEVEL`，源 OS 的 BSP idle 实际是 0** ★ | `src/sched_kern.c` 的 `sched_register_boot_idle` / `sched_register_ap_idle` | 源 OS 里 AP idle 显式设 `TASK_IDLE_LEVEL(1)`（`smp.cpp:154`），而 **BSP idle 从不赋 `task_level`**（`main.cpp:520-541`，memset 后保持 **0 = `TASK_KERNEL_LEVEL`**）| **不打算"照抄"这个 0**（已按意图实现）。理由：level 0 会让 BSP idle 变成**可调度候选**（`is_task_schedulable` 只排除 level 1），而它 `context0.rip == 0` ⇒ 被选中时 `timer_handle` **放弃这次切换**（白做一次派发）、并且被 EEVDF 计费。这显然是**漏赋值**而不是设计 ⇒ 我们两个 idle 都设 1，与源 OS 的**意图**（idle 不可停、不作候选）一致。★ 细节与向作者确认的问题见 `docs/PTASK.md` §2.4/§4.2 |
 | ~~D3~~ | ~~内核用硬浮点编译~~ | — | — | **已结案：不是退化，是照源 OS 的设计。** 见下方「FP 上下文」一节 |
@@ -2472,6 +2473,96 @@ CPU0 布的指针会被 CPU1 覆盖 ⇒ **CPU0 把 FPSCR 存进别人的 TCB**�
 **对照组里算出来的判据不能当报告项**（这正是另外五组 A/B 的结论只以普通输出给出的原因）。
 我第一版把 `invalid bound` 写成了报告项 ⇒ 它读到的永远是初值 0 ⇒ **一条假 FAIL**。
 **"判据放在报告的哪一侧"本身是有约束的** —— 这条现在也写进了代码注释。
+
+### M4-11.1：串口排他从"关调度"换成**一把真锁**（已完成，板上 91/0）
+
+要证的事一句话：**排他输出不再让整个系统停摆，而互斥仍然是成立的**。
+
+#### 交付物
+
+| 文件 | 角色 |
+|---|---|
+| `include/arch/mutex.h` + `src/mutex.c` | 源 OS `kernel/task/mutex.cpp`(189 行)的**纯状态机**：不含 MMIO/CP15/内联汇编/时间源，唯一依赖是四个函数指针（取当前任务 / 让出 / 进临界区 / 出临界区）⇒ 宿主穷尽测 |
+| `src/mutex_kern.c` | 四个钩子的实现 + 串口那把锁 + 两条绊线计数 + 破坏性 A/B 的开关 |
+| `src/console.c` | **只做转发**（原来是"全局嵌套计数 + 只在 0→1 时叫钩子"，见坑 48） |
+| `tests/test_arm32_mutex.py` | 12 节、约 90 条断言：递归/`-EDEADLK`/`-EPERM`/`-EBUSY`/`-EINVAL`/销毁后/空指针/NULL current 边界/临界区进出口配对/让出次数逐值 |
+
+#### 语义：哪些照抄，哪些没照
+
+照抄（逐条对着 `mutex.cpp` 的行号，见 `arch/mutex.h`）：
+
+```
+拿不到就"让出 + 重试"，**不挂等待队列、不切 WAIT**（作者原注释：yield 型）
+递归计数 rcc；非递归自锁 ⇒ -EDEADLK；解锁非持有者 ⇒ -EPERM
+锁着的时候销毁 ⇒ -EBUSY；已销毁 ⇒ -EINVAL；trylock 被占 ⇒ -EBUSY
+trylock **一次都不让出**（否则它就不是非阻塞的）
+"没有 current 任务时空闲的锁会命中 owner == current" 这个边界也照抄（宿主测试钉住）
+```
+
+不照的两处，各有理由：
+
+- **`mutex_t.wait_queue` 字段没有搬**：源 OS 里它从头到尾没人用（只在 create/destroy 里建/销毁），是"本来打算做可睡眠、后来改成 yield"的化石 ⇒ 按本项目对死物的规矩（D10/D11）不搬。
+- **等锁那一下不是纯 yield，而是"睡一个 tick 再重试"**（记为**偏离 D17**）：源 OS 的 yield 能工作，是因为它的 **BSP idle 是 level 0 = 可调度候选**；我们刻意不作候选（D16）⇒ 纯 yield 会静默死锁（坑 49）。状态机没动，动的只是钩子。
+
+#### ★ 这一步最贵的三个坑（都进了计划 §0.5.5：48/49/50）
+
+**① 全局嵌套计数 + 真锁 = 漏洞（坑 48）。** 第一次带锁上板的症状**不是**报错，而是
+`verify_board.py` 说"报告不完整：SUMMARY 声明 90 passed，实际只解析到 85 条"，
+同时"这把锁被竞争过吗"那个计数恒为 **0**。根因：`console.c` 的 `g_excl_depth` 是
+**全局**的，它按**深度**而不是按**持有者**计数 ⇒ 状态线程看到 `depth == 1` 就
+一声不吭地直接打印。旧做法（排他 = 关调度）下这个计数是对的，因为那时
+"调度关着 ⇒ 没有第二个写者能跑"。处置：嵌套交回**按持有者**计数的递归互斥
+（源 OS 的 `rec = true` + `rcc`），`console.c` 只转发。
+
+**② 照抄"让出"会死锁（坑 49）。** 源 OS 的等锁是 `scheduler_yield()` 空转。
+本移植的 idle **不作候选**，而自检报告就跑在 idle 上下文里 ⇒
+等锁者 yield 之后仍是 `best`，调度器把它自己选回来（连切换都不做），
+持锁的 idle 永远回不来：**拿锁的人等放锁的人、放锁的人等拿锁的人让出 CPU**。
+处置见 D17（睡一个 tick）。⚠ 这一条是 D16 的**连锁后果** —— 两次偏离是连着的。
+
+**③ 对照组的"活着"观测量不能押在别人的相位上（坑 50）。** 破坏性 A/B 连着两次报
+`NOT DETECTED`，而同一份日志里两边的 `sched_off` 明明差着 1200ms（+0 vs +1200）。
+因为"系统活着"取的是 **1Hz** 状态线程的唤醒计数，而窗口是 1.2s：
+窗口边界正好错过一次唤醒就是 0；更早一次则是它已经卡在"等锁重试"里
+（那个计数在进循环**之前**就加过了）。处置：换成**周期 64ms** 的饥饿监视器窗口计数
+（前者的三十分之一）⇒ A 组十几次、B 组 0 次，确定成立。
+
+#### 板上判据（5 条，都在报告里）
+
+```
+console_excl_wait       这把锁**真的被竞争过**吗（让出次数 > 0）。恒 0 的话"互斥成立"就是空话
+                        ⚠ 适用条件：第二个写者（状态线程）存在 —— 一起判
+console_excl_sched_off  报告区间里"调度被人为关掉"的毫秒数 ≤ 50（旧做法 = 整个报告长度，几千 ms）
+console_excl_alive      报告区间里状态线程**醒过**（旧做法恒为 0：那几秒整个系统停摆）
+console_mutex_off_wait  ★绊线★ 在"关调度"的窗口里等过锁 ⇒ yield/睡眠都失效、同核持锁者饿死
+console_mutex_errors    ★绊线★ 状态机返回非 0（生产路径上不可能：递归锁 + 深度在锁那层）
+```
+
+实测（同一块 AC880-CB，多次 JTAG 加载结果一致）：
+
+```
+CHECK console_excl_wait      = 1 (expect == 1)   PASS
+CHECK console_excl_sched_off = 0 (expect <= 50)  PASS
+CHECK console_excl_alive     = 1 (expect == 1)   PASS
+CHECK console_mutex_off_wait = 0 (expect == 0)   PASS
+CHECK console_mutex_errors   = 0 (expect == 0)   PASS
+Sched nostarve: K=4 windows=23 full=23 events=0 late=0 skipped=0   ← 旧做法这里是 skipped=1
+```
+
+#### 破坏性 A/B：同一段负载，只换"拿住排他"的实现
+
+```
+Console A/B : lock(1200ms)   -> sched_off=+0 ms    alive=+19 (win=+19 wake=+0 wait=+0)
+Console A/B : legacy(1200ms) -> sched_off=+1200 ms alive=+0  (win=+0 wake=+0 wait=+0)
+Console A/B : yield-lock vs disable-lock -> DETECTED
+```
+
+两段完全一样的负载（拿住排他、等 1200ms 墙钟、放开），`console_mutex_set_legacy(1)`
+把那两句换回 `sched_disable/sched_enable`。判据是**两个侧面都换过来**才算检出：
+停摆时长（0 vs 窗口长度）与"窗口里系统还在跑"（19 > 0 vs 0）。
+（只想看一个侧面的话，"窗口里其实什么都没跑"也能显得 A 很好 —— 坑 43 的同一类。）
+
+---
 
 ### 12. 其它待办（AM3 及以后）
 
