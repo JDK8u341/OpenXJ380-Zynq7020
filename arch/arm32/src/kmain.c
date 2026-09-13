@@ -4296,12 +4296,24 @@ void kmain(void)
             sched_enable();
             console_puts(" VFP A/B     : kthread_create FAILED\n");
         } else {
-            arm_task_ctx_t idle_ctx_backup = sched_boot_idle()->ctx;
-            arm_task_ctx_t ctx_snapshot[SCHED_CTX_SNAPSHOT_MAX];
-            u32            ctx_snapshot_n;
-
-            ctx_snapshot_n = sched_ctx_snapshot_all(ctx_snapshot, SCHED_CTX_SNAPSHOT_MAX);
-
+            /*
+             * ★ 这里**没有** ctx 快照/还原 —— 那不是"保险",而是**污染源** ★
+             *
+             * 9.75 需要它,是因为那一组会把 kmain 的现场**收进 `current_task`**
+             * (决策照做、执行流不动)⇒ 名册里那些线程的 ctx 被写成了别人的现场。
+             *
+             * 而这一组(以及 9.77)**没有那种污染**:窗口里一切按正常路径切换,
+             * 每个线程的 ctx 都是它自己被换下时的**真实现场**。
+             * 这时再去"还原成窗口开始时的快照"就是**把跑过的线程恢复到过期现场**:
+             * 它的栈早被自己后来的执行用过了,恢复之后一跑就跳进垃圾。
+             *
+             * ⚠ 这个坑在 M4-11.1 之前**潜伏**着:那时状态线程被"关调度"冻在
+             *   报告里(实测 `late=4539388 us`),窗口内根本不动 ⇒ "恢复过期现场"
+             *   恰好是个空操作。M4-11.1 让状态线程恢复准时(late≈300us)之后,
+             *   它就会在窗口里真的跑 ⇒ 一到下一相就 Data Abort
+             *   (`DFAR=0x20000137 DFSR=0x8F1 对齐故障`,pc 落在数据段)。
+             *   完整经过见计划 §0.5.5 第 51 条。
+             */
             g_vfp_skip = 1u; /* ★ 对照组:不换浮点现场 ★ */
             sched_enable();
             wait_ms_wall(FP_BUDGET_US / 1000u + 300u);
@@ -4331,7 +4343,7 @@ void kmain(void)
                            g_vfp_ctl_detected ? "检出" : "未检出 —— 判据不承重!");
             console_excl_end();
 
-            /* 收拾:与 9.75 同一套(挂起两个线程、复位 current / 队列 / idle 现场)*/
+            /* 收拾:挂起两个探针(它们此后不再被调度)*/
             ca->status      = WAIT;
             ca->wakeup_time = 0u;
             cb->status      = WAIT;
@@ -4340,8 +4352,6 @@ void kmain(void)
 
             sched_set_current(sched_boot_idle());
             sched_boot_idle()->status = RUNNING;
-            sched_boot_idle()->ctx    = idle_ctx_backup;
-            sched_ctx_restore_all(ctx_snapshot, ctx_snapshot_n);
             /* ⚠ 不调 sched_kern_init():见上面 9.75 那段说明 —— 它会清空队列、
              *   把常驻的周期状态线程一起抹掉。 */
         }
@@ -4374,12 +4384,7 @@ void kmain(void)
             sched_enable();
             console_puts(" Wake A/B    : kthread_create FAILED\n");
         } else {
-            arm_task_ctx_t idle_ctx_backup = sched_boot_idle()->ctx;
-            arm_task_ctx_t ctx_snapshot[SCHED_CTX_SNAPSHOT_MAX];
-            u32            ctx_snapshot_n;
-
-            ctx_snapshot_n = sched_ctx_snapshot_all(ctx_snapshot, SCHED_CTX_SNAPSHOT_MAX);
-
+            /* ⚠ 同样**不用** ctx 快照/还原 —— 理由见 9.76 那段(污染源,不是保险)*/
             g_wake_skip = 1u; /* ★ 对照组:扫描里不再唤醒 ★ */
             sched_enable();
             wait_ms_wall(1500u);
@@ -4394,15 +4399,13 @@ void kmain(void)
                            g_wake_ctl_detected ? "检出" : "未检出 —— 判据不承重!");
             console_excl_end();
 
-            /* 收拾:与 9.75 / 9.76 同一套 */
+            /* 收拾:挂起探针 */
             sc->status      = WAIT;
             sc->wakeup_time = 0u;
             g_wake_skip     = 0u;
 
             sched_set_current(sched_boot_idle());
             sched_boot_idle()->status = RUNNING;
-            sched_boot_idle()->ctx    = idle_ctx_backup;
-            sched_ctx_restore_all(ctx_snapshot, ctx_snapshot_n);
             /* ⚠ 不调 sched_kern_init():见上面 9.75 那段说明 —— 它会清空队列、
              *   把常驻的周期状态线程一起抹掉。 */
         }
