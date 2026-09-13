@@ -154,12 +154,20 @@ tcb_t sched_kthread_create(void (*entry)(void *), void *arg, const char *name);
 void sched_yield(void);
 
 /*
- * 造 idle 线程并切过去 —— **不返回**。
- * idle 就是 `for (;;) arch_wfi();`,它的存在让"没有可运行线程"这件事
- * 有一个合法的落点,而不是让调度器去挑一个空队列。
+ * 把**启动上下文**注册成 idle(照源 OS)。
+ *
+ * 关键:`ctx.pc = 0` 是"上下文无效"的标记 —— 调度器挑到它时什么都不做。
+ * 也就是说 **idle 不是另一个线程,而是启动流程自己**;
+ * 没有"切进 idle"这回事。(第一版造了一个真的 wfi 线程 + 交棒,是偏离源 OS 的。)
  */
-void sched_kern_start(void);
+void  sched_register_boot_idle(void);
+tcb_t sched_boot_idle(void);
 
-/* 诊断:本核累计切换次数、idle 被调度到的次数 */
+/*
+ * tick 里给 current 计费 ← `timer_handle()` `scheduler.cpp:437`。
+ * 本步唯一让策略在板上活起来的地方;它**不做任何切换**(切换是 M4-9)。
+ */
+void sched_tick_account(void);
+
+/* 诊断:本核累计切换次数 */
 u32 sched_switch_count(void);
-u32 sched_idle_spins(void);

@@ -28,12 +28,10 @@
 static sched_queue_t g_runq[PERCPU_MAX_CPUS];
 
 static u32 g_switch_count;
-static u32 g_idle_spins;
 
-/* idle 线程的 TCB 与栈。静态实例:它必须永远存在,且不该依赖分配器 */
-static struct arm_thread_control_block g_idle_tcb;
-static kstack_t                        g_idle_stack;
-static tcb_t                           g_idle_task;
+/* 启动上下文被注册成的那个 idle TCB(照源 OS)。静态实例:它永远存在 */
+static struct arm_thread_control_block g_boot_idle_tcb;
+static tcb_t                           g_boot_idle;
 
 /*
  * 启动上下文的丢弃槽。
@@ -97,7 +95,6 @@ void sched_kern_init(void)
 
     sched_queue_init(&g_runq[pc->cpu_id]);
     g_switch_count = 0u;
-    g_idle_spins   = 0u;
 }
 
 static sched_queue_t *self_runq(void)
@@ -205,32 +202,34 @@ void sched_yield(void)
      * 而"跑一次算一片"与源 OS 的 tick 计费在长期份额上等价,
      * 又不必在这条热路径上碰全局定时器。
      */
-    if (cur != NULL && cur != g_idle_task) {
+    if (cur != NULL && cur != g_boot_idle) {
         cur->status = RUNNING;
         sched_account_run(cur, SCHED_BASE_SLICE_NS);
     }
 
     next = sched_pick(q);
-    if (next == NULL) {
-        /* 没有可运行线程 -> idle。已在跑 idle 就什么都不做 */
-        next = g_idle_task;
-    }
     if (next == NULL || next == cur) {
         return;
     }
 
+    /*
+     * ⚠ `next->ctx.pc == 0` 表示"这个线程的上下文无效"(源 OS 用
+     *   `context0.rip != 0` 做同一个判断)。挑到这种线程时**不许切过去** ——
+     *   它的现场根本不在内存里(启动上下文就是这样)。
+     *   源 OS 在这种情况下是"什么都不做,继续跑 current"。
+     */
+    if (next->ctx.pc == 0u) {
+        return;
+    }
+
     /* ---- 把当前线程放回队列,再把下一个摘下来 ---- */
-    if (cur != NULL && cur != g_idle_task) {
+    if (cur != NULL && cur != g_boot_idle) {
         cur->status = START;
         (void)sched_queue_insert(q, cur);
     }
 
-    if (next != g_idle_task) {
-        sched_queue_remove(q, next);
-        next->status = RUNNING;
-    } else {
-        g_idle_spins++;
-    }
+    sched_queue_remove(q, next);
+    next->status = RUNNING;
 
     sched_set_current(next);
     g_switch_count++;
@@ -256,7 +255,12 @@ void sched_yield(void)
      *   那时的正确做法是"只恢复 next,不保存任何人" ——
      *   用一个丢弃槽当 from。
      */
-    if (cur == NULL) {
+    if (cur == NULL || cur == g_boot_idle) {
+        /*
+         * 从"上下文不在内存里"的线程切走:没有现场可保存,用丢弃槽。
+         * (启动上下文就属于这种 —— 它的现场在 CPU 里,而且按源 OS 的模型
+         *  它只被切走、会被 M4-9 的帧改写路径切回来。)
+         */
         arch_ctx_switch(&g_boot_ctx, &next->ctx);
     } else {
         arch_ctx_switch(&cur->ctx, &next->ctx);
@@ -268,95 +272,84 @@ u32 sched_switch_count(void)
     return g_switch_count;
 }
 
-u32 sched_idle_spins(void)
-{
-    return g_idle_spins;
-}
-
 /* ------------------------------------------------------------------ */
-/* idle                                                                */
+/* 启动上下文 = idle(照源 OS,不是另造一个线程)                       */
 /* ------------------------------------------------------------------ */
 
 /*
- * idle 线程:没有别的事可做时 CPU 在这里等中断。
+ * 源 OS 的做法(`kernel/main.cpp`,在 KernelMain 里):
  *
- * 为什么必须有一个真的 idle 线程,而不是"挑不到就让调度器空转":
- *   - 空转会让 CPU 一直满速跑,板上直接表现为发热与功耗;
- *   - 更要紧的是**它没有栈** —— 协作式切换总得切到**某个**上下文上,
- *     而"没有上下文"是没法切过去的。
+ *     idle_thread->kernel_stack = get_rsp();
+ *     idle_thread->context0.rsp = get_rsp();
+ *     idle_thread->status       = RUNNING;
+ *     queue_enqueue_ref(get_current_cpu()->scheduler_queue, idle_thread, ...);
+ *     get_current_cpu()->current_task = idle_thread;
+ *     // context0.rip 从头到尾没设过 -> 保持 0
+ *
+ * 也就是说:**"idle"不是另一个线程,而是启动上下文自己**。
+ * 它的 `context0.rip` 是 0,而 `timer_handle` 拿 `rip != 0` 当"上下文有效"的守卫
+ * (`scheduler.cpp:444`)—— 挑到它时**什么都不做**,启动流程继续跑。
+ * 这就是 idle 的执行方式:没有"切进 idle"这回事。
+ *
+ * ⚠ 第一版我造了一个真的 `for(;;) wfi()` idle 线程 + `sched_kern_start()` 交棒。
+ *   那是**偏离源 OS** 的,而且立刻推出一堆不存在的问题:
+ *   "协作式让出会把当前线程重新入队 ⇒ 队列永不为空 ⇒ 挑不到 idle ⇒ 出不来"。
+ *   源 OS 里 idle 永远是 current,压根不需要"进去"。
+ *
+ * ARM 侧的"上下文无效"标记同样用 `ctx.pc == 0`(源 OS 用 `context0.rip`)。
+ * `ctx.sp` 取**当前** sp —— 现场就在 CPU 里,不需要保存,
+ * 因为这台"线程"只被切**走**,从不会被切**回来**…
+ * 需要被切回来时,x86 的 `change_proccess` 会把改写后的帧交回 iretq,
+ * ARM 侧对应的是改写现场帧再 rfeia(M4-9)。
  */
-static void idle_main(void *arg)
-{
-    (void)arg;
-
-    for (;;) {
-        /*
-         * ⚠ 自旋计数放在 WFI **之前**:它是"idle 被调度到几次"的计数,
-         *   不是"空转了几圈"。idle 每次被切进来只加一次 ——
-         *   这样它与 sched_switch_count 是同一量纲,可以直接对比。
-         */
-        arch_wfi();
-    }
-}
-
-void sched_kern_start(void)
+void sched_register_boot_idle(void)
 {
     u32 i;
 
-    memset(&g_idle_tcb, 0, sizeof(g_idle_tcb));
+    memset(&g_boot_idle_tcb, 0, sizeof(g_boot_idle_tcb));
 
-    /*
-     * idle 的栈:从栈池取,而不是复用启动栈。
-     *
-     * 复用启动栈会有一个隐蔽后果:kmain 的栈帧还在上面,
-     * 而 idle 永远不返回 —— 一旦将来有人让 idle 调用任何东西,
-     * 它就在 kmain 的栈帧上往下长,把 kmain 还在用的局部变量踩掉。
-     * (M4-7 的对照组正是踩坏了 kmain 的三个局部变量,那次是有意的。)
-     */
-    if (g_ks == NULL || kstack_alloc(g_ks, &g_idle_stack) != KSTACK_OK) {
-        /*
-         * 拿不到栈就不能切过去 —— 那会切到一个野 sp 上。
-         * 如实报出来并留在当前上下文里跑(退化但不崩)。
-         */
-        console_puts(" Sched       : idle stack alloc FAILED, scheduling disabled\n");
+    g_boot_idle_tcb.task_level   = TASK_IDLE_LEVEL;
+    g_boot_idle_tcb.status       = RUNNING;
+    g_boot_idle_tcb.kernel_stack = arch_read_sp(); /* 当前 sp,不另取栈 */
+    g_boot_idle_tcb.ctx.sp       = arch_read_sp();
+    g_boot_idle_tcb.ctx.pc       = 0u; /* ★ 0 = 上下文无效,调度器不许切进来 ★ */
+    g_boot_idle_tcb.owns_kstack  = false; /* 它就是启动栈,不归栈池管 */
+    for (i = 0; i < sizeof(g_boot_idle_tcb.name) - 1u && "idle"[i] != '\0'; i++) {
+        g_boot_idle_tcb.name[i] = "idle"[i];
+    }
+    sched_entity_init(&g_boot_idle_tcb, 0u);
+
+    g_boot_idle = &g_boot_idle_tcb;
+    sched_set_current(g_boot_idle);
+}
+
+tcb_t sched_boot_idle(void)
+{
+    return g_boot_idle;
+}
+
+/* ------------------------------------------------------------------ */
+/* tick 里给 current 计费(照源 OS)                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * ← `timer_handle()` `scheduler.cpp:437`:
+ *      charge_current_eevdf_runtime(current, EEVDF_TICK_NS);
+ *
+ * **这是 M4-8 里唯一会让策略在板上"活起来"的地方**,而且它不做任何切换 ——
+ * 切换是 M4-9 的事。所以本步的板级判据可以是:
+ * 跑 N 个 tick 之后,current(启动上下文)的 vruntime 正好涨了 N 毫秒。
+ *
+ * ⚠ 只在 current 确实在跑、且不是 idle 时才计费 —— 与源 OS 的三条早退一致
+ *   (idle / 非 RUNNING / runtime 为 0),那些早退在 sched_account_run 里。
+ */
+void sched_tick_account(void)
+{
+    tcb_t cur = sched_current();
+
+    if (cur == NULL) {
         return;
     }
 
-    g_idle_tcb.task_level   = TASK_IDLE_LEVEL;
-    g_idle_tcb.status       = RUNNING;
-    g_idle_tcb.kernel_stack = g_idle_stack.top;
-    g_idle_tcb.kstack_base  = g_idle_stack.base;
-    g_idle_tcb.kstack_guard = g_idle_stack.guard;
-    g_idle_tcb.kstack_slot  = g_idle_stack.slot;
-    g_idle_tcb.owns_kstack  = true;
-    for (i = 0; i < sizeof(g_idle_tcb.name) - 1u && "idle"[i] != '\0'; i++) {
-        g_idle_tcb.name[i] = "idle"[i];
-    }
-    g_idle_tcb.ctx.sp = g_idle_stack.top;
-    g_idle_tcb.ctx.pc = (u32)(uintptr_t)idle_main;
-    sched_entity_init(&g_idle_tcb, 0u);
-
-    g_idle_task = &g_idle_tcb;
-
-    console_printf(" Sched       : idle stack=0x%08X top=0x%08X guard=0x%08X\n", g_idle_stack.base,
-                   g_idle_stack.top, g_idle_stack.guard);
-
-    /*
-     * ---- 交棒 ----
-     *
-     * 把 current 置空(此刻**没有**线程在跑,跑的是启动流程),
-     * 然后走一次普通的让出:它会挑出 deadline 最小的可运行者
-     * (没有就挑 idle),并从**丢弃槽**切过去。
-     *
-     * ⚠ 正常情况下这一句不返回:启动上下文被存进 g_boot_ctx 之后就
-     *   永远躺在那里了 —— 它没有 TCB,也没人会把它放回队列。
-     *   真返回了说明有人把 g_boot_ctx 当成线程切了回来,那是本模块被用错,
-     *   所以下面停在 WFI 里而不是继续跑启动流程(那会是一个栈已经不一致的 kmain)。
-     */
-    sched_set_current(NULL);
-    sched_yield();
-
-    for (;;) {
-        arch_wfi();
-    }
+    sched_account_run(cur, SCHED_TICK_NS);
 }

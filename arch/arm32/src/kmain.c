@@ -191,6 +191,9 @@ static u32            g_yield_b;
 static u32            g_yield_ok;
 static u32            g_yield_switches;
 static u32            g_yield_local_ok;
+static u32            g_sched_idle_ok;
+static u64            g_tick_acc_delta;
+static u32            g_tick_acc_ok;
 
 #define YIELD_ROUNDS 8u
 
@@ -392,6 +395,16 @@ static volatile u32 g_tick_first;
 
 static void tick_handler(u32 intid, void *arg)
 {
+    /*
+     * ← 源 OS `timer_handle()` `scheduler.cpp:437`:
+     *      charge_current_eevdf_runtime(current, EEVDF_TICK_NS);
+     *
+     * M4-8 里**唯一**让调度策略在板上活起来的地方,而且它不做任何切换
+     * (切换是 M4-9 的事)。放在处理函数的最前面:后面的诊断计数只影响 CPU0,
+     * 而计费必须每核都做。
+     */
+    sched_tick_account();
+
     u32       now;
     percpu_t *pc;
 
@@ -1711,8 +1724,9 @@ void kmain(void)
         sched_kern_bind(&g_kstack, &g_heap);
         sched_kern_init();
 
-        g_yield_a = 0u;
-        g_yield_b = 0u;
+        g_yield_a   = 0u;
+        g_yield_b   = 0u;
+        g_tick_acc_delta = 0u;
 
         if (sched_kthread_create(yield_probe_a, NULL, "ya") == NULL ||
             sched_kthread_create(yield_probe_b, NULL, "yb") == NULL) {
@@ -1721,9 +1735,65 @@ void kmain(void)
             console_printf(" Sched       : 2 threads created, stack pool used=%u\n",
                            g_kstack.used_slots);
 
+            /*
+             * ★ 照源 OS:把**启动上下文**注册成 idle(current 从此刻起非空)★
+             *   idle 不是另一个线程,而是跑启动流程的这个上下文自己;
+             *   它的 ctx.pc = 0 是"上下文无效"的标记。
+             */
+            sched_register_boot_idle();
+            /* 两项一起判:idle 就是启动上下文自己,且它的 pc == 0(上下文无效)*/
+            g_sched_idle_ok = ((sched_current() == sched_boot_idle()) &&
+                               (sched_boot_idle()->ctx.pc == 0u) &&
+                               (sched_boot_idle()->task_level == TASK_IDLE_LEVEL))
+                                  ? 1u
+                                  : 0u;
+
             if (arch_ctx_save(&g_sched_return) == 0u) {
                 g_sched_return.r[0] = 1u;
-                sched_kern_start(); /* 不返回:交棒给第一个线程 */
+                /* 直接把控制权交给测试线程(协作式入口;源 OS 的切换点在 tick,
+                 * 那是 M4-9 —— 这里用的是 M4-7 的 arch_ctx_switch 原语) */
+                sched_yield();
+            }
+
+            /*
+             * 回到启动上下文了 —— 把 current 也指回 idle。
+             * (探针切回来用的是 arch_ctx_switch 原语,它只搬寄存器与栈,
+             *  不负责改 current_task;那是调度器的账。)
+             */
+            /* ---- tick 计费:跑 20ms,一个**非 idle** 线程的 vruntime 应当涨 ≈ 20ms ---- */
+            /*
+             * ⚠ 第一版测的是 idle 的 vruntime,得到恒为 0 —— 而那是**对的**:
+             *   `sched_account_run` 对 idle 早退,源 OS 的
+             *   `charge_current_eevdf_runtime` 也一样("idle 不参与公平分配")。
+             *   判据写错了不是代码错了。所以这里临时把一个真实线程设成 current,
+             *   让 tick 去计它的费。
+             */
+            {
+                tcb_t probe = sched_kthread_create(yield_probe_b, NULL, "acc");
+                u64   before;
+                u64   after;
+
+                if (probe != NULL) {
+                    probe->status = RUNNING;
+                    sched_set_current(probe);
+                    before = probe->eevdf_vruntime;
+
+                    timer_delay_ms(20);
+
+                    after            = probe->eevdf_vruntime;
+                    g_tick_acc_delta = after - before;
+                    g_tick_acc_ok    = ((g_tick_acc_delta >= 10u * SCHED_TICK_NS) &&
+                                        (g_tick_acc_delta <= 40u * SCHED_TICK_NS))
+                                           ? 1u
+                                           : 0u;
+
+                    console_printf(" Sched tick  : vruntime += %u us over 20 ms (%s)\n",
+                                   (u32)(g_tick_acc_delta / 1000u), g_tick_acc_ok ? "PASS" : "FAIL");
+
+                    sched_set_current(sched_boot_idle()); /* 交还给 idle */
+                } else {
+                    console_puts(" Sched tick  : kthread_create FAILED\n");
+                }
             }
 
             g_yield_switches  = sched_switch_count();
@@ -1894,6 +1964,25 @@ void kmain(void)
      * 三项分开:计数到没到、切换有没有真发生、切换有没有踩坏别人的栈。
      * 第三项是 M4-7 那套判据的复用 —— 调度器错了往往先表现在这里。
      */
+    /*
+     * ---- idle 的注册方式(M4-8,照源 OS)----
+     *
+     * idle 是**启动上下文自己**,不是另一个线程。判据是
+     * `current_task` 在注册后就是它、且它的 `ctx.pc == 0`(上下文无效标记)——
+     * 后者正是源 OS 里 `context0.rip == 0` 的对应物。
+     */
+    selftest_report("sched_boot_idle", g_sched_idle_ok, 1u, SELFTEST_EQ);
+
+    /*
+     * ---- tick 里给 current 计费(照源 OS scheduler.cpp:437)----
+     *
+     * 这是 M4-8 里唯一让策略在板上活起来的地方:跑 N 个 tick,
+     * current 的 vruntime 应当正好涨 N 毫秒。判据留了余量 ——
+     * 取样期间 tick 数是变化的,所以验的是"涨了、且量级对",
+     * 精确值由宿主单测保证。
+     */
+    selftest_report("sched_tick_account", g_tick_acc_ok, 1u, SELFTEST_EQ);
+
     selftest_report("sched_yield_rounds", g_yield_ok, 1u, SELFTEST_EQ);
     selftest_report("sched_switches", (g_yield_switches > YIELD_ROUNDS) ? 1u : 0u, 1u, SELFTEST_EQ);
     selftest_report("sched_caller_intact", g_yield_local_ok, 1u, SELFTEST_EQ);

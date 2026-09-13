@@ -1571,6 +1571,60 @@ M4-8.3 的第一步把 `src/sched_kern.c` 提交了 —— 它编译、链接、
 (与之配套的是已有的三级证据纪律:软件自报 < 硬件读回 < 破坏性 A/B。
  但三级证据的前提是**代码真的跑了**;跑都没跑过时,讨论第几级证据没有意义。)
 
+#### ★★ 重大修正:M4-8 的 idle 与切换点,我原来三处偏离源 OS ★★
+
+起因:在 M4-8.3 里我推出一个"死结"——纯协作式调度器里 idle 一旦进去就出不来
+(让出会把当前线程重新入队 ⇒ 队列永不为空 ⇒ 挑不到 idle;而把线程重新入队
+只有正在跑的线程调 yield 才会发生)。这个"死结"逼我去查源 OS,
+结果发现**它是我的发明的问题**。源 OS 的形状完全不同:
+
+```c
+// 1) 启动上下文本身就是 idle(scheduler 之外,main.cpp)
+idle_thread->kernel_stack = get_rsp();        // 当前 rsp
+idle_thread->context0.rsp = get_rsp();
+idle_thread->status       = RUNNING;
+queue_enqueue_ref(get_current_cpu()->scheduler_queue, idle_thread, ...);
+get_current_cpu()->current_task = idle_thread;   // current 从一开始就指向它
+// context0.rip 从头到尾没设过 -> 保持 0
+
+// 2) 唯一的切换点在 tick 中断里(scheduler.cpp:430-470)
+charge_current_eevdf_runtime(current, EEVDF_TICK_NS);
+if (cpu->scheduler_ticks < TIME_SLICE) { send_eoi(); return reg; }
+tcb_t best = select_next_task();
+if (best == NULL || best == current) { ...; return reg; }
+if (best->context0.rip != 0) { change_proccess(reg, current, best); }
+else { current->status = RUNNING; }          // ★ 上下文无效 -> 什么都不做 ★
+
+// 3) yield 只是"把时间片置满",再触发同一个中断
+void scheduler_yield() { get_current_cpu()->scheduler_ticks = TIME_SLICE;
+                         asm("int $32"); }
+```
+
+| # | 我原来做的 | 源 OS |
+|---|---|---|
+| **a** | 一个真的 `for(;;) wfi()` idle 线程 + `sched_kern_start()` 交棒 | 把**启动上下文**用 `get_rsp()` 注册成 TCB;**没有交棒这回事** |
+| **b** | 协作式 `sched_yield`(自己计费+入队+挑+切)| 切换**只在 tick 里**;yield = 置满时间片 + 触发同一入口 |
+| **c** | 于是推出"协作式到不了 idle"这个难题 | idle 永远是 current,**不需要"切进去"** |
+
+**根因**:我把 M4-9 的东西(tick 里切换)当成了 M4-8 的前提,
+然后在那个错误前提上推出一堆源 OS 里不存在的困难。
+
+**修正后的划分**:
+
+| 步骤 | 内容(照源 OS)|
+|---|---|
+| **M4-8** | 就绪队列 + 策略(已完成,宿主测)+ `current_task` 机制 + **把启动上下文注册成 idle TCB**(`ctx.sp` = 当前 sp,`ctx.pc` = 0 作为"上下文无效"标记)+ **tick 里给 current 计费**(`charge_current_eevdf_runtime`)。**本步不做任何切换** |
+| **M4-9** | **在 tick 里切换**:时间片计数 → 到点挑下一个 → `pc != 0` 才换;`yield` = 置满时间片 + 触发同一入口。★ 到这一步 idle 与抢占的语义才完整 ★ |
+
+**ARM 侧对应物**:x86 的 `change_proccess(reg, current, best)` 是**就地改写
+保存在 C 栈上的寄存器帧**;ARM 侧对应的是**改写 M4-7 那个现场帧,再 `rfeia` 回去** ——
+也就是"切换点落在任务的栈上"这件事终于用上了。`arch_ctx_switch`(协作式)
+则留作 M4-11 阻塞睡眠与线程退出时的原语。
+
+**⚠ WFI 不是源 OS 的行为**:x86 那边是 `hlt`,而且只在 `process_exit` 里;
+所谓"idle 进 WFI"是我的发明。要不要给 ARM 加,是一个**需要单独拍板**的偏离,
+不擅自定。M4-8 的判据里不含它。
+
 #### M4-8 的执行分解(按此顺序做,每步都能单独交代)
 
 | # | 内容 | 验收 |
