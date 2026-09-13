@@ -185,6 +185,112 @@ static int g_tcb_ctx_check = -1;
 /* M4-7:异常帧是否落在 SVC 栈区(1 = 在,0 = 不在)*/
 static u32 g_exc_frame_on_svc_stack;
 
+/* M4-7 后半段:协作式上下文切换的自检状态 */
+#define SWITCH_REG_PATTERN 0x5EED0000u
+
+static arm_task_ctx_t g_ctx_a;
+static arm_task_ctx_t g_ctx_b;
+
+/*
+ * ★ 离开 A 时"存到哪里"用一个**丢弃**的槽 ★
+ *
+ * `arch_ctx_switch(from, to)` 会**把当前状态存进 from**。如果 from 就是
+ * `g_ctx_a`,那它会把 `arch_ctx_save(&g_ctx_a)` 刚设好的"切回来的继续点"
+ * 覆盖成"arch_ctx_switch 调用点的下一条" —— 于是切回来之后会跳过
+ * `arch_ctx_save` 的返回值使用处,整个用例的判据就落空了。
+ * (第一版就是这么写的:ctx_b=PASS、stack_isolated=PASS,唯独 ctx_a=FAIL,
+ *  而 FAIL 的原因是用例自己写错,不是切换器。)
+ */
+static arm_task_ctx_t g_ctx_throwaway;
+
+static u32 g_sw_a_ret;
+static u32 g_sw_a_sp;
+static u32 g_sw_b_sp;
+static u32 g_sw_b_ran;
+static u32 g_sw_b_ran_nosp;
+static u32 g_sw_a_local;
+static u32 g_sw_b_local;
+static u32 g_sw_b_local_val;
+static u32 g_sw_b_regs_ok;
+static u32 g_sw_ctx_a_ok;
+static u32 g_sw_ctx_b_ok;
+static u32 g_sw_stack_ok;
+static u32 g_sw_nosp_detected;
+/*
+ * 对照组会在跑的过程中踩坏 kmain 自己的栈(那正是它要证明的事),
+ * 所以它的输入(期望的栈区间)必须在**跑之前**抄到全局量里 ——
+ * 否则打印出来的是一个被自己踩坏的局部变量,看着像 bug 其实是"预期的破坏"。
+ */
+static u32 g_sw_ab_base;
+static u32 g_sw_ab_top;
+
+/*
+ * 上下文 B 的入口(M4-7 后半段)。
+ *
+ * 它做三件事,每件都对应一条会被检查的性质:
+ *   1. 核对 r4-r11 还是切换器恢复进来的那些图案 —— 证明切换器真的恢复了
+ *      被调用者保存寄存器(AAPCS 的硬要求);
+ *   2. 在自己的栈上放一个局部变量,并记下它的地址与 sp —— 证明它跑在
+ *      **自己的栈**上,而不是别人的;
+ *   3. 主动切回 A —— 证明"能切回来",也就是切换是双向的。
+ *
+ * ⚠ 这个函数**不再返回**:它最后会切回 A,而 A 不会再切过来。
+ *   为了不让编译器把它优化成 fallthrough,末尾放一个死循环。
+ */
+static u32 switch_probe_read_reg(u32 n);
+
+static void switch_probe_b(void)
+{
+    volatile u32 local_b = 0xB0B0B0B0u;
+    u32          i;
+    u32          ok = 1u;
+
+    for (i = 4u; i <= 11u; i++) {
+        /* 用函数调用把寄存器压力做出来:切换器恢复错了这里就会读到别的值 */
+        if (switch_probe_read_reg(i) != (SWITCH_REG_PATTERN + i)) {
+            ok = 0u;
+        }
+    }
+    g_sw_b_regs_ok = ok;
+
+    g_sw_b_local     = (u32)(uintptr_t)&local_b;
+    g_sw_b_local_val = local_b;
+    g_sw_b_sp        = arch_read_sp();
+    g_sw_b_ran++;
+
+    arch_ctx_switch(&g_ctx_b, &g_ctx_a);
+
+    /* 不该回到这里 —— 真回来了说明 A 又被切过来了,那是用例设计之外的情况 */
+    g_sw_b_ran++;
+    for (;;) {
+    }
+}
+
+/*
+ * 取第 n 个被调用者保存寄存器(r4-r11)的当前值。
+ *
+ * n 是运行期参数,所以**必须**用一段小汇编按 n 选寄存器 ——
+ * 这正是要验的东西:切换器把 r4-r11 恢复成了什么。
+ */
+static u32 switch_probe_read_reg(u32 n)
+{
+    u32 v = 0u;
+
+    switch (n) {
+    case 4u:  __asm__ volatile("mov %0, r4"  : "=r"(v)); break;
+    case 5u:  __asm__ volatile("mov %0, r5"  : "=r"(v)); break;
+    case 6u:  __asm__ volatile("mov %0, r6"  : "=r"(v)); break;
+    case 7u:  __asm__ volatile("mov %0, r7"  : "=r"(v)); break;
+    case 8u:  __asm__ volatile("mov %0, r8"  : "=r"(v)); break;
+    case 9u:  __asm__ volatile("mov %0, r9"  : "=r"(v)); break;
+    case 10u: __asm__ volatile("mov %0, r10" : "=r"(v)); break;
+    case 11u: __asm__ volatile("mov %0, r11" : "=r"(v)); break;
+    default:  v = 0u; break;
+    }
+
+    return v;
+}
+
 static u32 g_kstack_selftest;
 static u32 g_kstack_slots_ok;
 static u32 g_kstack_guard_ok;
@@ -1451,6 +1557,85 @@ void kmain(void)
                        g_exc_frame_on_svc_stack ? "YES" : "NO");
     }
 
+        /* ---- 9.6 协作式上下文切换(M4-7 后半段) ---- */
+    /*
+     * 验收方式:让**两个上下文来回切**,并且每一方都检查
+     *   1. 自己是在**自己的栈**上跑的;
+     *   2. 自己的局部变量(被调用者保存的那类)在两个栈上各有一份;
+     *   3. 切回来之后,调用点的局部状态完好。
+     *
+     * 为什么要这么验:切换器最要紧的动作是**换栈**。不换栈的话,
+     * 被恢复的上下文会跑在别人的栈上 —— 而那件事**不报任何错**,
+     * 只在负载上来之后以随机踩栈的形式出现。所以除了"能切过去再切回来",
+     * 还必须有一组对照:故意不换栈时,检查必须**失败**。
+     */
+    {
+        kstack_t stk_b;
+
+        if (kstack_alloc(&g_kstack, &stk_b) == KSTACK_OK) {
+            volatile u32 local_a = 0xA0A0A0A0u;
+            u32          i;
+
+            g_sw_a_sp        = 0u;
+            g_sw_b_sp        = 0u;
+            g_sw_b_ran       = 0u;
+            g_sw_a_local     = (u32)(uintptr_t)&local_a;
+            g_sw_b_local     = 0u;
+            g_sw_b_local_val = 0u;
+            g_sw_a_ret       = 0u;
+
+            /* ---- 给 B 造一个初始上下文 ---- */
+            for (i = 0; i < 13u; i++) {
+                g_ctx_b.r[i] = 0u;
+            }
+            /* r0 = B 首次运行时的返回值(切换器会恢复它)*/
+            g_ctx_b.r[0]  = 0u;
+            /* r4-r11 放图案:B 起来后第一件事就是核对它们还在不在 */
+            for (i = 4u; i <= 11u; i++) {
+                g_ctx_b.r[i] = SWITCH_REG_PATTERN + i;
+            }
+            g_ctx_b.sp    = stk_b.top;
+            g_ctx_b.lr    = 0u; /* B 不该返回;真返回了会跳到 0,那是明确的错误 */
+            g_ctx_b.pc    = (u32)(uintptr_t)switch_probe_b;
+            g_ctx_b.cpsr  = 0u;
+
+            g_sw_a_sp = arch_read_sp();
+
+            /* ---- A:自己存一份,然后切过去 ---- */
+            g_sw_a_ret = arch_ctx_save(&g_ctx_a);
+            if (g_sw_a_ret == 0u) {
+                /*
+                 * 告诉"将来被切回来的自己":你是被切回来的,不是刚存完。
+                 * 这一个字就是 setjmp 约定的全部 —— 见 context.S 的说明。
+                 */
+                g_ctx_a.r[0] = 1u;
+                arch_ctx_switch(&g_ctx_throwaway, &g_ctx_b); /* ★ 不覆盖 g_ctx_a ★ */
+            }
+
+            /* ---- 到这说明 B 主动切回来了 ---- */
+            g_sw_ctx_a_ok = ((g_sw_a_ret == 1u) && (local_a == 0xA0A0A0A0u)) ? 1u : 0u;
+            g_sw_ctx_b_ok = ((g_sw_b_ran == 1u) && (g_sw_b_local_val == 0xB0B0B0B0u) &&
+                             (g_sw_b_regs_ok == 1u))
+                                ? 1u
+                                : 0u;
+            /* B 真的跑在**它自己的栈**上吗 —— 这一条才是"换栈"的判据 */
+            g_sw_stack_ok = ((g_sw_b_sp >= stk_b.base) && (g_sw_b_sp <= stk_b.top) &&
+                             (g_sw_a_sp < stk_b.base))
+                                ? 1u
+                                : 0u;
+
+            console_printf(" Switch      : a_ret=%u a_sp=0x%08X b_sp=0x%08X b_stack=[0x%08X,0x%08X)\n",
+                           g_sw_a_ret, g_sw_a_sp, g_sw_b_sp, stk_b.base, stk_b.top);
+            console_printf(" Switch      : ctx_a=%s ctx_b=%s stack_isolated=%s\n",
+                           g_sw_ctx_a_ok ? "PASS" : "FAIL", g_sw_ctx_b_ok ? "PASS" : "FAIL",
+                           g_sw_stack_ok ? "PASS" : "FAIL");
+
+            (void)kstack_free(&g_kstack, &stk_b);
+        } else {
+            console_puts(" Switch      : kstack_alloc FAILED\n");
+        }
+    }
+
     /* ---- 10. 启动自检总账 ---- */
     /*
      * 位置:所有自检都跑完之后、主循环之前。
@@ -1591,6 +1776,19 @@ void kmain(void)
      */
     selftest_report("irq_frame_violations", irq_frame_violations(), 0u, SELFTEST_EQ);
 
+    /*
+     * ---- 协作式上下文切换(M4-7 后半段)----
+     *
+     * 三项分开报,因为它们失败的原因完全不同:
+     *   ctx_a      切回来之后 A 的调用点状态没保住(r4-r11 / sp 恢复错了)
+     *   ctx_b      B 没跑起来,或它看到的 r4-r11 不是切换器恢复的那些
+     *   stack      最要紧的一项:B 跑在**别人的栈**上(不换栈不会报任何错)
+     *   switch_ab  上面那条判据**承重性**的对照:故意不换栈时必须能检出
+     */
+    selftest_report("switch_ctx_a", g_sw_ctx_a_ok, 1u, SELFTEST_EQ);
+    selftest_report("switch_ctx_b", g_sw_ctx_b_ok, 1u, SELFTEST_EQ);
+    selftest_report("switch_stack_isolated", g_sw_stack_ok, 1u, SELFTEST_EQ);
+
     selftest_report("smp_cpu1_online", g_percpu[1].online, 1u, SELFTEST_EQ);
     selftest_report("smp_cpu1_stage", HB[HB_SLOT_CPU1_STAGE], HB_CPU1_STAGE_ONLINE, SELFTEST_EQ);
 
@@ -1659,6 +1857,62 @@ void kmain(void)
 
     HB[HB_SLOT_SELFTEST_FAILED] = selftest_summary();
     console_puts("\n");
+
+    /* ---- 9.7 切换器的破坏性对照组(必须在自检报告**之后**)---- */
+    /*
+     * 为什么放在最后:**这个对照组会故意毁掉调用者的栈**。
+     *
+     * 它跑的是同一段切换代码,只把"换栈"那一步关掉(`g_ctx_skip_sp = 1`)。
+     * 于是被恢复的上下文带着被切换者的 sp 跑起来 —— 它的栈帧就压在
+     * **调用者(kmain)的栈**上。
+     *
+     * 实测代价:第一次把它放在自检之前时,kmain 的三个局部变量
+     * (`uart_present` / `uart_clock_source` / `uart_loopback_ok`)
+     * 被踩成了代码地址一类的东西,报告里凭空多出 3 项 FAIL。
+     *
+     *   ⇒ 那三条 FAIL 不是"自检坏了",恰恰是这条判据要证明的事情本身:
+     *     **不换栈不会报任何错,只会静默踩坏别人的东西。**
+     *
+     * 所以它只能放在最后跑,而且结论以普通输出给出(不进报告)——
+     * 进了报告反而会因为它自己造成的破坏而变成误报。
+     */
+    if (g_kstack.inited) {
+        kstack_t stk_c;
+        u32      i;
+
+        if (kstack_alloc(&g_kstack, &stk_c) == KSTACK_OK) {
+            g_sw_b_sp  = 0u;
+            g_sw_b_ran = 0u;
+            for (i = 0; i < 13u; i++) {
+                g_ctx_b.r[i] = 0u;
+            }
+            g_ctx_b.sp = stk_c.top;
+            g_ctx_b.pc = (u32)(uintptr_t)switch_probe_b;
+
+            /* ★ 先把期望区间抄到全局量 —— 下面这一步会踩坏局部变量 ★ */
+            g_sw_ab_base = stk_c.base;
+            g_sw_ab_top  = stk_c.top;
+
+            g_ctx_skip_sp = 1u; /* ★ 对照组:不换栈 ★ */
+            if (arch_ctx_save(&g_ctx_a) == 0u) {
+                g_ctx_a.r[0] = 1u;
+                arch_ctx_switch(&g_ctx_throwaway, &g_ctx_b);
+            }
+            g_ctx_skip_sp = 0u;
+
+            g_sw_nosp_detected = ((g_sw_b_sp < stk_c.base) || (g_sw_b_sp > stk_c.top)) ? 1u : 0u;
+            g_sw_b_ran_nosp    = g_sw_b_ran;
+
+            console_printf(" Switch A/B  : skip_sp -> b_sp=0x%08X (若换栈应落在 "
+                           "[0x%08X,0x%08X))\n",
+                           g_sw_b_sp, g_sw_ab_base, g_sw_ab_top);
+            console_printf(" Switch A/B  : 未换栈 -> %s(这就是「静默踩栈」的样子)\n",
+                           g_sw_nosp_detected ? "检出" : "未检出 —— 判据不承重!");
+
+            /* ⚠ 不能用 stk_c 了:它已经在上面被踩坏 */
+            (void)stk_c.slot;
+        }
+    }
     /* 自检之后才开命令通道:在此之前串口还在标定,回显会乱 */
     shell_init();
     shell_banner();

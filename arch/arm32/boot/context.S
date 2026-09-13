@@ -129,3 +129,102 @@ arch_ctx_layout_check:
 13: mov     r0, #17                         /* cpsr */
     bx      lr
     .size   arch_ctx_layout_check, . - arch_ctx_layout_check
+
+
+/* ==================================================================== */
+/* 协作式上下文切换(M4-7 后半段)                                        */
+/* ==================================================================== */
+/*
+ * 与异常返回的分工 —— 这一条是设计决定,不是偷懒:
+ *
+ *   | 场景                | 谁负责保存/恢复 CPSR          |
+ *   |---------------------|-------------------------------|
+ *   | 异常返回(被抢占)| `rfeia sp!`,与跳转原子完成   |
+ *   | 协作式切换(本文件)| **不碰 CPSR**                 |
+ *
+ * 协作式切换永远发生在内核态、SVC 模式里,双方模式位相同;而恢复 CPSR
+ * 会**中途改变模式**,后面几条按 sp 寻址的指令立刻失去意义。
+ * 所以 CPSR 只**存下来**(供初始上下文与诊断用),不在这里恢复。
+ * 真正需要连 CPSR 一起换的路径是抢占(M4-9),那时走的是异常返回那条路。
+ *
+ * AAPCS 约定:r4-r11 是被调用者保存的,必须跨调用保持;r0-r3 与 r12 不用。
+ * 所以本切换器恢复 r4-r11 —— 另外**额外恢复 r0**,理由见下面。
+ */
+
+    .section .text.context, "ax"
+
+/*
+ * u32 arch_ctx_save(arm_task_ctx_t *ctx)
+ *
+ * 把当前上下文存进 ctx,**首次返回 0**;之后若有别的上下文切回这里,
+ * 会从本函数返回点继续,而返回值取自那个上下文里的 `r[0]`。
+ *
+ * 这就是 setjmp 的约定,也是"两个上下文来回切"能被验证的前提 ——
+ * 调用方靠返回值区分"我是刚存完"还是"我被切回来了":
+ *
+ *     if (arch_ctx_save(&a) == 0) {
+ *         a.r[0] = 1;                  // 告诉将来被切回来的自己:你是被切回来的
+ *         arch_ctx_switch(&a, &b);     // 这一句之后不会立刻继续
+ *     }
+ *     // 到这里说明是从别处切回来的
+ *
+ * ⚠ 不碰 ctx->r[0]:它由调用方决定(见上)。也不恢复 CPSR(见文件顶部)。
+ */
+    .global arch_ctx_save
+    .type   arch_ctx_save, %function
+arch_ctx_save:
+    add     r1, r0, #ARM_CTX_OFF_R(4)
+    stmia   r1, {r4-r11}                    /* r4..r11 -> ARM_CTX_OFF_R(4..11) */
+    str     sp,  [r0, #ARM_CTX_OFF_SP]
+    str     lr,  [r0, #ARM_CTX_OFF_LR]
+    str     lr,  [r0, #ARM_CTX_OFF_PC]      /* 恢复后从调用点之后继续 */
+    mrs     r1, cpsr
+    str     r1,  [r0, #ARM_CTX_OFF_CPSR]    /* 只存不恢复 —— 见文件顶部 */
+    mov     r0, #0
+    bx      lr
+    .size   arch_ctx_save, . - arch_ctx_save
+
+/*
+ * void arch_ctx_switch(arm_task_ctx_t *from, arm_task_ctx_t *to)
+ *
+ * 保存当前上下文到 from,再从 to 恢复。**从 from 看,这一句之后不会立刻
+ * 继续执行** —— 要等某个上下文切回 from 才继续。
+ *
+ * ⚠ `g_ctx_skip_sp` 是**破坏性 A/B 的对照组**:置 1 时故意不恢复 sp,
+ *   于是被恢复的上下文会跑在**别人的栈**上。
+ *   生产路径上它恒为 0;留着它是为了让"sp 恢复"这件事可以被证明是承重的
+ *   (见 kmain 里的切换自检)。
+ */
+    .global arch_ctx_switch
+    .type   arch_ctx_switch, %function
+arch_ctx_switch:
+    /* ---- 1. 保存 from ---- */
+    add     r2, r0, #ARM_CTX_OFF_R(4)
+    stmia   r2, {r4-r11}
+    str     sp,  [r0, #ARM_CTX_OFF_SP]
+    str     lr,  [r0, #ARM_CTX_OFF_LR]
+    str     lr,  [r0, #ARM_CTX_OFF_PC]
+    mrs     r2, cpsr
+    str     r2,  [r0, #ARM_CTX_OFF_CPSR]
+
+    /* ---- 2. 恢复 to ---- */
+    ldr     r2,  [r1, #ARM_CTX_OFF_PC]      /* r2 = 跳转目标(r2 是 caller-saved)*/
+
+    ldr     r3,  =g_ctx_skip_sp
+    ldr     r3,  [r3]
+    cmp     r3, #0
+    ldreq   sp,  [r1, #ARM_CTX_OFF_SP]      /* ★ 换栈 —— 默认路径一定会做 ★ */
+
+    ldr     lr,  [r1, #ARM_CTX_OFF_LR]
+    add     r3,  r1, #ARM_CTX_OFF_R(4)
+    ldmia   r3,  {r4-r11}
+    ldr     r0,  [r1, #ARM_CTX_OFF_R(0)]    /* r0 最后恢复:见 arch_ctx_save 的约定 */
+    bx      r2
+    .size   arch_ctx_switch, . - arch_ctx_switch
+
+/* 破坏性 A/B 的开关:0 = 正常恢复 sp(默认);1 = 故意不恢复 */
+    .global g_ctx_skip_sp
+    .data
+    .align  2
+g_ctx_skip_sp:
+    .word   0
