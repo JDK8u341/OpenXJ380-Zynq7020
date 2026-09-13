@@ -360,7 +360,7 @@ Preempt A/B  : skip_frame -> a=0 b=0 switched=2 invalid=0   → 检出
 | 步 | 内容 | 源 OS 依据 |
 |---|---|---|
 | 10.1 | `g_tick_switched`/`preempted`/`invalid` **搬进 `percpu_t`** | 不然 A/B 没法按核读数 |
-| 10.2 | 每核 idle，**`ctx.pc = 0`**（"上下文无效"）| `kernel/smp/smp.cpp:150-172`：AP 的 idle 也是 `current_task` + 入队，循环体是 `while (true) pause` —— 它**只被切走、不被切回** |
+| 10.2 | 每核 idle，**`ctx.pc = 0`**（"上下文无效"）| `kernel/smp/smp.cpp:150-172`：AP 的 idle 也是 `current_task` + 入队，循环体是 `while (true) pause`。⚠ **原写"它只被切走、不被切回"是错的**（`scheduler.cpp:358` 的兜底链会把它切回来），已在 §4.5 的 M4-10 调研里纠正 |
 | 10.3 | 拆掉 `sched_tick` 里的 CPU0 护栏（D6）| 有 10.2 才安全 |
 | 10.4 | 每核队列 + 自旋锁（D12）；**创建时挑"队列最短的核"** | `scheduler.cpp:540-549` |
 | 10.5 | `TASK_APPLICATION_LEVEL` 强制 CPU0 | `scheduler.cpp:540` 那个 `if` |
@@ -1986,6 +1986,71 @@ SMP 调度是整个 M4 最容易出错的一环（任务迁移、栈切换与 pe
 **上下文切换的一个具体设计点**：现在 IRQ 处理函数跑在 **IRQ 模式的栈**上
 （`start.S` 给每个模式分了独立栈）。加入调度后，切换点必须落在**任务的栈**上 ——
 否则两个任务会共用同一段异常栈，症状是高负载下随机踩栈。
+
+#### ★ M4-10 开工前的调研：源 OS 的每核调度到底长什么样 ★
+
+按 §0.5.6c 的规程先把源 OS 读清楚。**结论：计划里那句"AP 的 idle 只被切走、不被切回"
+是错的**，另外查出**两处必须修的偏离**（其中一处是只有在双核下才会爆的隐患）。
+
+##### ① 逐条照抄的依据
+
+| 源 OS | 出处 | 说明 |
+|---|---|---|
+| 每核结构 `PROCESSOR_INFO` 里有 `current_task` / `scheduler_queue` / `scheduler_ticks` | `include/smp/smp.h:43-46` | ARM 侧对应 `percpu_t` 的 `current_task` / 每核 `g_runq[]` / `scheduler_ticks` |
+| **BSP 等所有 AP 把 idle+队列登记完**才继续（`while (scheduler_is_ready == xsi->cpu_count)`）| `main.cpp:581-585`、`smp.cpp:174` | 这是**硬前置**：不等就可能往一个还没初始化的队列里塞线程。ARM 侧要有同样的握手 |
+| AP idle = 自己造的 TCB：`task_level = TASK_IDLE_LEVEL`、`context0.rsp = get_rsp()`、`status = RUNNING`、**`context0.rip` 从不赋值（保持 0）**、`info->current_task = idle`、**`queue_enqueue_ref(info->scheduler_queue, idle)`**，然后 `while (true) pause` | `smp.cpp:152-181` | 与 BSP idle（`main.cpp:520-541`）同构。ARM 侧已有 BSP 版本，AP 版本照做 |
+| 新线程的调度实体：`init_task_eevdf_entity(task, queue_average_vruntime(...), now)` | `scheduler.cpp:289-297`、`:551-554` | ★ `vruntime = base > WAKEUP_CREDIT ? base - WAKEUP_CREDIT : 0` —— **ARM 侧漏了这个减法**（见 ③）|
+| **创建时挑"队列最短的核"**：`min_cpu = get_cpu(0)`，然后 i=1..n-1，只有 `cpui->queue->size < min->size` 才换 | `scheduler.cpp:537-549` | 严格小于 ⇒ **平局留给核号小的**。排序规则是"先到先得" |
+| **`task_level == TASK_APPLICATION_LEVEL` 时跳过整个扫描** ⇒ 应用级线程**永远落在 CPU0** | `scheduler.cpp:540` | 逐字照抄成一个 `if` |
+| 每核队列各有一把锁，`select_next_task_safe` **整段持锁**（`spin_lock(&queue->lock)`）| `scheduler.cpp:325-360` | 队列锁在**线程上下文**里也会被拿（`queue_enqueue_ref` 内部），所以它必须是 **irqsave** 锁 —— 源 OS 的 `spin_lock` 确实 `cli` 并保存 RFLAGS（`include/cpu/lock.h:19-50`）。ARM 侧 `spin_lock` 契约相同（`arch/cpu.h:581`）|
+| `add_task` / `remove_task` 另有一把**全局** `scheduler_lock` | `scheduler.cpp:530`、`:564` | 与队列锁**不同序**：先全局后队列，没有反向路径 |
+| `is_task_schedulable` 排除 idle；idle 只在兜底链里被用到 | `scheduler.cpp:178`、`:358` | ARM 侧一致（D5 省掉的只有 `parent_group` 两条）|
+
+##### ② ★ 纠正一处计划里的错误断言 ★
+
+计划（以及 §0.5.7 的 M4-10 表）原话是：
+
+> 10.2 | 每核 idle，`ctx.pc = 0` | AP 的 idle 也是 `current_task` + 入队，循环体是
+> `while (true) pause` —— 它**只被切走、不被切回**
+
+**"只被切走、不被切回"是错的。** 依据在 `select_next_task_safe()` 的最后一行
+（`scheduler.cpp:358`）：
+
+```c
+tcb_t result = best != NULL ? best : (is_current_task_runnable(current) ? current : idle);
+```
+
+`is_task_schedulable()` 把 idle 排除在候选之外（`:178`），所以 `idle` **只能**从这条兜底
+链进来；而它的用途正是"**本核没有可运行的线程时回到 idle**"。也就是说：
+
+- AP idle 的 `context0.rip` 在**第一次被切走时**就被 `change_proccess` 收进了它的
+  `context0`（不再为 0）⇒ 从那以后它就是一个**可恢复的普通上下文**；
+- AP 上唯一的线程挂起/退出之后，兜底就把它**切回** `pause` 循环里。
+
+⇒ ARM 侧的实现必须支持"切回 AP idle"，判据也要写成"**切回来之后它还在跑**"，
+而不是"它永远不会再跑"。**这条纠正很重要**：按错的断言实现，AP 会在最后一个线程
+挂起之后卡在那个已挂起的线程上（`is_current_task_runnable(current)` 为假、
+又回不到 idle ⇒ 该核永久停摆），而现象是"另一个核看起来一切正常"。
+
+##### ③ ★ 查出的两处偏离（一处是隐性 bug）★
+
+| # | 问题 | 依据 | 后果 |
+|---|---|---|---|
+| **D15** | `sched_entity_init()` **漏了新线程的 `- WAKEUP_CREDIT`**：源 OS 是 `vruntime = base > CREDIT ? base - CREDIT : 0`，ARM 侧直接 `vruntime = base` | `scheduler.cpp:294` vs `src/sched.c` 的 `sched_entity_init` | 新线程比源 OS **晚 4 ms** 才被优先考虑。等权负载下看不出来（所以 M4-8 一路没暴露），但**它不是源 OS 的行为** ⇒ 归入退化清单，M4-10.1 关掉 |
+| — | `g_vfp_save_f` 是**全局变量**，不是每核字段：`arch_vfp_save_current` 用它找 `&cur->fpscr`，而 `sched_set_current()` 每次都覆盖它 | `boot/context.S` 的 `ldr r1, =g_vfp_save_f`；对比 `percpu_t.cur_vfp_f` 已经存在 | **两核一旦同时调度就会互相踩**：CPU0 布的指针被 CPU1 覆盖 ⇒ CPU0 把 FPSCR 存进**别人的 TCB**。今天不爆只因为 `sched_tick` 的 CPU0 护栏让 CPU1 根本不调度 ⇒ 与 M4-10.3 同一步修（10.6）|
+
+##### ④ M4-10 的分步（每步都要有能观测的判据）
+
+| 步 | 内容 | 判据 |
+|---|---|---|
+| 10.1 | 三个 tick 计数器搬进 `percpu_t`；**关掉 D15** | 宿主：透视图 + `sched_entity_init` 的补偿；板上：回归 + 新增按核读数 |
+| 10.2 | **每核 idle**（静态 TCB、`ctx.pc = 0`、入本核队列、`current_task` 指向它）+ **就绪握手** | 板上：`smp_ap_idle`、每核队列长度 |
+| 10.3 | 拆掉 `sched_tick` 的 CPU0 护栏（**D6 结案**）| 10.2 之后才安全；与 10.2 同步上板 |
+| 10.4 | **每核队列 + 每核一把 irqsave 锁 + 创建时挑最短队列**（**D12 结案**）| 板上：线程真的落在两个核上（`runq[0/1]` 非空 + 两核各自的 `switched` 都涨）|
+| 10.5 | `TASK_APPLICATION_LEVEL` 强制 CPU0 | 逐字照抄那个 `if` |
+| 10.6 | VFP 切换：去掉 CPU0 护栏 + **`g_vfp_save_f` 换成每核字段** | 板上：两核都在跑线程时 FPCSR/VFP 现场仍正确（复用 M4-9.5 的判据）|
+| A/B | `g_pick_cpu0`：选核永远返回 CPU0 ⇒ **CPU1 的 `switched[1]` 恒为 0**、而 CPU0 队列积压 | 与前五组同一风格：**预期它坏** |
+
 这一条在 M4-7 里必须先定下来，不能等到出问题再回头改。
 
 #### ★ 关于"兼容旧 XJ380"：`registers_t` 是唯一无法逐字节对齐的地方 ★
