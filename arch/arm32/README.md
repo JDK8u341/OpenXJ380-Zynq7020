@@ -2071,16 +2071,19 @@ switched=30 preempted=27 invalid=0
 | D2 | **`strtok` 的状态是全局静态变量** | `src/krlibc.c` | fs 层只有 `vfs.cpp` 的 2 处调用，暂时可控 | M4-11 有了可睡眠原语与任务之后。两个任务同时 strtok 会互相踩 —— 旧 XJ380 也是这个实现，所以不是移植引入的，但必须记下来 |
 | ~~D4~~ | ~~**`select_next_task` 被简化成"取队首"**~~ | — | — | **已结案（M4-8.4）**。源 OS 的 `select_next_task_safe` 还有 avg_vruntime 闸门、fallback 扫描、`mark_task_dispatched`、`wake_sleeping_task(current)` —— **那些现在全都在**（`sched_select_next` / `sched_queue_scan` / `sched_mark_dispatched`）。<br>★ 而且它不只是"简化"：**唤醒睡眠任务的那次扫描就在里面**，取队首的写法里根本没有它 ⇒ 睡下去的任务永远醒不过来。这就是 M4-8.4 做的第一件事 |
 | D5 | **`is_task_schedulable` 省掉了 `parent_group` 两条** | `src/sched.c` | 内核对线程还没有进程组（M7 才有） | M7。照抄会让**每一个**线程都不可调度（`parent_group == NULL`），所以只能先省 |
-| D6 | **`sched_tick` 里的 CPU0 护栏** | `src/sched_kern.c` | `g_runq[1]` 与 CPU1 的 idle 都还没建，放 CPU1 过去会两个核同时往一个上下文里塞现场 | **M4-10**（每核队列 + 每核 idle）|
+| ~~D6~~ | ~~**`sched_tick` 里的 CPU0 护栏**~~ | `src/sched_kern.c` | — | **已结案(M4-10.3,`a158e53`)**。拆掉的前提是四件都到位:每核队列、每核 idle、每核 `current_task`/`scheduler_ticks`/计数器、每核 VFP 指针。⚠ 护栏期间它还在**掩盖**一个 bug(见 D12 那条里的 `g_vfp_save_f`)|
 | ~~D7~~ | ~~**异常帧可能不是 8 字节对齐**~~ | `boot/vectors.S` 的 `_vec_irq`/`_vec_svc` | — | **已结案（D7）**。量出的规模是**一轮 1688 次**（早先"20~28"是在启动早期取的，低估了）。<br>★ **修法与计划里猜的不同**：计划写的是"帧 16→18 字 + 存原始 SP"，那是想岔了 —— 问题不在"帧落在哪"，而在**调 C 的那个边界**。帧**不能挪**（`EXC_FRAME_LEAVE` 靠 `帧基址 + 64 == S` 还原被中断的 SP），而 C 函数拿到的是 **r0 里的帧指针**、不是 SP ⇒ 只要 `bic sp, sp, #7` 一条指令，回来 `mov sp, r0` 恢复即可，不动帧、不动偏移、不动断言。<br>判据是新增的硬自检 `c_handler_sp_aligned`（必须 0）：处理函数入口读自己的 SP。实测 0（修复前必然等于 1688）|<br>⚠ 同时改正三处**错误因果**：帧大小是不是 8 的倍数**决定不了** SP 对齐；M4-2 那次 Undefined 是 FPU 没使能，与对齐无关 |
 | ~~D8~~ | ~~**VFP 上下文根本没保存/恢复**~~ | — | — | **已结案(M4-9.5,`53da560`)**。见下面「VFP 现场:补账」一节 —— 判据在板上成立(65/0),且有破坏性 A/B |
 | ~~D9~~ | ~~**`runtime_ticks` 从不累加**~~ | — | — | **已清(M4-9.5)**：照源 OS `scheduler.cpp:398` 每 tick 加一 |
 | ~~D10~~ | ~~**`sched_tick_account()` 成了死函数**~~ | — | — | **已删(M4-9.5)** |
 | ~~D11~~ | ~~**`SCHED_MAX_SWITCHES_TRACKED` 成了死宏**~~ | — | — | **已删(M4-9.5)** |
-| D12 | **就绪队列无锁** | `src/sched.h` 的 `sched_queue_t` | 单核；只有 CPU0 碰它 | **M4-10**。源 OS 用带自旋锁的 `lock_queue`。每核化之后要么每核一把锁、要么走无锁（`sched_next` 是侵入式的，天然适合）|
+| ~~D12~~ | ~~**就绪队列无锁**~~ | `src/sched.h` 的 `sched_queue_t` | — | **已结案(M4-10.4)**。每核一把 **irqsave** 锁(入队在线程上下文、选取在中断上下文 ⇒ 普通自旋锁就是**同核自死锁**),选取整段持锁 —— 与源 OS 的 `select_next_task_safe` 一致(`scheduler.cpp:325-360`)。<br>⚠ 源 OS 另有**全局** `scheduler_lock` 罩 `add_task`/`remove_task`(`:530`/`:564`),M4-10 **刻意没引**:ARM 侧现在只有 add,那把锁**没有第二个用户**(本项目删过两个这样的死物,D10/D11)。**M4-11 有线程退出时必须补上** |
+| ~~D6~~ | ~~**`sched_tick` 里的 CPU0 护栏**~~ | — | — | **已结案(M4-10.3,`a158e53`)**。拆掉的前提是四件都到位:每核队列、每核 idle、每核 `current_task`/`scheduler_ticks`/计数器、每核 VFP 指针。⚠ 护栏期间它还在**掩盖**一个 bug(见 D12 那条里的 `g_vfp_save_f`) |
+| ~~D12~~ | ~~**就绪队列无锁**~~ | — | — | **已结案(M4-10.4)**。每核一把 **irqsave** 锁(入队在线程上下文、选取在中断上下文 ⇒ 普通自旋锁就是**同核自死锁**),选取整段持锁 —— 与源 OS 的 `select_next_task_safe` 一致(`scheduler.cpp:325-360`)。<br>⚠ 源 OS 另有**全局** `scheduler_lock` 罩 `add_task`/`remove_task`(`:530`/`:564`),M4-10 **刻意没引**:ARM 侧现在只有 add,那把锁**没有第二个用户**(本项目删过两个这样的死物,D10/D11)。**M4-11 有线程退出时必须补上**。<br>★ 顺带:那个全局量 `g_vfp_save_f` 也是同一类问题 —— 它让"每核结构里的 `cur_vfp_f`"变成第二份真相,而双核下第二份真相互相覆盖 ⇒ 已删 |
+| ~~D15~~ | ~~**新线程的 vruntime 漏了 `- WAKEUP_CREDIT`**~~ | — | — | **已结案(M4-10.1,`ccb7156`)**。见下方 M4-10 一节 |
 | D13 | **串口排他用的是"关调度"，不是锁** | `src/console.c` 的 `console_excl_begin/end` | 只有一个常驻线程会打印（1Hz 状态行），关调度期间没别的上下文能跑，互斥成立 | **M4-11**。可睡眠的 `mutex` 到位后换成它。⚠ 期间**整个系统停摆**，所以它不是通用的 printf 锁，只能包"必须成段"的输出。**绝不能用自旋锁**：一行 60~80ms，持锁者会被抢占，等锁者自旋（还关中断）就再也没人放锁 |
 | ★ D14 ★ | ★ **线程没有退出路径 —— 尾部那段终止循环不可达** ★ | `src/kmain.c` 的 `thread_finish()`；6 个调用点 | 自检探针"干完活"之后 `sched_park_self()` 就永久挂起了 | **M4-11**。源 OS 的对应物是 `pcb.cpp:501-504`（`kill_thread` 之后 `while (true) hlt`）—— 也就是说 **`wfi` 在这里是对的**（它的正当用途是"永久停住"，不是"idle 省电"），只是**现在还到不了那个循环**。⚠ 它看起来像一项策略，其实不是：读代码的人会以为"本项目线程结束时会 wfi"，而真相是线程从来没结束过 |
-| ★ D15 ★ | ★ **新线程的 vruntime 漏了 `- WAKEUP_CREDIT`** ★ | `src/sched.c` 的 `sched_entity_init()` | 源 OS 是 `base > CREDIT ? base - CREDIT : 0`（`scheduler.cpp:294`），ARM 侧直接 `= base`。等权负载下看不出来（所以 M4-8 一路没暴露），但它让新线程比源 OS **晚 4 ms** 才被优先考虑 | **M4-10.1**（M4-10 开工调研时查出来的）。判据是宿主单测逐值钉住补偿，不是"看起来差不多" |
+| ~~★ D15 ★~~ | ~~★ **新线程的 vruntime 漏了 `- WAKEUP_CREDIT`** ★~~ | `src/sched.c` 的 `sched_entity_init()` | — | **已结案(M4-10.1,`ccb7156`)**。源 OS 是 `base > CREDIT ? base - CREDIT : 0`(`scheduler.cpp:294`),M4-8 写成了 `= base`(把参数当成了"当前时刻")⇒ 新线程比源 OS 晚 4ms 才被优先考虑。<br>★ **宿主单测当时是"跟着实现一起写错的"**:它断言 `vruntime == base`,所以一路全绿。改正时把判据**对着源 OS 逐值重写**(含 `base<credit`、`base==credit` 两个边界) |
 | ~~D3~~ | ~~内核用硬浮点编译~~ | — | — | **已结案：不是退化，是照源 OS 的设计。** 见下方「FP 上下文」一节 |
 
 
@@ -2339,6 +2342,114 @@ adv    == K    ★ 负载是真的：4 个线程都真的在推进
 ```
 
 **没有新增退化条目** —— 这一步是新判据 + 新仪器，不是退化。
+
+### M4-10：SMP 调度 —— 两个核都在跑线程（已完成，板上 81/0）
+
+**范围照源 OS**（★ 全树搜 `balance|migrat|load_avg|steal` **零命中** ⇒
+**不发明均衡器**）：每核 idle、每核队列、创建时挑最短队列、应用级钉 CPU0。
+顺手结掉 **D6**（CPU0 护栏）、**D12**（队列无锁）、**D15**（vruntime 补偿）。
+
+#### 三个核的东西，各管一件事
+
+| 东西 | 在哪 | 依据 |
+|---|---|---|
+| `current_task` / `scheduler_ticks` / `switched` / `preempted` / `invalid_ctx` / `cur_vfp_d` / `cur_vfp_f` | `percpu_t`（TPIDRPRW 取本核）| `PROCESSOR_INFO`(`include/smp/smp.h:43-46`) |
+| 每核就绪队列 + 一把 **irqsave** 锁 | `sched_kern.c` 的 `kern_runq_t g_runq[]` | `select_next_task_safe` 整段持锁(`scheduler.cpp:325-360`)；源 OS 的 `spin_lock` 同样关中断并保存 RFLAGS |
+| 每核 idle | `g_idle_tcb[cpu]`（静态实例）| BSP 见 `main.cpp:520-541`，AP 见 `smp.cpp:152-181` |
+
+**选核策略放在纯逻辑层**（`sched_pick_cpu()`）—— 板上只有一组真实负载，
+证不了"平局留给核号小的""没就绪的核不参与"这些边界，所以按 §4.5 的分工丢给宿主穷尽测：
+
+```c
+u32 sched_pick_cpu(i32 task_level, const u32 *queue_len, const u32 *ready, u32 cpu_num);
+```
+
+三条语义逐字照抄 `add_task()`：起点 CPU0 + **严格小于**（平局给核号小的）、
+`TASK_APPLICATION_LEVEL` **跳过整个扫描**（永远 CPU0）、只按队列长度挑。
+⚠ 10.5 那条 `if` **今天不可能被执行**（没有应用级线程）——
+所以它的判据只能在宿主单测里（"编译过 = 零功能证据"这条规矩）。
+
+#### ★★ 纠正一处计划里的错误断言：AP 的 idle **会**被切回来 ★★
+
+计划原文说"AP 的 idle 也是 `current_task` + 入队，循环体是 `while (true) pause` ——
+它**只被切走、不被切回**"。**错的。** 依据 `scheduler.cpp:358`：
+
+```c
+tcb_t result = best != NULL ? best : (is_current_task_runnable(current) ? current : idle);
+```
+
+`is_task_schedulable()` 把 idle 排除在候选之外(`:178`)，所以 `idle` **只能**从这条
+兜底链进来 —— 它的用途正是"**本核没有可运行线程时回到 idle**"。idle 的 `ctx.pc`
+在第一次被切走时就被现场帧填成非 0，从此是可恢复的普通上下文。
+
+按错的断言实现，AP 会在最后一个线程挂起后**卡在那个已挂起的线程上**：
+`is_current_task_runnable(current)` 为假、又回不到 idle ⇒ **该核永久停摆**，
+而另一个核看起来一切正常。⇒ 判据写成"**切回来之后它还在跑**"：
+
+```
+Sched smp   : cpu1 switched=+16 preempted=+15 idle_harvested=1 back=1
+```
+
+`back` 的测法是"idle 的循环体就是 `pc->loops++`，线程都挂起之后再等一小段，
+它必须继续涨" —— 不涨就说明 AP 卡住了。
+
+#### 判据：三件事都成立才叫"这个核在调度"
+
+```
+Sched smp   : threads=3/3 assign=(0,3) ran=(0,3) place_bad=0
+Sched smp   : cpu1 switched=+16 preempted=+15 idle_harvested=1 back=1
+Sched smp   : cpu0 switched=+13 preempted=+7  runq=(15,4)
+```
+
+- **搬过帧**（`switched`）、**换下的是真实线程**（`preempted` ——
+  只切 idle 的话它恒为 0，那不算"在调度"）；
+- `ran=(0,3)`：核号是**线程自己**写进 `g_smp_ran[]` 的（`percpu_self()->cpu_id`
+  只有本核能填对 —— 与 AM3 用 MPIDR 而不是 `cpu_id` 判"CPU1 真的起来了"同一规矩）；
+- `place_bad=0`：每个新线程都落在"**造它之前**更短的那个队列"上。
+
+#### ★ 三个"判据自己错了"（都进了计划 §0.5.5 的坑表）
+
+**① "两个核各分到一半"是错的期望。** 源 OS 的规则比的是**队列长度**，而队列是
+"全部线程的**名册**"（睡着的、挂起的都在里面）。启动到那一相时 CPU0 的名册上已经
+躺着十几个已挂起的探针 ⇒ **每一个新线程都落到 CPU1**，直到 CPU1 也攒到那么多。
+上板实测 `assign=(0,6) ran=(0,6)`，而**两个核都在正常调度**。
+⇒ 判据改成"**规则有没有被正确执行**"，不是"负载有没有均分"。
+（那条"成批倾斜"的性质本身是源 OS 的行为，已记进计划的未决项。）
+
+**② A/B 报了一个漂亮的假 DETECTED。** 线程池只有 32 个槽（`KSTACK_SLOTS`），
+而 D14 说线程**没有退出路径** ⇒ 每造一个线程永久占一个槽。启动到对照组时已用掉
+二十几个 ⇒ 对照组 6 个线程**全部创建失败** ⇒ `assign=(0,0) ran=(0,0)`，
+而"CPU1 一次都没切"照样成立。⇒ 判定里必须带"这一相真的发生了什么"，
+否则报 **INCONCLUSIVE**；并新增自检 `kstack_headroom`（>= 4）给 D14 当哨兵。
+
+**③ 报告之后那五组对照全是单核判据。** 相 6 把选核打开之后，VFP 对照组当场从
+`bad=(7914,0)` 变成 `bad=(0,0)` 报"未检出" —— 看起来像 VFP 保存/恢复坏了，
+实际是**两个核各有自己的 d0-d31**，"被对方改掉"根本不会发生。
+⇒ 9.75 之前显式钉回 CPU0。**这一条最值得记**：
+"判据不承重"与"判据的适用条件没了"看起来一模一样，而排查方向完全相反。
+
+#### 10.6：顺手修掉一个"只有双核才会爆"的隐患
+
+`arch_vfp_save_current` / `_restore_current` 原来有两道护栏：`cpu_id != 0` 就早退，
+以及读一个**全局量** `g_vfp_save_f`（存 `&cur->fpscr`）。两核同时调度时，
+CPU0 布的指针会被 CPU1 覆盖 ⇒ **CPU0 把 FPSCR 存进别人的 TCB**。
+它今天不爆只因为护栏让 CPU1 根本不走这条路 —— 也就是说：
+**护栏一直在掩盖它。** 现在汇编直接读 `percpu_t.cur_vfp_f`，全局量已删。
+
+#### 验收
+
+```
+自检          smp_sched_two_cores / smp_sched_created / smp_sched_placement
+              smp_sched_cpu1_ran / smp_ap_idle / smp_ap_idle_back
+              smp_cpu1_sched_ready / kstack_headroom       全部 PASS
+板上总计      81 passed / 0 failed（上一阶段 73/0）
+六组 A/B      搬帧 / VFP / 扫描唤醒 / 无饥饿 / 选核 / 不换栈 —— 全部检出
+宿主          9 failed / 73 passed（9 项预先存在且无关）
+命令通道      tmp-test/shell_test.py 10/10（顺带修好了它的过期等待窗口，见坑 44）
+```
+
+**没有新增退化条目** —— D6/D12/D15 结案，新增的注意点写在计划的未决项里
+（名册倾斜、栈池余量、`online` 含义加强）。
 
 ### 12. 其它待办（AM3 及以后）
 
