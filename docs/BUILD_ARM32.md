@@ -35,7 +35,7 @@ python tmp-test/verify_board.py --load --seconds 75
 | Ninja | 任意较新版本 | |
 | pyserial | `pip install pyserial` | 只有串口脚本用 |
 | 硬件 | Zynq-7020 板 + JTAG 下载器 + 串口线 | 本移植是照 AC880-CB / AC850-CORE 调的 |
-| 硬件工程 | 从**同一套设计**导出并解包出来的两样东西：**带 PL 设计**那个工程的 `hw\sdt\System_wrapper.bit`，**外加** UART1 已使能、MIO bank1 = 1.8V 那个工程的 `ps7_init.tcl` |★ **见 §2** —— 这两样来自**两个不同工程**，别顺着目录拿文件 |
+| 硬件工程 | ★ **仓库里已经带了**：`arch/arm32/board/` 下有比特流与两份 XSA，`tmp-test/zynq/ps7_init_uart1.tcl` 也已在库 | **同一套设计换一块板：这一步什么都不用做。**只有换设计/换板时才照 **§2** 自己导出（那两样来自**两个不同工程**，别顺着目录拿文件）|
 
 > `xsdb` 的用法：加载 PS 配置、烧比特流、下载 ELF、读寄存器，全部走 JTAG。
 >
@@ -172,9 +172,13 @@ Vitis 工程里的**平台导出目录**（`<工程>\hw\sdt\`）是 XSA 解开�
 
 | 文件 | 放到哪 | 然后改 `config.py` 里哪个 |
 |---|---|---|
-| 比特流（`System_wrapper.bit`） | **留在你自己的目录就行**（几 MB，**不要提交**） | `BITSTREAM` = 它的**绝对路径** |
+| 比特流（`System_wrapper.bit`） | ★ **同一套设计：什么都不用做** —— 仓库里已经有一份（`arch/arm32/board/System_wrapper.bit`），`config.py` 默认就指它。换设计时才换成你自己的（放哪都行，几 MB，**别提交**）| 默认已指对；换设计时才改 `BITSTREAM` |
 | `ps7_init.tcl`（UART1 那份） | **放进仓库**：`tmp-test/zynq/ps7_init_uart1.tcl` | `PS7_INIT`（默认就指这里，通常不用改） |
 | `xparameters.h` | 只在你**改了设计**时才动 `arch/arm32/board/`（见 §2.4 的提醒） | — |
+
+> ★ **同一套设计换一块板时，上面这张表只有 `ps7_init.tcl` 那一行可能需要动** ——
+> 而它在库里也已经有一份（`tmp-test/zynq/ps7_init_uart1.tcl`），所以**通常一行都不用改**，
+> 直接 `python config.py` 自检即可。仓库里带的东西见 [`arch/arm32/board/README.md`]。
 
 放好之后：
 
@@ -264,7 +268,7 @@ FAIL:有 38 个 MIO16-53 不是 LVCMOS18(bank 1 应为 1.8V):
 | `VITIS_DIR` | Vitis / Vivado 安装目录 | 安装时选的路径 | `C:\AMDDesignTools\2025.2`（AMD 统一安装器）<br>`C:\Xilinx\Vitis\2025.2`（Xilinx 安装器） |
 | `SERIAL_PORT` | 板子 PS UART1 接到 PC 的哪个串口 | Windows 设备管理器 → 端口 | `"COM4"`、`"COM7"`（Linux 上是 `/dev/ttyUSB0`） |
 | `SERIAL_BAUD` | 波特率 | 固定是 9600 8N1 | `9600`（一般不用改） |
-| `BITSTREAM` | PL 比特流（**必须是带 PL 设计那个工程**的，见 §2.2） | Vitis/Vivado 工程导出的目录 | `<你的平台>\hw\sdt\System_wrapper.bit` |
+| `BITSTREAM` | PL 比特流 | ★ **默认不用管**：指向仓库里的 `arch/arm32/board/System_wrapper.bit`（同一套设计换板不用改）。换设计时才改成 `<你的平台>\hw\sdt\System_wrapper.bit`（见 §2.2）| （默认即仓库内那份）|
 | `SCHEMATIC_PDF` | 原理图 PDF（可选） | 只有 `tmp-test/sch_render.py` 用 | 留空 `""` 表示不用 |
 
 `VITIS_DIR` 会被派生出这些，**不用手写**：
@@ -429,7 +433,7 @@ import config                     # noqa: E402
 | `...\gcc-arm-none-eabi`（工具链根） | `config.ARM_TOOLCHAIN_DIR` | `tools/gen_ninja.py`、`exc_frame_probe.py` |
 | `...\out\kernel-arm.elf` | `config.KERNEL_ELF` | Tcl（经 `paths.tcl`） |
 | `...\tmp-test\led\out\led.elf` | `config.LED_ELF` | `run_led.tcl` |
-| `...\System_wrapper.bit` | `config.BITSTREAM` | 3 个 Tcl |
+| `...\System_wrapper.bit` | `config.BITSTREAM`（★ 现默认指向仓库里的 `arch/arm32/board/System_wrapper.bit`）| 3 个 Tcl |
 | `...\ps7_init_uart1.tcl` | `config.PS7_INIT` | `run_kernel_uart.tcl` |
 | `...\ps7_mio_bank1_check.tcl` | `config.PS7_MIO_CHECK` | `run_kernel_uart.tcl` |
 | `D:\<资料盘>\...\原理图.pdf` | `config.SCHEMATIC_PDF` | `sch_render.py` |

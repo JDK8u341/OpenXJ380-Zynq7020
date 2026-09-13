@@ -90,9 +90,13 @@ git diff --name-only 08e5c9c HEAD -- kernel include driver user lib boot kmod re
 > 完整步骤（要改哪几个值、去哪找、怎么自检、怎么排错）见
 > **[`docs/BUILD_ARM32.md`](docs/BUILD_ARM32.md)**。★
 >
-> ★ **如果你是拿自己的板复现这套东西**（同一套设计、换一块板）：
-> 照着指南 **§2** 走一遍 —— **自己导出 XSA → 解包 → 放到对应路径 → 改 `config.py`**。
-> ⚠ 那一节有一条防误导：**PS 配置（`ps7_init`）与 PL 比特流来自两个不同的工程**，
+> ★ **同一套设计换一块板：硬件那一步什么都不用做。** 仓库里已经带了
+> **PL 比特流**与**两份 XSA**（[`arch/arm32/board/`](arch/arm32/board/README.md)），
+> `ps7_init` 也在库里（`tmp-test/zynq/ps7_init_uart1.tcl`），`config.py` 默认就指着它们 ——
+> clone 下来 `python config.py` 应当直接全绿。**只有换设计/换板时才需要自己导出**，
+> 那一步见指南 **§2**。
+>
+> ⚠ 指南 §2 有一条防误导：**PS 配置（`ps7_init`）与 PL 比特流来自两个不同的工程**，
 > 两边各有一个"看起来能用、其实不能用"的文件 —— 拿错了分别是
 > "**串口一个字节都没有**"和"**LED 不亮**"，而且都不像配置问题。★
 

@@ -13,8 +13,10 @@ VITIS_DIR = r"C:\AMDDesignTools\2025.2"
 # 板子 PS UART1 接到 PC 的串口
 SERIAL_PORT = "COM4"
 
-# PL 比特流(在 Vitis 工程导出目录里,形状通常是 <平台>\hw\sdt\System_wrapper.bit)
-BITSTREAM = r"C:\path\to\your\platform\hw\sdt\System_wrapper.bit"
+# PL 比特流。**同一套设计换一块板时不要写这一项** —— 仓库里已经带了一份
+# (arch/arm32/board/System_wrapper.bit),config.py 默认就指它。
+# 只有换 PL 设计 / 换板子时才覆盖成自己的(形状通常是 <平台>\hw\sdt\System_wrapper.bit):
+# BITSTREAM = r"C:\path\to\your\platform\hw\sdt\System_wrapper.bit"
 
 # 可选:原理图 PDF(tmp-test/sch_render.py 用)
 # SCHEMATIC_PDF = r"D:\path\to\schematic.pdf"

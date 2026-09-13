@@ -35,6 +35,9 @@ import os
 import sys
 from pathlib import Path
 
+#: 仓库根目录(本文件所在目录)。**先定它**,因为下面默认值里有仓库内相对路径。
+ROOT = Path(__file__).resolve().parent
+
 # ============================================================================
 # ★ 要改的就是这一段 ★
 # ============================================================================
@@ -52,9 +55,20 @@ SERIAL_PORT = "COM4"
 #: 串口波特率。板级自检/命令通道都是 9600 8N1,一般不用改。
 SERIAL_BAUD = 9600
 
-#: PL 比特流。**这个必须换成你自己的**:它在 Vitis 工程导出目录里,形状通常是
-#:     <平台>\hw\sdt\System_wrapper.bit
-BITSTREAM = r"C:\path\to\your\platform\hw\sdt\System_wrapper.bit"
+#: PL 比特流。
+#: ★ **仓库里已经带了一份** —— `arch/arm32/board/System_wrapper.bit`
+#:   (来自 `AXI_GPIO_1` 工程,AXI GPIO → LED 流水灯),所以默认就能上板,
+#:   不用你自己导。**同一套设计换一块板,这里不用改。**
+#: 只有当你要换 PL 设计 / 换板子时才改成自己的(形状通常是
+#:   `<你的平台>\hw\sdt\System_wrapper.bit`)。
+#: ⚠ 注意:**XSA 里的比特流与这份不是同一个** —— 详见 `docs/BUILD_ARM32.md` §2.2。
+BITSTREAM = ROOT / "arch" / "arm32" / "board" / "System_wrapper.bit"
+
+#: 「平台自带的那份 ps7_init」(**不路由 UART1**)。
+#: 只有 `run_kernel.tcl` / `run_led.tcl` 这两个不用串口的老脚本会用到它。
+#: 留空(`""`)= 就用仓库里那份 ps7_init(它也配了时钟/DDR/MIO,对这两个流程够用)。
+#: 想跟原来一样用平台那份、或者换了平台,才在这里填路径。
+PS7_PLATFORM = ""
 
 #: 原理图 PDF(只有 `tmp-test/sch_render.py` 用)。留空表示不用。
 SCHEMATIC_PDF = ""
@@ -62,8 +76,6 @@ SCHEMATIC_PDF = ""
 # ============================================================================
 # 本地覆盖(可选)—— 必须放在**派生之前**,否则从 BITSTREAM 派生的值会用到旧值
 # ============================================================================
-#: 仓库根目录(本文件所在目录)。
-ROOT = Path(__file__).resolve().parent
 
 # 如果存在 config.local.py,就用它覆盖上面那段的值 —— 这样你的机器路径不必进 git。
 _LOCAL = ROOT / "config.local.py"
@@ -104,10 +116,13 @@ LED_ELF = ROOT / "tmp-test" / "led" / "out" / "led.elf"
 #: ★ 必须用**这一份**:平台自带的 ps7_init.tcl **不把 MIO48/49 配成 UART1**,
 #: 用了它内核照常启动但串口一个字节都没有(看起来像"内核没跑起来")。
 PS7_INIT = ROOT / "tmp-test" / "zynq" / "ps7_init_uart1.tcl"
-#: 平台自带的那一份(不路由 UART1)。只有非串口的老脚本用得到它;它在比特流同目录。
-PS7_PLATFORM = Path(BITSTREAM).with_name("ps7_init.tcl")
 #: MIO bank1 电平自检。
 PS7_MIO_CHECK = ROOT / "tmp-test" / "zynq" / "ps7_mio_bank1_check.tcl"
+
+#: `run_kernel.tcl` / `run_led.tcl` 用的 ps7_init。
+#: 顶部 `PS7_PLATFORM` 留空 ⇒ 与串口流程**同一份**(仓库里那份,它也配了时钟/DDR/MIO);
+#: 在那里填了路径 ⇒ 用你填的那份(例如平台自带的、不路由 UART1 的那份)。
+PS7_PLATFORM = PS7_PLATFORM or PS7_INIT
 
 # ============================================================================
 # 工具函数
@@ -143,8 +158,12 @@ def check() -> list[str]:
     for label, path in REQUIRED_PATHS.items():
         if not Path(path).exists():
             problems.append(f"{label} 不存在: {path}")
-    if not BITSTREAM or "path/to/your" in BITSTREAM:
-        problems.append(f"board.bitstream 还是占位值,必须改成你的比特流: {BITSTREAM}")
+    # 比特流**默认在仓库里**(arch/arm32/board/System_wrapper.bit),所以正常情况下
+    # 这一项就该是绿的;红了说明要么 clone 不全,要么你把 BITSTREAM 指到了别处而那里没有。
+    if not BITSTREAM:
+        problems.append("board.bitstream 是空的 —— 指到你的比特流,或留默认(仓库里那份)")
+    elif "path/to/your" in str(BITSTREAM):
+        problems.append(f"board.bitstream 还是占位值: {BITSTREAM}")
     elif not Path(BITSTREAM).exists():
         problems.append(f"board.bitstream 不存在: {BITSTREAM}")
     for label, path in (("ps7_init", PS7_INIT), ("ps7_mio_check", PS7_MIO_CHECK)):
@@ -183,16 +202,20 @@ def write_paths_tcl() -> Path:
 
 
 def as_dict() -> dict[str, str]:
-    """给 `python config.py` 打印用。"""
+    """给 `python config.py` 打印用。
+
+    ⚠ 全部转成 `str`:这些值可能是 `Path`(例如仓库内相对路径那几项),
+    而下面 `main()` 里对它们做的是字符串判断(找 "path/to/your" 之类)。
+    """
     return {
-        "vitis.dir": VITIS_DIR,
+        "vitis.dir": str(VITIS_DIR),
         "jtag.xsdb": str(XSDB),
         "jtag.hw_server": str(HW_SERVER),
         "toolchain.dir": str(ARM_TOOLCHAIN_DIR),
         "toolchain.arm_gcc": str(ARM_CC),
-        "board.serial_port": SERIAL_PORT,
+        "board.serial_port": str(SERIAL_PORT),
         "board.baud": str(SERIAL_BAUD),
-        "board.bitstream": BITSTREAM,
+        "board.bitstream": str(BITSTREAM),
         "repo.ps7_init": str(PS7_INIT),
         "repo.kernel_elf": str(KERNEL_ELF),
         "repo.led_elf": str(LED_ELF),
