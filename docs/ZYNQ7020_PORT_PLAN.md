@@ -244,14 +244,18 @@ Preempt A/B  : skip_frame -> a=0 b=0 switched=2 invalid=0   → 检出
 
 | 项 | 状态 |
 |---|---|
+| ★★ **VFP 上下文根本没保存/恢复** ★★ | **全树零条 VFP 传输指令**；`TCB.vfp[64]`/`fpscr` 是死字段。README 的 M4-6 那节早就写明"M4-7 的切换点调用"，**从来没做**。源 OS 每次 `change_proccess` 都做（`scheduler.cpp:121-122`）。M4-9 之前切换罕见、暴露面小；**M4-9 之后每 4ms 一次非自愿抢占**，任何线程里一个 `double` 就够触发，症状是**算错数**。⇒ 建议**下一步就补**（README 退化清单 D8 写了修法与验收判据），它是唯一一条"欠着且已经在暴露面上"的 |
 | ★ **A/B 窗口内 `invalid` 推演与实测不符** ★ | 窗口内 `switched` 只涨 2、`invalid` **一次都没涨**；按代码推演第 2 次之后就该持续拒绝。实测 0，**原因未查清**。不影响任何判据（检出的两个条件都由实测值支撑）。已写进 `kmain.c` 的注释，交给 M4-10 查 |
 | ★ **异常帧可能不是 8 字节对齐** ★ | 实测一轮 **20 次**。SP 合法地可以是 4 mod 8（libgcc 的 Thumb `__udivmoddi4`，`push {r4,r5,lr}` = 12 字节），于是 `bl` 进 C 处理函数时 SP 也不对齐，严格说违反 AAPCS。**本板实测扛得住**（被拒绝那一轮里 `sched_tick` 在这个状态下执行了 3 万多次没出错），但那是"没观察到问题"。根治要把帧从 16 字加宽到 18 字、并把原始 SP 存进帧里 —— 用 `irq_frame_unaligned8` 量出的规模来决定值不值得做 |
+| `runtime_ticks` 从不累加 | 源 OS 每 tick 加一（`scheduler.cpp:398`）；这边只清 0。没有读者，等 procfs 要用时补 |
+| `sched_tick_account()` / `SCHED_MAX_SWITCHES_TRACKED` 成了死物 | M4-9 重写后无人引用：前者是 M4-8 遗留，后者是我删掉旧 `sched_switch_count` 用法时漏下的 |
 | **`irq_spurious` 那次 1285** | 约 14 次启动出现 1 次，之后未复现。判据保留在自检里，账目在 `README` 第 9 节 |
 | 启动阶段 ~67ms 的 tick 跳变 | 预先存在，已用受控 A/B 证明与缓存无关，原因未明 |
 | PL310 勘误 775420 | 尚未处理 |
 | SXAH 57 位系统调用号 | ARM 侧需要重新编号；代价实际为零 |
 | **WFI 要不要加** | x86 那边是 `hlt` 且只在 `process_exit` 里；"idle 进 WFI"**不是源 OS 的行为**。要不要给 ARM 加，**需要用户单独拍板** |
 | `sched_pick` 仍是"取队首" | 源 OS 的 `select_next_task_safe` 还有 avg_vruntime 闸门、fallback 扫描、`mark_task_dispatched`。等权负载下结果相同，但**那是简化，不是等价**。M4-10 一起补 |
+| 就绪队列无锁 | 单核、只有 CPU0 碰它。源 OS 用带自旋锁的 `lock_queue`；M4-10 再定每核一把还是无锁 |
 | `spin_t` 的宿主编译器 `#include <stdint.h>` | 无 |
 | `arch/arm32` 不在 `ninja format` 的范围内 | 刻意；见 README（用 clang-format 会打散注释对齐）|
 | `c45431b` 的提交说明有三处结论是错的 | 已在 `79947bc` 的说明里逐条更正；**以 `79947bc` 为准** |

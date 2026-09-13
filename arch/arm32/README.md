@@ -2073,6 +2073,11 @@ switched=30 preempted=27 invalid=0
 | D5 | **`is_task_schedulable` 省掉了 `parent_group` 两条** | `src/sched.c` | 内核对线程还没有进程组（M7 才有） | M7。照抄会让**每一个**线程都不可调度（`parent_group == NULL`），所以只能先省 |
 | D6 | **`sched_tick` 里的 CPU0 护栏** | `src/sched_kern.c` | `g_runq[1]` 与 CPU1 的 idle 都还没建，放 CPU1 过去会两个核同时往一个上下文里塞现场 | **M4-10**（每核队列 + 每核 idle）|
 | D7 | **异常帧可能不是 8 字节对齐** | `boot/vectors.S` 的 `EXC_FRAME_ENTER` | 本板实测扛得住（被拒绝那一轮里 `sched_tick` 在 4-mod-8 的 SP 上跑了 3 万多次没出错）| 需要时。根治要把帧从 16 字加宽到 18 字、把原始 SP 存进帧里。用 `irq_frame_unaligned8` 量出的规模（一轮 **20** 次）决定值不值得做 |
+| ★ D8 ★ | ★★ **VFP 上下文根本没保存/恢复** ★★ | **全树零条 VFP 传输指令**；`TCB.vfp[64]`/`fpscr` 是**死字段** | **不成立 —— 这是活 bug 的引信，不是"暂时够用"** | **现在就欠着**：源 OS 每次 `change_proccess` 都做 `save_fpu_context`/`restore_fpu_context`（`scheduler.cpp:121-122`）。M4-9 之前切换是罕见的主动行为，M4-9 之后是**每 4ms 一次的非自愿抢占** —— 暴露面从理论变成现实。内核是硬浮点编译的，任何线程里一个 `double` 局部变量就够触发，而症状是**算错数，不是崩** |
+| D9 | **`runtime_ticks` 从不累加** | `src/sched.c:149` 只清 0 | 没有读者 | 源 OS 每个 tick `__atomic_fetch_add(&current->runtime_ticks, 1ULL, …)`（`scheduler.cpp:398`）。等 procfs / 记账要用它时补 |
+| D10 | **`sched_tick_account()` 成了死函数** | `src/sched_kern.c:444` | — | M4-8 的遗留物：M4-9 把计费并进了 `sched_tick`。要么删、要么标注"仅调试用" |
+| D11 | **`SCHED_MAX_SWITCHES_TRACKED` 成了死宏** | `include/arch/sched.h:252` | — | 同上，M4-9 重写 `sched_switch_count` 的用法后没人引用了 |
+| D12 | **就绪队列无锁** | `src/sched.h` 的 `sched_queue_t` | 单核；只有 CPU0 碰它 | **M4-10**。源 OS 用带自旋锁的 `lock_queue`。每核化之后要么每核一把锁、要么走无锁（`sched_next` 是侵入式的，天然适合）|
 | ~~D3~~ | ~~内核用硬浮点编译~~ | — | — | **已结案：不是退化，是照源 OS 的设计。** 见下方「FP 上下文」一节 |
 
 
@@ -2106,6 +2111,28 @@ restore_fpu_context(&target->fpu_context);
 | 内核可自由用 SSE | 内核可自由用 VFP（`-mfpu=vfpv3 -mfloat-abi=hard` **保持不变**）|
 
 **⚠ 因此 `-mgeneral-regs-only` 是错的** —— 它会让 ARM 侧偏离源 OS。
+
+#### ★★ 但这件事**根本没有落地**（2026-09 补记）★★
+
+上面那张表里写的"M4-7 的切换点调用"，**从来没做**。全树搜
+`vstmia|vldmia|vmrs|vmsr|fmxr|fmrx` —— **零命中**；
+`TCB` 里的 `vfp[64]` 与 `fpscr` 从头到尾没有任何代码读过或写过，
+是纯粹的**死字段**（占了 260 字节的 TCB 体积，也占了 `sizeof(tcb)=512` 里的一半）。
+
+也就是说：**表里写下的设计是对的，实现是零。** 这类"文档写了、代码没做"的缺口
+比"没想过"更危险，因为读文档的人会以为它已经在了。
+
+M4-9 之前它的暴露面还小（切换是罕见的主动行为）；**M4-9 之后是每 4ms 一次的
+非自愿抢占**，任何一个线程里出现 `double`/`float` 就会被别的线程悄悄改掉
+d0–d31 —— 而症状是**算出错的数**，不是崩溃。
+
+⇒ 修法（照源 OS 的形状）：在 `boot/context.S` 加
+`arch_vfp_save(u32 *d, u32 *fpscr)` / `arch_vfp_restore(const u32 *d, u32 fpscr)`
+（`vstmia`/`vldmia` 存取 d0–d31、`vmrs`/`vmsr` 读写 FPSCR），
+在 `sched_tick` 的搬帧那一段调用 —— **不能放进 `sched_ctx_from_frame`**，
+那是纯逻辑层、宿主可测，一旦碰 VFP 就不能在宿主上跑了。
+验收判据：两个线程各自用 `double` 累加一个已知数列并核对结果，
+再把保存/恢复关掉做 A/B（应当算错）。
 之前倾向它是因为那样能省掉内核 FP 上下文，但那是**为了省事而改设计**，
 与 B5"两个架构共用同一套契约"直接冲突。
 
