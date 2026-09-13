@@ -689,3 +689,65 @@ bool sched_cpsr_matches_kernel(u32 cpsr)
      */
     return arm_cpsr_must(cpsr) == arm_cpsr_must(ARM_CPSR_KERNEL);
 }
+
+/* ------------------------------------------------------------------ */
+/* ★ M4-10:选核(纯逻辑,宿主可穷尽测)★                              */
+/* ------------------------------------------------------------------ */
+
+u32 sched_pick_cpu(i32 task_level, const u32 *queue_len, const u32 *ready, u32 cpu_num)
+{
+    /*
+     * ← `add_task()` `scheduler.cpp:537-549`,逐句对应:
+     *
+     *     struct PROCESSOR_INFO *min_cpu = get_cpu(0);
+     *     size_t min_cpu_index = 0;
+     *     if (new_task->task_level != TASK_APPLICATION_LEVEL) {
+     *         for (size_t i = 1; i < get_cpu_num(); i++) {
+     *             struct PROCESSOR_INFO *cpui = get_cpu(i);
+     *             if (cpui != NULL && cpui->scheduler_queue != NULL &&
+     *                 cpui->scheduler_queue->size < min_cpu->scheduler_queue->size) {
+     *                 min_cpu = cpui; min_cpu_index = i;
+     *             }
+     *         }
+     *     }
+     *
+     * ★ 这是**策略**,所以放在纯逻辑层:宿主机上可以穷尽扫"队列长度组合"、
+     *   "哪些核没就绪"、"应用级线程"这几种情形 —— 板上只有一组真实负载,
+     *   证不了"平局留给核号小的"这种边界(§4.5 拍板的分工)。
+     *
+     * 三条语义逐字照抄:
+     *   - 起点 CPU0,比较是 **严格小于** ⇒ **平局留给核号小的**;
+     *   - `TASK_APPLICATION_LEVEL` **跳过整个扫描** ⇒ 永远 CPU0;
+     *   - 只按队列**长度**挑(源 OS 全树没有负载均值、没有周期性迁移)。
+     *
+     * ⚠ 两处 ARM 侧的加固(不是偏离,是"源 OS 由前置条件保证、这里显式检查"):
+     *   - `ready[i] == 0` 的核**不参与** —— 源 OS 靠 BSP 等
+     *     `scheduler_is_ready == cpu_count` 保证队列都已建好;往一个没人扫的
+     *     队列里放线程**不报任何错**,只是那个线程永远不跑;
+     *   - CPU0 自己也必须就绪,否则返回 0 让调用方去报错(调用方一定在
+     *     某个核上跑着,但"跑着"不等于"它的队列建好了")。
+     */
+    u32 best = 0u;
+    u32 i;
+
+    if (queue_len == NULL || ready == NULL || cpu_num == 0u) {
+        return 0u;
+    }
+    if (ready[0] == 0u) {
+        return 0u;
+    }
+    if (task_level == TASK_APPLICATION_LEVEL) {
+        return 0u;
+    }
+
+    for (i = 1u; i < cpu_num; i++) {
+        if (ready[i] == 0u) {
+            continue;
+        }
+        if (queue_len[i] < queue_len[best]) {
+            best = i;
+        }
+    }
+
+    return best;
+}

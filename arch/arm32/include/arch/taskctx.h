@@ -416,14 +416,18 @@ void arch_vfp_restore(const u32 *d32, u32 fpscr);
  *   而"收尾会不会碰浮点寄存器"是编译器说了算的(本内核里 GCC 已经在用
  *   `vldr d16/vstr d16` 做 64 位清零)。完整理由见 boot/context.S。
  *
- * 两条都会被 `g_vfp_skip`(破坏性 A/B)短路,并且只在 CPU0 上生效。
+ * 两条都会被 `g_vfp_skip`(破坏性 A/B)短路。
+ *
+ * ★ M4-10.6:两条都**不再有 CPU0 护栏**,也**不再读那个全局量** ★
+ *
+ *   它们读的是 TPIDRPRW 拿到的**本核**结构,所以两个核各用各的现场 ——
+ *   这正是"每核化"要的东西。原来那句 `if (cpu_id != 0) return` 是在
+ *   掩盖一个隐患:配对的 `g_vfp_save_f` 是个**全局变量**(存 `&cur->fpscr`),
+ *   两核同时调度时 CPU0 布的指针会被 CPU1 覆盖 ⇒ CPU0 把 FPSCR 存进
+ *   别人的 TCB。现在汇编直接读 `percpu_t.cur_vfp_f`,全局量已删。
  */
 void arch_vfp_save_current(void);
 void arch_vfp_restore_current(void);
-
-/* `sched_set_current()` 与汇编之间的那一半:当前线程的 `&fpscr`。
- * 定义在 boot/context.S。⚠ 与 `percpu_t.cur_vfp_f` 同生同死,不是第二份真相。 */
-extern u32 g_vfp_save_f;
 
 /*
  * FPSCR 的舍入模式(bit[23:22])。**只给自检用。**

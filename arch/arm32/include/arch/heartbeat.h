@@ -157,6 +157,15 @@
 #define HB_CPU1_STAGE_CACHE     5u    /* 本核 L1 已开 */
 #define HB_CPU1_STAGE_IRQ       6u    /* 本核 GIC 接口 + 私有定时器中断已开 */
 #define HB_CPU1_STAGE_ONLINE    7u    /* 已置 online,进入主循环 */
+#define HB_CPU1_STAGE_SCHED     8u    /* ★ M4-10.2:本核 idle 已注册、就绪队列已建 ★
+                                       *
+                                       * 它排在 ONLINE **之后**取值是刻意的:
+                                       * CPU1 是先登记 idle、再置 online 的
+                                       * (online 于是蕴含"调度器就绪",见
+                                       * src/smp.c 第 7 步)。这个阶段号用于
+                                       * "卡在登记 idle 之前"与"卡在登记之后"
+                                       * 的区分 —— 前者 online=0 且 stage=SCHED,
+                                       * 后者 online=1。 */
 #define HB_CPU1_STAGE_FAILED    0xEEu /* 中途失败 */
 
 /* MMU 阶段的取值。0 表示还没开始 */

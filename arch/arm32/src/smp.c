@@ -11,6 +11,7 @@
 #include <arch/mmu.h>
 #include <arch/percpu.h>
 #include <arch/platform.h>
+#include <arch/sched.h>
 #include <arch/smp.h>
 #include <arch/timer.h>
 
@@ -198,7 +199,39 @@ void cpu1_main(void)
     irq_global_enable();
     HB[HB_SLOT_CPU1_STAGE] = HB_CPU1_STAGE_IRQ;
 
-    /* ---- 6. 报到 ---- */
+    /* ---- 7. ★ M4-10.2:本核的 idle 与就绪队列 ★ ----
+     *
+     * 顺序是刻意的:这一步**必须在 `percpu_publish_self()` 之前**。
+     *
+     * 源 OS 里 BSP 是等所有 AP 把 idle 与队列登记完才继续的
+     * (`main.cpp:581-585` 的 `while (scheduler_is_ready == xsi->cpu_count);`),
+     * 否则 BSP 可能往一个**还没初始化**的队列里塞线程。
+     * ARM 侧没有单独的 "scheduler_is_ready" 计数器 —— 这里让
+     * `online` 这个已有的标志**蕴含"本核调度器就绪"**:
+     *
+     *     online == 1  ⇒  本核 idle 已注册、队列已建、current_task 已指向 idle
+     *
+     * `smp_wait_online()` 于是自动成了那个握手(它本来就在等这个标志)。
+     * ⚠ 也就是说 `online` 的**含义被加强了** —— 它现在比 AM3 时更强。
+     *
+     * D6(CPU0 护栏)与 D12(队列无锁)都在 M4-10 关掉,所以在此之前
+     * CPU1 拿到 idle 也不会去调度任何人;从 M4-10.3 起它才会。
+     */
+    sched_register_ap_idle();
+    HB[HB_SLOT_CPU1_STAGE]  = HB_CPU1_STAGE_SCHED;
+
+    /*
+     * ★ 报到 ★ —— `percpu_publish_self()` 写本核表项里的 cpu_id / mpidr / online。
+     *
+     * ⚠ 它必须**紧跟在这两步之后**,而且这两步的顺序不能反:online 的含义
+     *   现在是"**连调度器都就绪了**"(见上面那段说明)。
+     *
+     * ⚠ 上板踩过一次:改这一段时把 `percpu_publish_self()` 漏掉了,
+     *   而心跳那几行还在 ⇒ 现象是 **stage=7(ONLINE)但 online=0**,
+     *   CPU0 等到超时(`SMP WARN: CPU1 did not come online ... stage=7`),
+     *   而 CPU1 其实跑得好好的。**心跳是给 JTAG 看的诊断,不是判据** ——
+     *   判据只看 `percpu.online`。两个都写、而且顺序对,才对得上。
+     */
     percpu_publish_self();
 
     HB[HB_SLOT_CPU1_ID]     = pc->cpu_id;
@@ -207,11 +240,17 @@ void cpu1_main(void)
     HB[HB_SLOT_CPU1_STAGE]  = HB_CPU1_STAGE_ONLINE;
     arch_dsb();
     cpu_sev(); /* 通知可能正在 WFE 等它的 CPU0 */
-    /*
-     * ---- 7. 本核主循环 ----
+
+    /* ---- 8. 本核主循环 = **本核 idle 的循环体** ----
      *
-     * 心跳里的 loops 只在本核内递增,CPU0 通过读 percpu 表拿到它 ——
-     * 这是"CPU1 真的在独立推进"而不是"CPU0 打印了一个数字"的证据。
+     * 源 OS 的 AP 在登记完 idle 之后就是这个循环(`smp.cpp:178-181`):
+     *
+     *     while (true) { asm volatile("pause"); }
+     *
+     * 而它的 idle TCB 的 `context0.rip` 当时还是 0 —— 也就是说
+     * **这一段就是 idle 的上下文**;第一次被抢占时现场被收进那个 TCB,
+     * 之后本核没线程可跑时(兜底链)会**切回这里**。
+     * 所以它不是"启动完之后顺手进的一个循环",而是 idle 本体。
      *
      * 中断已经开着:本核的 1kHz tick 与 SGI 都会在这里被打断处理。
      * 压力测试由 CPU0 用 go/done 握手触发,见 smp_stress_run()。

@@ -454,16 +454,28 @@ arch_vfp_get_rmode:
  * `sched_set_current()` 用 C 算好写进去。每核结构是"全 u32 字段"的
  * (percpu.h 有断言),所以它的偏移在宿主与目标上一致,汇编可以放心用。
  *
- * ## 为什么两个函数都要查 cpu_id
- *
- * 目前只有 CPU0 参与调度。CPU1 的 1kHz 定时器同样会走 `_vec_irq`,
- * 如果它去消费 CPU0 布下的状态,就会把 CPU0 的现场搬到 CPU1 上 ——
- * 两个核同时用一份 d0-d31。
- *
  * ## 为什么用 `ldmia` 而不是 `vldmia`
  *
  * 这里要读的是**每核结构里的普通内存**(不是 VFP 寄存器),所以是整数
  * `ldr`。下面 `vldmia`/`vstmia` 才是真的搬 d0-d31。
+ *
+ * ## ★ M4-10.6:去掉 CPU0 护栏,并改掉一个"只有双核才会爆"的隐患 ★
+ *
+ * 原来这两个函数都有一句 `if (percpu.cpu_id != 0) return`(M4-10 之前
+ * 只有 CPU0 参与调度,不拦的话 CPU1 会去消费 CPU0 布下的状态)。
+ * M4-10 起两个核都调度,护栏必须去掉 —— 而 `percpu_t` 里的两个指针
+ * **本来就是按核的**(TPIDRPRW 拿到的是本核结构),所以去掉之后各用各的。
+ *
+ * ⚠ 但一起去掉的还必须有一个**全局变量** `g_vfp_save_f`:
+ *   它存的是"`&cur->fpscr`",而 `sched_set_current()` 每次都覆盖它 ——
+ *   两个核同时调度时,CPU0 布的指针会被 CPU1 覆盖,于是 **CPU0 把 FPSCR
+ *   存进别人的 TCB**。那种错不报任何东西,只表现为"另一个线程的舍入模式
+ *   莫名变了"(M4-9.5 的判据恰好量这个,所以它会被抓到,但归因会很难)。
+ *   今天不爆只因为护栏让 CPU1 根本不走这条路 —— 也就是说:
+ *   **护栏一直在掩盖这个 bug。**
+ *
+ *   修法:读同一个每核结构里的 `ARM_PERCPU_OFF_CUR_VFP_F`(C 侧早就写好了,
+ *   `sched_set_current()` 一次写两个字段),那个全局变量**删掉**。
  */
     .global arch_vfp_save_current
     .type   arch_vfp_save_current, %function
@@ -473,22 +485,20 @@ arch_vfp_save_current:
     cmp     r3, #0
     bxne    lr                          /* 破坏性 A/B:跳过 */
 
-    mrc     p15, 0, r0, c13, c0, 4      /* r0 = TPIDRPRW = 本核 percpu_t* */
+    mrc     p15, 0, r0, c13, c0, 4      /* r0 = TPIDRPRW = **本核** percpu_t* */
     cmp     r0, #0
     bxeq    lr
-    ldr     r1, [r0, #ARM_PERCPU_OFF_CPU_ID]
+    ldr     r1, [r0, #ARM_PERCPU_OFF_CUR_VFP_F]
     cmp     r1, #0
-    bxne    lr                          /* 只有 CPU0 参与调度 */
+    bxeq    lr                          /* 还没有 current,或已声明不处理 */
     ldr     r0, [r0, #ARM_PERCPU_OFF_CUR_VFP_D]
     cmp     r0, #0
-    bxeq    lr                          /* 还没有 current,或已声明不处理 */
+    bxeq    lr
 
-    ldr     r1, =g_vfp_save_f
-    ldr     r1, [r1]                    /* r1 = &cur->fpscr */
     vstmia  r0!, {d0-d15}
     vstmia  r0!, {d16-d31}
     vmrs    r2, fpscr
-    str     r2, [r1]
+    str     r2, [r1]                    /* r1 = &cur->fpscr(本核的 current)*/
     bx      lr
     .size   arch_vfp_save_current, . - arch_vfp_save_current
 
@@ -503,15 +513,13 @@ arch_vfp_restore_current:
     mrc     p15, 0, r0, c13, c0, 4
     cmp     r0, #0
     bxeq    lr
-    ldr     r1, [r0, #ARM_PERCPU_OFF_CPU_ID]
+    ldr     r1, [r0, #ARM_PERCPU_OFF_CUR_VFP_F]
     cmp     r1, #0
-    bxne    lr
+    bxeq    lr
     ldr     r0, [r0, #ARM_PERCPU_OFF_CUR_VFP_D]
     cmp     r0, #0
     bxeq    lr
 
-    ldr     r1, =g_vfp_save_f
-    ldr     r1, [r1]
     ldr     r1, [r1]                    /* r1 = fpscr 的值 */
     vldmia  r0!, {d0-d15}
     vldmia  r0!, {d16-d31}
@@ -520,23 +528,10 @@ arch_vfp_restore_current:
     .size   arch_vfp_restore_current, . - arch_vfp_restore_current
 
 /*
- * C 侧把"当前线程的浮点现场在哪"写进每核结构,汇编读的是同一对地址。
- *
- * `g_vfp_save_f` 是给 C 用的便利变量:`sched_set_current()` 一次写两个
- * 指针,而 `_vec_irq` 里那两条 `bl` 之间**不会有别的写者**
- * (中断全程 I=1,而且只有 CPU0 走这条路),所以一个全局量够了。
- * 换成两个每核字段也可以,但那就多两个偏移要维护、换不来什么。
- *
- * ⚠ 它不是"第二份真相":真值在 `percpu_t.cur_vfp_d`(汇编直接读),
- *   这里只放同一对象的 `&fpscr` 一半,而且与前者同生同死
- *   (`sched_set_current()` 一起写、一起清)。
+ * (M4-10.6:`g_vfp_save_f` 这个 `.data` 里的全局量**已删除** ——
+ *  它是"&cur->fpscr"的第二份真相,而第二份真相在双核下就是错的。
+ *  现在汇编只读 `percpu_t.cur_vfp_f`,C 侧也只写那一处。)
  */
-    .global g_vfp_save_f
-    .data
-    .align  2
-g_vfp_save_f:
-    .word   0
-
 /*
  * ★ 破坏性 A/B 的开关:置 1 时**完全跳过**浮点现场的存与取 ★
  *

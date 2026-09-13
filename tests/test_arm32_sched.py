@@ -995,6 +995,60 @@ int main(void)
     CHECK(g_wake_skip == 0u);
     CHECK(g_pick_sticky == 0u);
 
+    /* ================================================================ */
+    /* 14. ★ M4-10:选核(策略层,穷尽)★                               */
+    /* ================================================================ */
+
+    /*
+     * ← `add_task()` `scheduler.cpp:537-549`。它是**策略**,所以判据在这里 ——
+     * 板上只有一组真实负载,证不了"平局留给核号小的""没就绪的核不参与"
+     * 这些边界(§4.5 拍板的分工:策略→宿主,机制→板上)。
+     */
+    {
+        const u32 q_len2[2] = {5u, 2u}; /* CPU1 更空 */
+        const u32 q_rdy2[2] = {1u, 1u};
+        const u32 q_tie[2]  = {3u, 3u};
+        const u32 q_nrdy[2] = {9u, 0u}; /* CPU1 没就绪、而且"看起来更空" */
+        const u32 rdy_no[2] = {1u, 0u};
+        const u32 rdy_c0[2] = {0u, 1u}; /* 连 CPU0 都没就绪 */
+        const u32 q_full[2] = {7u, 7u};
+
+        /* (1) 挑最短的那个核 */
+        CHECK(sched_pick_cpu(TASK_KERNEL_LEVEL, q_len2, q_rdy2, 2u) == 1u);
+        CHECK(sched_pick_cpu(TASK_KERNEL_LEVEL, q_full, q_rdy2, 2u) == 0u);
+
+        /* (2) ★ 平局留给核号小的(比较是**严格小于**)★ */
+        CHECK(sched_pick_cpu(TASK_KERNEL_LEVEL, q_tie, q_rdy2, 2u) == 0u);
+
+        /* (3) ★ 没就绪的核不参与 —— 哪怕它"队列更短" ★ */
+        CHECK(sched_pick_cpu(TASK_KERNEL_LEVEL, q_nrdy, rdy_no, 2u) == 0u);
+
+        /* (4) ★ 应用级线程跳过整个扫描 ⇒ 永远 CPU0 ★ */
+        CHECK(sched_pick_cpu(TASK_APPLICATION_LEVEL, q_len2, q_rdy2, 2u) == 0u);
+        CHECK(sched_pick_cpu(TASK_APPLICATION_LEVEL, q_nrdy, rdy_no, 2u) == 0u);
+
+        /* (5) CPU0 自己没就绪 ⇒ 0(由调用方去报错,而不是静默乱放)*/
+        CHECK(sched_pick_cpu(TASK_KERNEL_LEVEL, q_len2, rdy_c0, 2u) == 0u);
+
+        /* (6) 边界参数不崩 */
+        CHECK(sched_pick_cpu(TASK_KERNEL_LEVEL, NULL, q_rdy2, 2u) == 0u);
+        CHECK(sched_pick_cpu(TASK_KERNEL_LEVEL, q_len2, NULL, 2u) == 0u);
+        CHECK(sched_pick_cpu(TASK_KERNEL_LEVEL, q_len2, q_rdy2, 0u) == 0u);
+        CHECK(sched_pick_cpu(TASK_KERNEL_LEVEL, q_len2, q_rdy2, 1u) == 0u); /* 只有 CPU0 */
+
+        /* (7) 核数从 1 到 4 都不得越界 */
+        {
+            u32 i;
+
+            for (i = 1u; i <= 4u; i++) {
+                u32 len[4] = {9u, 0u, 0u, 0u};
+                u32 rdy[4] = {1u, 0u, 0u, 0u};
+
+                CHECK(sched_pick_cpu(TASK_KERNEL_LEVEL, len, rdy, i) == 0u);
+            }
+        }
+    }
+
     if (failures != 0) {
         printf("%d check(s) failed\n", failures);
         return 1;

@@ -225,6 +225,22 @@ static u32 g_reloc_ctl_a;
 static u32 g_reloc_ctl_b;
 static u32 g_reloc_ctl_detected;
 
+/* ---- M4-10:两核调度的自检状态 ---- */
+static u32 g_cpu1_sched_ready;   /* CPU1 的 idle + 队列都登记好了 */
+static u32 g_smp_sched_ok;       /* 相 6:两个核都真的在跑线程 */
+static u32 g_smp_ran[PERCPU_MAX_CPUS]; /* 每个核上"跑完了"的探针数 */
+static u32 g_smp_assign[PERCPU_MAX_CPUS]; /* 每个核被分配到的探针数(TCB.cpu_id)*/
+static u32 g_smp_cpu1_switched_at;
+static u32 g_smp_cpu1_preempted_at;
+static u32 g_smp_cpu0_preempted_at;
+static u32 g_smp_made;              /* 相 6 真的造出来的线程数(非空转的判据之一)*/
+static u32 g_smp_place_bad;         /* ★ 落在"不是更短的那个队列"上的线程数(应当 0)*/
+static u32 g_smp_ap_idle_harvested; /* CPU1 的 idle 现场被收过(ctx.pc != 0)*/
+static u32 g_smp_ap_idle_back;      /* ★ 线程挂起之后 CPU1 **回到了 idle**(loops 还在涨)*/
+static u32 g_smp_ctl_detect;        /* A/B:置 pick_cpu0 之后 CPU1 一次都没切 */
+static u32 g_smp_ctl_inconclusive;  /* ★ 相 6 没证明 CPU1 会调度 ⇒ 对照组无意义 */
+static u32 g_smp_ctl_cpu1_delta;    /* 对照组窗口里 CPU1 的 switched 增量 */
+static u32 g_smp_ctl_cpu0_delta;
 #define YIELD_ROUNDS 8u
 
 /*
@@ -1030,6 +1046,42 @@ static void starve_monitor(void *arg)
             }
         }
     }
+}
+
+/*
+ * ★ M4-10:两核调度相用的探针 ★
+ *
+ * 它比前面那些探针都简单,因为这一相要证的事不在"线程内部":
+ * **它自己观测到自己在哪个核上跑** —— 这是"两个核都真的在跑线程"
+ * 唯一不依赖我推理的证据(`percpu_self()->cpu_id` 只有本核能填对,
+ * 与 AM3 用 MPIDR 而不是 cpu_id 判"CPU1 真的起来了"是同一条规矩)。
+ *
+ * 墙钟预算很短(40ms),跑完就挂起 —— 两个核上的线程都必须会退出,
+ * 否则 kmain 拿不回 CPU,"自检把系统挂住"。
+ */
+#define SMP_SCHED_BUDGET_US 40000u
+#define SMP_SCHED_THREADS   3u
+/* 对照组只要 2 个:一个占住 CPU0、一个备用。线程池只有 32 个槽(D14:没有退出路径)*/
+#define SMP_CTL_THREADS     2u
+
+static void smp_sched_probe(void *arg)
+{
+    u64       t0 = timer_read_us();
+    percpu_t *me = percpu_self();
+    u32       id = (me == NULL) ? 0xFFFFFFFFu : me->cpu_id;
+
+    (void)arg;
+
+    while ((timer_read_us() - t0) < (u64)SMP_SCHED_BUDGET_US) {
+        cpu_relax();
+    }
+
+    /* ★ 只有本核能把自己的核号写对 ★ */
+    if (id < PERCPU_MAX_CPUS) {
+        g_smp_ran[id]++;
+    }
+
+    thread_finish();
 }
 
 /* 相 5 与对照组的四个负载线程入口(同一个探针,两个 g_starve 槽)*/
@@ -2321,6 +2373,25 @@ void kmain(void)
         if (cpu1_ok) {
             console_printf(" SMP         : CPU1 online  id=%u mpidr=0x%08X stack=0x%08X\n",
                            g_percpu[1].cpu_id, g_percpu[1].mpidr, (u32)g_percpu[1].stack_top);
+
+            /*
+             * ★ M4-10.2:这一步顺带就是"调度器就绪"的握手 ★
+             *
+             * `online` 由 CPU1 自己置,而且从 M4-10 起它是在
+             * `sched_register_ap_idle()` **之后**才置的(见 src/smp.c 第 7 步)——
+             * 也就是说 `online == 1` 现在蕴含:
+             *     本核 idle 已注册、本核就绪队列已建、current_task 已指向 idle。
+             *
+             * 这正是源 OS 的 `while (scheduler_is_ready == xsi->cpu_count);`
+             * (`main.cpp:581-585`)要保证的事:CPU0 不会往一个还没初始化的
+             * 队列里塞线程。所以这里**不需要**再加一次等待 —— 加一次反而
+             * 会让两处判据分叉。
+             */
+            console_printf(" SMP         : CPU1 sched ready (runq=%u idle_pc_zero=%u)\n",
+                           sched_cpu_runq_len(1u),
+                           (sched_idle_of(1u) != NULL && sched_idle_of(1u)->ctx.pc == 0u) ? 1u : 0u);
+            g_cpu1_sched_ready =
+                ((sched_idle_of(1u) != NULL) && (sched_cpu_runq_len(1u) >= 1u)) ? 1u : 0u;
         } else {
             /*
              * 不等成功也要如实报出来,而且**不能就此停机** ——
@@ -2561,6 +2632,26 @@ void kmain(void)
 
         sched_kern_bind(&g_kstack, &g_heap);
         sched_kern_init();
+
+        /*
+         * ★ M4-10:从这里到相 5 结束,线程**全部落在 CPU0** ★
+         *
+         * 理由不是"省事",而是**这些判据都是单核判据**:
+         *
+         *   | 判据 | 一旦线程被分到 CPU1 会变成什么 |
+         *   |---|---|
+         *   | M4-9 的 `saw=(1,1)` 交错见证 | 两核各跑各的,**永远不会交错** ⇒ 判 FAIL |
+         *   | M4-9.5 的 VFP 现场 | 两个核各有自己的 d0-d31 ⇒ "被对方改掉"根本不会发生 ⇒ 判据失去区分能力 |
+         *   | M4-8.4 的唤醒延迟 | 纯占用线程在另一个核上 ⇒ 不再构成竞争 ⇒ 判据变得空转 |
+         *   | M4-8.5 的无饥饿 | K 个线程被拆到两核上 ⇒ 量的不再是"同一个核上的轮转" |
+         *
+         * 所以它们必须**显式**钉在 CPU0 —— 这既保住了既有判据的含义,
+         * 又顺手成了 M4-10 的对照组(见报告之后那一相):
+         * **置 1 = M4-10 之前的行为**。
+         *
+         * M4-10 自己的判据是**相 6**(它才把开关打开)。
+         */
+        sched_set_pick_cpu0(1u);
         /*
          * ★ 把排他输出的钩子装上 ★
          *
@@ -2950,6 +3041,150 @@ void kmain(void)
         }
     }
 
+    /* ---- 相 6:★ M4-10 —— 两个核都在跑线程 ★ ---- */
+    /*
+     * 与前面每一相的差别只有一个:**这一相把选核打开**
+     * (`sched_set_pick_cpu0(0)`),于是线程按源 OS 的规矩落到
+     * "队列最短的那个核"(`scheduler.cpp:537-549`)。
+     *
+     * 判据(全部是可读的数,不是"看起来在跑"):
+     *   cpu1_switched   CPU1 的 `switched` 增量 > 0 —— 它在搬帧
+     *   cpu1_preempted  CPU1 的 `preempted` 增量 > 0 —— 被换下的是**真实线程**
+     *                   (只切 idle 的话这个数永远是 0,那不算"在调度")
+     *   cpu0_preempted  CPU0 也在抢占真实线程(不是把活全推给 CPU1)
+     *   ap_idle_ctx     CPU1 的 idle 现场被收过(`ctx.pc != 0`)—— 它被切走过
+     *   ap_idle_back    线程挂起之后 CPU1 **回到了自己的 idle**(见下)
+     *   placement       ★ 每个新线程都落在"造它之前更短的那个队列"上 ★
+     *
+     * ## ★ 为什么判据是 placement 而不是"两个核各分到一半" ★
+     *
+     * 第一版我要求"两个核都分到线程"—— 上板立刻证明那是**错的期望**:
+     * 源 OS 的规则比的是**队列长度**,而队列是"全部线程的**名册**"
+     * (M4-8.4 对齐源 OS 之后就是这样:睡着的、挂起的都还在里面)。
+     * 启动到这一相时 CPU0 的名册上已经躺着十几个已挂起的探针,
+     * 而 CPU1 只有它自己的 idle ⇒ **每一个新线程都会落到 CPU1**,
+     * 直到 CPU1 也攒到同样多的名册项。
+     *
+     * 实测(那一轮):`assign=(0,6) ran=(0,6)`,而两个核**都在正常调度**。
+     * ⇒ 判据要测的是"**规则有没有被正确执行**"(拿造线程之前的两个队列长度
+     *   去对),而不是"负载有没有均分" —— 后者是这套规则的已知性质,
+     *   不是它的判据。**这也说明"判据得对着机制写,不能对着愿望写"。**
+     *
+     * ⚠ 负载必须**会自己挂起**(跑完就 park):两个核上的线程都不退出的话,
+     *   kmain 拿不回 CPU —— 那是"自检把系统挂住",本项目最怕的失败模式。
+     */
+    {
+        tcb_t st[SMP_SCHED_THREADS];
+        u32   i;
+        u32   sw0;
+        u32   sw1;
+        u32   pre0;
+        u32   pre1;
+        u32   made = 0u;
+        u32   place_bad = 0u;
+
+        sched_set_pick_cpu0(0u); /* ★ 打开选核 —— 这才是 M4-10 的行为 ★ */
+
+        g_smp_ran[0] = 0u;
+        g_smp_ran[1] = 0u;
+        g_smp_assign[0] = 0u;
+        g_smp_assign[1] = 0u;
+
+        sw0  = g_percpu[0].switched;
+        sw1  = g_percpu[1].switched;
+        pre0 = g_percpu[0].preempted;
+        pre1 = g_percpu[1].preempted;
+
+        for (i = 0u; i < SMP_SCHED_THREADS; i++) {
+            u32 len0 = sched_cpu_runq_len(0u);
+            u32 len1 = sched_cpu_runq_len(1u);
+            u32 expect = (len1 < len0) ? 1u : 0u; /* 严格小于 ⇒ 平局给 CPU0 */
+
+            sched_disable(); /* 每个线程各罩一次:不要把整个系统冻住一整段 */
+            st[i] = sched_kthread_create(smp_sched_probe, NULL, "smp");
+            sched_enable();
+
+            if (st[i] == NULL) {
+                continue;
+            }
+            made++;
+            if (st[i]->cpu_id < PERCPU_MAX_CPUS) {
+                g_smp_assign[st[i]->cpu_id]++;
+            }
+            /* ★ 落在"造它之前更短的那个队列"上了吗 ★ */
+            if (st[i]->cpu_id != expect) {
+                place_bad++;
+            }
+        }
+
+        {
+            if (made == 0u) {
+                console_puts(" Sched smp   : kthread_create FAILED\n");
+            } else {
+                /* 预算 40ms,给足 10 倍余量 —— 两个核都在抢 CPU,慢一点正常 */
+                starve_wait_ms(400u);
+
+                /*
+                 * ★ "CPU1 回到自己的 idle 了吗" ★
+                 *
+                 * idle 的循环体就是 `pc->loops++` —— 所以这个计数器**只在
+                 * idle 真的在跑的时候才涨**。相 6 的探针都已经挂起了,
+                 * 于是再等一小段,CPU1 的 `loops` 必须继续涨:
+                 *
+                 *   涨  ⇒ 它从"最后一个线程挂起"回到了 idle 的循环里
+                 *   不涨 ⇒ 它卡在那个已挂起的线程上(该核永久停摆,
+                 *          而另一个核看起来一切正常 —— 计划里那句
+                 *          "AP 的 idle 只被切走、不被切回"如果照字面实现,
+                 *          得到的就是这个形态)
+                 *
+                 * 这一条正是 M4-10 调研时**纠正**的那个断言的可执行版本。
+                 */
+                {
+                    u32 l1a = g_percpu[1].loops;
+
+                    starve_wait_ms(100u);
+                    g_smp_ap_idle_back = (g_percpu[1].loops > l1a) ? 1u : 0u;
+                }
+
+                g_smp_cpu1_switched_at  = g_percpu[1].switched - sw1;
+                g_smp_cpu1_preempted_at = g_percpu[1].preempted - pre1;
+                g_smp_cpu0_preempted_at = g_percpu[0].preempted - pre0;
+                g_smp_place_bad         = place_bad;
+                g_smp_made              = made;
+                g_smp_ap_idle_harvested =
+                    ((sched_idle_of(1u) != NULL) && (sched_idle_of(1u)->ctx.pc != 0u)) ? 1u : 0u;
+
+                g_smp_sched_ok =
+                    ((g_smp_cpu1_switched_at > 0u) && (g_smp_cpu1_preempted_at > 0u) &&
+                     (g_smp_cpu0_preempted_at > 0u) && (g_smp_ap_idle_harvested != 0u) &&
+                     (g_smp_ap_idle_back != 0u) && (g_smp_ran[1] > 0u) && (made == SMP_SCHED_THREADS))
+                        ? 1u
+                        : 0u;
+
+                console_excl_begin();
+                console_printf(" Sched smp   : threads=%u/%u assign=(%u,%u) ran=(%u,%u) place_bad=%u\n",
+                               made, SMP_SCHED_THREADS, g_smp_assign[0], g_smp_assign[1], g_smp_ran[0],
+                               g_smp_ran[1], place_bad);
+                console_printf(" Sched smp   : cpu1 switched=+%u preempted=+%u idle_harvested=%u back=%u\n",
+                               g_smp_cpu1_switched_at, g_smp_cpu1_preempted_at,
+                               g_smp_ap_idle_harvested, g_smp_ap_idle_back);
+                console_printf(" Sched smp   : cpu0 switched=+%u preempted=+%u  runq=(%u,%u)\n",
+                               g_percpu[0].switched - sw0, g_smp_cpu0_preempted_at,
+                               sched_cpu_runq_len(0u), sched_cpu_runq_len(1u));
+                console_printf(" Sched smp   : two cores scheduling = %s\n",
+                               g_smp_sched_ok ? "PASS" : "FAIL");
+                console_excl_end();
+            }
+        }
+
+        /*
+         * ⚠ 选核开关**留着不动**(仍为 0):报告之后的对照组要从这个状态出发。
+         *   ⚠ 但报告之后的**每一组对照都是单核判据**,所以 9.75 之前会把它
+         *     再钉回 1 —— 上板实测漏了这一步时 VFP 对照组直接失去区分能力。
+         *     见 9.75 之前那段说明。
+         */
+    }
+
     /* ---- 10. 启动自检总账 ---- */
     /*
      * 位置:所有自检都跑完之后、主循环之前。
@@ -3270,6 +3505,42 @@ void kmain(void)
                     1u, SELFTEST_EQ);
 
     /*
+     * ---- ★ M4-10:两个核都在跑线程 ★ ----
+     *
+     * 五项分开报 —— 它们的失败原因完全不同:
+     *   smp_sched_two_cores  合起来的判据(见相 6 的说明)
+     *   smp_sched_cpu1_ran   **CPU1 上真的有探针跑完过**(核号是线程自己写的)
+     *   smp_sched_spread     两个核**都**分到了线程(按 TCB 的 `cpu_id`)
+     *   smp_ap_idle          CPU1 的 idle 登记好了,而且它的现场被收过
+     *                        —— 也就是"切进过 CPU1 的 idle、又切走了"
+     */
+    selftest_report("smp_sched_two_cores", g_smp_sched_ok, 1u, SELFTEST_EQ);
+    selftest_report("smp_sched_created", g_smp_made, SMP_SCHED_THREADS, SELFTEST_EQ);
+    selftest_report("smp_sched_placement", (g_smp_place_bad == 0u) ? 1u : 0u, 1u, SELFTEST_EQ);
+    selftest_report("smp_sched_cpu1_ran", (g_smp_ran[1] > 0u) ? 1u : 0u, 1u, SELFTEST_EQ);
+    selftest_report("smp_ap_idle", g_smp_ap_idle_harvested, 1u, SELFTEST_EQ);
+    selftest_report("smp_ap_idle_back", g_smp_ap_idle_back, 1u, SELFTEST_EQ);
+    selftest_report("smp_cpu1_sched_ready", g_cpu1_sched_ready, 1u, SELFTEST_EQ);
+
+    /*
+     * ---- ★ 线程栈池的余量(给 D14 当哨兵)★ ----
+     *
+     * D14:线程**没有退出路径**,于是每造一个线程就永久占掉一个栈槽
+     * (`KSTACK_SLOTS = 32`)。这一相之后已经用掉二十几个 —— 再加两个探针
+     * 就会开始**静默地创建失败**(`sched_kthread_create` 返回 NULL),
+     * 而"创建失败"在各处的表现是"那个自检项看起来没跑"。
+     *
+     * 判据留 4 个槽的余量:不是"越多越好",而是"还够下一次改动"。
+     * 它红了就说明该做 M4-11(线程退出)或者扩池了 —— 两条都写在待办里。
+     */
+    selftest_report("kstack_headroom",
+                    (g_kstack.slot_count > g_kstack.peak_used &&
+                     (g_kstack.slot_count - g_kstack.peak_used) >= 4u)
+                        ? 1u
+                        : 0u,
+                    1u, SELFTEST_EQ);
+
+    /*
      * `invalid_ctx` 必须恒为 0:它不是"发生过多少件坏事"的计数,
      * 而是"调度器有没有挑到过不可切换的上下文"。挑了就是有 bug ——
      * 正常路径上 idle 的 pc==0 只在注册与第一次切走之间成立,
@@ -3350,6 +3621,27 @@ void kmain(void)
     HB[HB_SLOT_SELFTEST_FAILED] = selftest_summary();
     console_puts("\n");
     console_excl_end(); /* ★ 报告区间结束,状态行线程可以继续说话了 ★ */
+
+    /* ---- 9.75 之前的共同前提:★ 后面的对照组全部钉在 CPU0 ★ ---- */
+    /*
+     * 报告之后的每一组对照(9.75 搬帧 / 9.76 VFP / 9.77 扫描唤醒 / 9.78 无饥饿 /
+     * 9.79 选核)都是**单核判据** —— 它们量的是"同一个核上的两三个线程之间
+     * 发生了什么"。线程一旦被分到两个核上,这些判据**全部失去区分能力**:
+     *
+     *   - 搬帧  :两个线程不共享 CPU ⇒ 谁都不需要搬帧
+     *   - VFP   :两个核各有自己的 d0-d31 ⇒ "被对方改掉"根本不会发生
+     *   - 唤醒  :探测线程睡在另一个核上 ⇒ "不醒"与"这台机器没在跑"分不开
+     *   - 无饥饿:K 个线程被拆开 ⇒ 不再是同一队列上的轮转
+     *
+     * ⚠ 这不是理论担忧:**上板实测过** —— M4-10 的相 6 把选核打开之后,
+     *   VFP 对照组当场从 `bad=(7914,0)` 变成 `bad=(0,0)`,报告"未检出"。
+     *   那一刻看起来像"VFP 保存/恢复坏了",实际是**判据的适用条件没了**。
+     *   ⇒ 教训与 §0.5.6b 那条一样:**每个判据都要写清它的适用条件**,
+     *     而"单核"就是这几条的适用条件。
+     *
+     * 所以这里显式钉回 CPU0;9.79 自己会再置 1 并(在最后)恢复成生产值 0。
+     */
+    sched_set_pick_cpu0(1u);
 
     /* ---- 9.75 抢占的破坏性对照组(必须在自检报告**之后**)---- */
     /*
@@ -3805,6 +4097,112 @@ void kmain(void)
                            g_starve_ctl_detect ? "DETECTED" : "MISSED - detector not load-bearing");
             console_excl_end();
         }
+    }
+
+    /* ---- 9.79 ★ M4-10 的破坏性对照组:选核永远给 CPU0 ★ ---- */
+    /*
+     * 同一批负载、同一个调度器,**只把"放哪个核"改成永远 CPU0**
+     * (`sched_set_pick_cpu0(1)`)—— 也就是 M4-10 之前的行为。
+     *
+     *   选核开(相 6 实测):线程铺到两个核 ⇒ `cpu1 switched=+N preempted=+M`
+     *   选核关          :CPU1 的队列里一个可运行线程都没有 ⇒
+     *                    **`switched[1]` 的增量恒为 0**、而 CPU0 的队列里
+     *                    堆着全部线程(CPU1 只剩自己的 idle 在空转)
+     *
+     * ⚠ 判据是"**CPU1 一次都没切**"(检出),不是"切得少了"。
+     *   与前五组一样:这里是**预期它坏** —— 它证明"挑最短队列"这件事承重。
+     *
+     * ⚠ 这一相**不需要**收拾:开关置 1 就是 M4-10 之前的行为,而负载线程
+     *   跑完会自己挂起(不会把 CPU 占死)。
+     */
+    {
+        tcb_t sa2[SMP_CTL_THREADS];
+        u32   i;
+        u32   made = 0u;
+        u32   sw1_before = g_percpu[1].switched;
+        u32   sw0_before = g_percpu[0].switched;
+
+        sched_set_pick_cpu0(1u); /* ★ 对照组:全塞 CPU0 ★ */
+
+        g_smp_ran[0] = 0u;
+        g_smp_ran[1] = 0u;
+        g_smp_assign[0] = 0u;
+        g_smp_assign[1] = 0u;
+
+        for (i = 0u; i < SMP_CTL_THREADS; i++) {
+            sched_disable();
+            sa2[i] = sched_kthread_create(smp_sched_probe, NULL, "ab0");
+            sched_enable();
+            if (sa2[i] == NULL) {
+                continue;
+            }
+            made++;
+            if (sa2[i]->cpu_id < PERCPU_MAX_CPUS) {
+                g_smp_assign[sa2[i]->cpu_id]++;
+            }
+        }
+
+        /*
+         * ★ 非空转:对照组必须**真的造出线程**来了 ★
+         *
+         * 上板踩过一次:线程池(KSTACK_SLOTS=32)在前面几相就快用满了,
+         * 这里 6 个线程全部创建失败 ⇒ `assign=(0,0) ran=(0,0)`,
+         * 而判据"CPU1 一次都没切"照样成立 ⇒ 打出一句**漂亮的假 DETECTED**。
+         * ⇒ 判定里必须带上"这一相真的发生了什么"。
+         *   (顺带:这也是 D14"线程没有退出路径"的直接后果 —— 每造一个
+         *    线程就永久占一个栈槽。自检里新增 `kstack_headroom` 盯着它。)
+         */
+        if (made < SMP_CTL_THREADS) {
+            console_excl_begin();
+            console_printf(" Smp-pick A/B: INCONCLUSIVE(只造出 %u/%u 个线程 —— "
+                           "线程池可能满了)\n",
+                           made, SMP_CTL_THREADS);
+            console_excl_end();
+        } else {
+            starve_wait_ms(400u); /* 截止时刻语义,不是 N 次串行 1ms —— 见坑 39 */
+        }
+
+        g_smp_ctl_cpu1_delta = g_percpu[1].switched - sw1_before;
+        g_smp_ctl_cpu0_delta = g_percpu[0].switched - sw0_before;
+
+        /*
+         * ★ 判据必须**非空转** ★
+         *
+         * 第一版这里只判"CPU1 一次都没切" —— 结果在两种"什么都没发生"的
+         * 启动里也报 **DETECTED**:① CPU1 压根没上线(一个不存在的核当然
+         * 一次都没切);② 线程没造出来。这正是本项目反复踩的那类事
+         * (判据看似成立,其实什么都没在测)。
+         *
+         * ⇒ 先要求三件事都成立,再判对照组;否则结论是 **INCONCLUSIVE**:
+         *   相 6 已经证明过 CPU1 会调度 / 这一相真的造出了线程。
+         */
+        if ((g_smp_cpu1_switched_at == 0u) || (made < SMP_CTL_THREADS)) {
+            g_smp_ctl_inconclusive = 1u;
+            g_smp_ctl_detect       = 0u;
+        } else {
+            g_smp_ctl_detect =
+                ((g_smp_ctl_cpu1_delta == 0u) && (g_smp_ctl_cpu0_delta > 0u) &&
+                 (g_smp_assign[1] == 0u))
+                    ? 1u
+                    : 0u;
+        }
+
+        console_excl_begin();
+        console_printf(" Smp-pick A/B: pick_cpu0=1 assign=(%u,%u) ran=(%u,%u)\n", g_smp_assign[0],
+                       g_smp_assign[1], g_smp_ran[0], g_smp_ran[1]);
+        console_printf(" Smp-pick A/B: cpu1 switched=+%u (should be 0)  cpu0 switched=+%u\n",
+                       g_smp_ctl_cpu1_delta, g_smp_ctl_cpu0_delta);
+        if (g_smp_ctl_inconclusive != 0u) {
+            console_printf(" Smp-pick A/B: INCONCLUSIVE(相 6 没证明 CPU1 会调度 —— "
+                           "这个对照组成立不了)\n");
+        } else {
+            console_printf(" Smp-pick A/B: pick-cpu0 -> %s(这就是「另一个核全程闲着」的样子)\n",
+                           g_smp_ctl_detect ? "DETECTED" : "MISSED - not load-bearing");
+        }
+        console_excl_end();
+
+        /* 收拾:开关恢复成生产值(0 = 挑最短队列)*/
+        sched_set_pick_cpu0(0u);
     }
 
     /* ---- 9.7 切换器的破坏性对照组(必须在自检报告**之后**)---- */

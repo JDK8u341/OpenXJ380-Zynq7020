@@ -44,15 +44,145 @@
 #include <arch/timer.h>
 #include <krlibc.h>
 
-/* 每核一个就绪队列。**不放进 percpu_t**:那个结构体要求"不许有指针字段"
- * (宿主与目标的布局必须一致),而 sched_queue_t 里有个 tcb_t。 */
-static sched_queue_t g_runq[PERCPU_MAX_CPUS];
+/*
+ * 每核一个就绪队列。**不放进 percpu_t**:那个结构体要求"不许有指针字段"
+ * (宿主与目标的布局必须一致),而 sched_queue_t 里有个 tcb_t。
+ *
+ * ★ M4-10.4:每核队列各配一把 **irqsave** 锁 ★
+ *
+ *   | 谁 | 在哪 | 为什么必须持锁 |
+ *   |---|---|---|
+ *   | `sched_tick` 的选取 | 中断上下文 | 遍历链表 |
+ *   | `sched_kthread_create` 入队 | 线程上下文 | 改链表 |
+ *   | `sched_ctx_snapshot/restore_all` | 线程上下文(对照组的罩子)| 遍历链表 |
+ *
+ *   ⇒ **必须是 irqsave 锁**:入队在**线程上下文**里发生,而同一个核的
+ *     中断随时可能插进来做选取 —— 普通自旋锁在那里就是**同核自死锁**。
+ *     源 OS 用的是同一个契约(`spin_lock` 会 `cli` 并保存 RFLAGS,
+ *     `include/cpu/lock.h:19-50`),ARM 侧 `spin_lock` 契约相同(`arch/cpu.h:581`)。
+ *
+ *   ⚠ 与源 OS 的一处差别(写清楚):源 OS 除队列锁之外还有一把**全局**
+ *     `scheduler_lock` 罩住 `add_task`/`remove_task`(`scheduler.cpp:530`/`:564`)——
+ *     它防的是"加入"与"摘除"互相竞争。ARM 侧现在**只有加入**
+ *     (线程退出是 M4-11,`remove` 还不存在),所以那把锁暂时**没有第二个用户**;
+ *     不引它,免得变成"看起来像一项机制、其实没人用"的东西(本项目删过两个
+ *     这样的死物,见 D10/D11)。等 M4-11 有 remove 时按源 OS 补上。
+ *
+ *   ⚠ 读**别的核**的队列长度来挑核时**不取那把锁**(源 OS 同样如此,
+ *     它只在自己持有的全局锁下读 `cpui->scheduler_queue->size`):
+ *     `count` 是 u32,读到的要么是旧值要么是新值,两个都对 ——
+ *     这是"尽力而为的负载均衡",不是一致性协议。
+ */
+typedef struct
+{
+    sched_queue_t q;
+    spin_t        lock;
+} kern_runq_t;
 
-static u32 g_switch_count;
+static kern_runq_t g_runq[PERCPU_MAX_CPUS];
 
-/* 启动上下文被注册成的那个 idle TCB(照源 OS)。静态实例:它永远存在 */
-static struct arm_thread_control_block g_boot_idle_tcb;
-static tcb_t                           g_boot_idle;
+/*
+ * ★ M4-10 的选核开关 ★ —— 语义与两个用途见 include/arch/sched.h。
+ * 生产路径恒为 0。
+ */
+static u32 g_pick_cpu0;
+
+void sched_set_pick_cpu0(u32 on)
+{
+    g_pick_cpu0 = on;
+}
+
+static kern_runq_t *runq_of(u32 cpu_id)
+{
+    return (cpu_id < PERCPU_MAX_CPUS) ? &g_runq[cpu_id] : NULL;
+}
+
+static kern_runq_t *self_runq_kern(void)
+{
+    percpu_t *pc = percpu_self();
+
+    return (pc == NULL) ? NULL : runq_of(pc->cpu_id);
+}
+
+/*
+ * ★ 挑一个核放新线程 ← `add_task()` `scheduler.cpp:537-549` ★
+ *
+ *     struct PROCESSOR_INFO *min_cpu = get_cpu(0);
+ *     size_t min_cpu_index = 0;
+ *     if (new_task->task_level != TASK_APPLICATION_LEVEL) {
+ *         for (size_t i = 1; i < get_cpu_num(); i++) {
+ *             struct PROCESSOR_INFO *cpui = get_cpu(i);
+ *             if (cpui != NULL && cpui->scheduler_queue != NULL &&
+ *                 cpui->scheduler_queue->size < min_cpu->scheduler_queue->size) {
+ *                 min_cpu = cpui; min_cpu_index = i;
+ *             }
+ *         }
+ *     }
+ *
+ * 三点逐字照抄:
+ *   - 起点是 **CPU0**,比较是 **严格小于** ⇒ **平局留给核号小的**;
+ *   - `TASK_APPLICATION_LEVEL` **跳过整个扫描** ⇒ 应用级线程永远在 CPU0;
+ *   - 只按"队列长度"挑,没有负载均值、没有周期性均衡(源 OS 全树没有)。
+ *
+ * ⚠ 一处**必须**的加固(不是偏离):跳过**还没就绪**的核。
+ *   源 OS 靠 BSP 等 `scheduler_is_ready == cpu_count`(`main.cpp:581-585`)
+ *   保证所有队列都已建好;ARM 侧同样有那个握手(`online` 蕴含"调度器就绪"),
+ *   但入队路径**自己再查一次**更稳:往一个没人扫的队列里放线程**不会报任何错**,
+ *   只是那个线程永远不跑 —— 而那种"静默"正是本项目最贵的故障类型。
+ */
+static kern_runq_t *pick_runq(i32 task_level)
+{
+    u32 len[PERCPU_MAX_CPUS];
+    u32 rdy[PERCPU_MAX_CPUS];
+    u32 i;
+
+    /* ★ 对照组开关:全塞 CPU0(M4-10 之前的行为)★ */
+    if (g_pick_cpu0 != 0u) {
+        return &g_runq[0];
+    }
+
+    /*
+     * 把"每核队列长度"与"每核就绪"摊成两个数组,交给**纯逻辑层**的
+     * `sched_pick_cpu()` 去挑 —— 那三条语义(严格小于/应用级走 CPU0/
+     * 跳过没就绪的核)于是能在宿主机上穷尽测(§4.5 的分工)。
+     *
+     * ⚠ 读别的核的 `count` **不取那把锁**:源 OS 同样如此(它只在自己持有的
+     *   全局锁下读 `cpui->scheduler_queue->size`)。`count` 是 u32,
+     *   读到的要么是旧值要么是新值,两个都对 —— 这是尽力而为的负载均衡,
+     *   不是一致性协议。
+     */
+    for (i = 0u; i < PERCPU_MAX_CPUS; i++) {
+        len[i] = g_runq[i].q.count;
+        rdy[i] = g_percpu[i].online;
+    }
+    rdy[0] = 1u; /* 本核一定就绪:调用者正在这个核上跑 */
+
+    return &g_runq[sched_pick_cpu(task_level, len, rdy, PERCPU_MAX_CPUS)];
+}
+
+u32 sched_cpu_runq_len(u32 cpu_id)
+{
+    const kern_runq_t *kq = runq_of(cpu_id);
+
+    return (kq == NULL) ? 0u : kq->q.count;
+}
+
+/*
+ * 每核的 idle TCB(照源 OS)。**静态实例**:它们永远存在,不从堆里取。
+ *
+ * - `g_idle[0]` = 启动流程自己(`sched_register_boot_idle`,kmain 调);
+ * - `g_idle[1]` = AP 的启动路径(`sched_register_ap_idle`,cpu1_main 调),
+ *   循环体就是 `while (true) pause` 那个本核主循环。
+ *
+ * ⚠ 源 OS 的 AP idle 是 `alloc_zeroed_tcb()` 从堆里取的(`smp.cpp:152`)。
+ *   ARM 侧用静态实例,理由有两条:
+ *     1. **堆归 CPU0 管**(`g_heap` 由 kmain 绑进 `sched_kern_bind`),而 AP
+ *        在 CPU0 还没走到那一步时就要拿到自己的 idle ⇒ 走堆会引入一个新的
+ *        跨核分配时序问题,而它对这个对象毫无必要(它永不销毁);
+ *     2. BSP 的 idle 本来就是静态实例(M4-8 就是这么做的),两边同构。
+ */
+static struct arm_thread_control_block g_idle_tcb[PERCPU_MAX_CPUS];
+static tcb_t                           g_idle[PERCPU_MAX_CPUS];
 
 /*
  * 启动上下文的丢弃槽 —— **M4-9 起不再需要**。
@@ -109,18 +239,22 @@ void sched_set_current(tcb_t t)
      *
      * ⚠ `t == NULL` 时两个指针必须清 0 —— 汇编拿它当"没有 current,
      *   别碰浮点"的判据(`arch_vfp_save_current` 里的 `bxeq lr`)。
-     *   留着上一次的地址会让 CPU1 或启动早期去写一个不相干的 TCB。
+     *   留着上一次的地址会让另一个核或启动早期去写一个不相干的 TCB。
+     *
+     * ★ M4-10.6:这里**只写每核字段**,不再同步一个全局量 ★
+     *
+     *   原来还写了一个 `g_vfp_save_f`(汇编读它找 `&cur->fpscr`)。那在
+     *   两个核都调度时是错的:CPU0 布的指针会被 CPU1 覆盖 ⇒ CPU0 把
+     *   FPSCR 存进**别人的 TCB**。现在汇编直接读 `cur_vfp_f`,全局量已删。
      */
     if (t == NULL) {
         pc->cur_vfp_d = 0u;
         pc->cur_vfp_f = 0u;
-        g_vfp_save_f  = 0u;
         return;
     }
 
     pc->cur_vfp_d = (u32)(uintptr_t)t->vfp;
     pc->cur_vfp_f = (u32)(uintptr_t)&t->fpscr;
-    g_vfp_save_f  = pc->cur_vfp_f;
 }
 
 /* ------------------------------------------------------------------ */
@@ -133,14 +267,20 @@ void sched_kern_bind(kstack_pool_t *ks, heap_t *heap)
 
 void sched_kern_init(void)
 {
-    percpu_t *pc = percpu_self();
+    percpu_t    *pc = percpu_self();
+    kern_runq_t *kq;
 
     if (pc == NULL) {
         return;
     }
 
-    sched_queue_init(&g_runq[pc->cpu_id]);
-    g_switch_count = 0u;
+    kq = self_runq_kern();
+    if (kq == NULL) {
+        return;
+    }
+
+    sched_queue_init(&kq->q);
+    spin_init(&kq->lock);
 
     /*
      * ★ M4-10.1:计数器在**本核**的每核结构里,所以每个核各调一次本函数、
@@ -252,9 +392,9 @@ u64 sched_off_total_ns(void)
 
 static sched_queue_t *self_runq(void)
 {
-    percpu_t *pc = percpu_self();
+    kern_runq_t *kq = self_runq_kern();
 
-    return (pc == NULL) ? NULL : &g_runq[pc->cpu_id];
+    return (kq == NULL) ? NULL : &kq->q;
 }
 
 tcb_t sched_kthread_create(void (*entry)(void *), void *arg, const char *name)
@@ -262,7 +402,9 @@ tcb_t sched_kthread_create(void (*entry)(void *), void *arg, const char *name)
     struct arm_thread_control_block *t;
     kstack_t                         stk;
     sched_queue_t                   *q;
+    kern_runq_t                     *kq;
     u32                              i;
+    bool                             ok;
 
     if (entry == NULL) {
         return NULL;
@@ -272,6 +414,7 @@ tcb_t sched_kthread_create(void (*entry)(void *), void *arg, const char *name)
     if (q == NULL || g_ks == NULL || g_heap == NULL) {
         return NULL;
     }
+    (void)q; /* M4-10.4 起目标队列由 pick_runq() 挑;本核队列只用于体检 */
 
     t = (tcb_t)heap_alloc(g_heap, (size_t)sizeof(struct arm_thread_control_block));
     if (t == NULL) {
@@ -366,11 +509,34 @@ tcb_t sched_kthread_create(void (*entry)(void *), void *arg, const char *name)
      *     `queue_index` 在侵入式队列里没有对应物,不存;
      *   - `queue_enqueue_ref` → `sched_queue_append`(FIFO 追加)。
      *
-     * ⚠ 源 OS 的 `add_task` 会挑"队列最短的核" —— 那是 M4-10 的事。
+     * ★ M4-10.4:目标队列由 `pick_runq()` 挑(源 OS 的"队列最短的核"),
+     *   而且**起点平均值要在同一把锁里读**:不然读到的平均值与入队后的
+     *   队列对不上,新线程的起点就与"入队那一刻的平均"差了一截 ——
+     *   那种偏差很小、看不出来,但它是错的。
      */
-    sched_entity_init(t, sched_queue_avg_vruntime(q, NULL, 0u), timer_read_ns());
+    kq = pick_runq(t->task_level);
+    if (kq == NULL) {
+        (void)kstack_free(g_ks, &stk);
+        (void)heap_free(g_heap, t);
+        return NULL;
+    }
 
-    if (!sched_queue_append(q, t)) {
+    /*
+     * ← `add_task()` 最后两行:`new_task->cpu_id = min_cpu_index;`
+     *
+     * ⚠ 这个字段在 M4-10 之前**从来没被写过**(TCB 里一直留着 0)。
+     *   它现在是"这个线程被分配给哪个核"的唯一记录 —— 而且因为
+     *   **没有任何迁移机制**(源 OS 就没有,见 §0.5.7),它同时就是
+     *   "它在哪个核上跑过"。判据靠它区分两个核,不能省。
+     */
+    t->cpu_id = (u32)(kq - &g_runq[0]);
+
+    spin_lock(&kq->lock);
+    sched_entity_init(t, sched_queue_avg_vruntime(&kq->q, NULL, 0u), timer_read_ns());
+    ok = sched_queue_append(&kq->q, t);
+    spin_unlock(&kq->lock);
+
+    if (!ok) {
         /* 查重失败说明本模块自己被用错了;回滚而不是留个半成品 */
         (void)kstack_free(g_ks, &stk);
         (void)heap_free(g_heap, t);
@@ -467,7 +633,16 @@ void sched_park_self(void)
 
 u32 sched_switch_count(void)
 {
-    return g_switch_count;
+    /*
+     * ★ M4-10.1:改成本核的每核计数 ★
+     *
+     * 原来这里是一个**跨核共享**的 `g_switch_count++`(两核一起加,还会丢更新)。
+     * 它唯一的读者是 kmain 的"让出"自检 —— 那条判据要的是"**本核**真的切换了
+     * 几次",所以读每核字段才是它本来的意思。
+     */
+    percpu_t *pc = percpu_self();
+
+    return (pc == NULL) ? 0u : pc->switched;
 }
 
 /* ------------------------------------------------------------------ */
@@ -495,7 +670,7 @@ u32 sched_switch_count(void)
 u32 sched_ctx_snapshot_all(arm_task_ctx_t *out, u32 max)
 {
     percpu_t    *pc = percpu_self();
-    sched_queue_t *q;
+    kern_runq_t *kq;
     const tcb_t *link;
     u32          n = 0u;
 
@@ -503,11 +678,17 @@ u32 sched_ctx_snapshot_all(arm_task_ctx_t *out, u32 max)
         return 0u;
     }
 
-    q = &g_runq[pc->cpu_id];
-    for (link = &q->head; *link != NULL && n < max; link = &(*link)->sched_next) {
+    kq = runq_of(pc->cpu_id);
+    if (kq == NULL) {
+        return 0u;
+    }
+
+    spin_lock(&kq->lock);
+    for (link = &kq->q.head; *link != NULL && n < max; link = &(*link)->sched_next) {
         out[n] = (*link)->ctx;
         n++;
     }
+    spin_unlock(&kq->lock);
 
     return n;
 }
@@ -515,7 +696,7 @@ u32 sched_ctx_snapshot_all(arm_task_ctx_t *out, u32 max)
 void sched_ctx_restore_all(const arm_task_ctx_t *in, u32 n)
 {
     percpu_t      *pc = percpu_self();
-    sched_queue_t *q;
+    kern_runq_t   *kq;
     const tcb_t   *link;
     u32            i = 0u;
 
@@ -523,16 +704,25 @@ void sched_ctx_restore_all(const arm_task_ctx_t *in, u32 n)
         return;
     }
 
-    q = &g_runq[pc->cpu_id];
-    for (link = &q->head; *link != NULL && i < n; link = &(*link)->sched_next) {
-        /*
-         * ⚠ 按**遍历顺序**配对,不按身份匹配 —— 因为对照组的硬件性前提是
-         *   "这段窗口里没有线程被创建或销毁"。真被破坏了,错配也是静默的;
-         *   所以两个函数都只走队列、不分配、不加锁,窗口内不会有别的写者。
-         */
+    kq = runq_of(pc->cpu_id);
+    if (kq == NULL) {
+        return;
+    }
+
+    /*
+     * ⚠ 按**遍历顺序**配对,不按身份匹配 —— 因为对照组的硬件性前提是
+     *   "这段窗口里没有线程被创建或销毁"。真被破坏了,错配也是静默的;
+     *   所以两个函数都只走队列、不分配,窗口内不会有别的写者。
+     *
+     * ⚠ M4-10 起**要取锁**:另一个核可能正在往这个队列里放线程
+     *   (`pick_runq` 会挑到本核的队列)。
+     */
+    spin_lock(&kq->lock);
+    for (link = &kq->q.head; *link != NULL && i < n; link = &(*link)->sched_next) {
         (*link)->ctx = in[i];
         i++;
     }
+    spin_unlock(&kq->lock);
 }
 
 /* ------------------------------------------------------------------ */
@@ -669,13 +859,13 @@ void sched_register_boot_idle(void)
 {
     u32 i;
 
-    memset(&g_boot_idle_tcb, 0, sizeof(g_boot_idle_tcb));
+    memset(&g_idle_tcb[0], 0, sizeof(g_idle_tcb[0]));
 
-    g_boot_idle_tcb.task_level   = TASK_IDLE_LEVEL;
-    g_boot_idle_tcb.status       = RUNNING;
-    g_boot_idle_tcb.kernel_stack = arch_read_sp(); /* 当前 sp,不另取栈 */
-    g_boot_idle_tcb.ctx.sp       = arch_read_sp();
-    g_boot_idle_tcb.ctx.pc       = 0u; /* ★ 0 = 上下文无效(第一次切走前)★ */
+    g_idle_tcb[0].task_level   = TASK_IDLE_LEVEL;
+    g_idle_tcb[0].status       = RUNNING;
+    g_idle_tcb[0].kernel_stack = arch_read_sp(); /* 当前 sp,不另取栈 */
+    g_idle_tcb[0].ctx.sp       = arch_read_sp();
+    g_idle_tcb[0].ctx.pc       = 0u; /* ★ 0 = 上下文无效(第一次切走前)★ */
     /*
      * ⚠ cpsr 必须写成内核的规范 CPSR(见 arch/taskctx.h 的 ARM_CPSR_KERNEL)。
      *
@@ -687,15 +877,15 @@ void sched_register_boot_idle(void)
      *   0x80000153)。所以它只在"被第一次切走之前"这一段有效,
      *   而恰好就是那一段需要它(A/T/模式位要能过 `sched_ctx_switchable`)。
      */
-    g_boot_idle_tcb.ctx.cpsr    = ARM_CPSR_KERNEL;
-    g_boot_idle_tcb.owns_kstack = false; /* 它就是启动栈,不归栈池管 */
-    for (i = 0; i < sizeof(g_boot_idle_tcb.name) - 1u && "idle"[i] != '\0'; i++) {
-        g_boot_idle_tcb.name[i] = "idle"[i];
+    g_idle_tcb[0].ctx.cpsr    = ARM_CPSR_KERNEL;
+    g_idle_tcb[0].owns_kstack = false; /* 它就是启动栈,不归栈池管 */
+    for (i = 0; i < sizeof(g_idle_tcb[0].name) - 1u && "idle"[i] != '\0'; i++) {
+        g_idle_tcb[0].name[i] = "idle"[i];
     }
-    sched_entity_init(&g_boot_idle_tcb, 0u, timer_read_ns());
+    sched_entity_init(&g_idle_tcb[0], 0u, timer_read_ns());
 
-    g_boot_idle = &g_boot_idle_tcb;
-    sched_set_current(g_boot_idle);
+    g_idle[0] = &g_idle_tcb[0];
+    sched_set_current(g_idle[0]);
 
     /*
      * ★ idle **要进就绪队列**(照源 OS)★
@@ -711,16 +901,106 @@ void sched_register_boot_idle(void)
      * ⇒ 队列化之后它是"名册上的一员、但不是候选",正是源 OS 的语义,
      *   而且 `queue_average_vruntime` 也按"候选才计入"处理它(不计入)。
      */
-    if (!sched_queue_append(&g_runq[0], g_boot_idle)) {
+    if (!sched_queue_append(&g_runq[0].q, g_idle[0])) {
         /* 队列为空且 idle 是新对象,插不进去只可能是本模块被用错了 */
-        g_boot_idle = NULL;
+        g_idle[0] = NULL;
         sched_set_current(NULL);
     }
 }
 
 tcb_t sched_boot_idle(void)
 {
-    return g_boot_idle;
+    return g_idle[0];
+}
+
+tcb_t sched_idle_of(u32 cpu_id)
+{
+    return (cpu_id < PERCPU_MAX_CPUS) ? g_idle[cpu_id] : NULL;
+}
+
+/*
+ * ★ M4-10.2:AP 的 idle —— 形状与 BSP 版逐条对应,只是**由 AP 自己注册** ★
+ *
+ * ← `smp.cpp:152-181`:
+ *     apu_idle = alloc_zeroed_tcb();
+ *     apu_idle->task_level   = TASK_IDLE_LEVEL;
+ *     apu_idle->kernel_stack = apu_idle->context0.rsp = get_rsp();
+ *     apu_idle->cpu_id       = lapic_id();
+ *     apu_idle->status       = RUNNING;
+ *     scheduler_init_task(apu_idle);            // ← base_vruntime = 0
+ *     info->current_task     = apu_idle;
+ *     queue_enqueue_ref(info->scheduler_queue, apu_idle, &apu_idle->sched_node);
+ *     scheduler_is_ready++;
+ *     ...
+ *     while (true) { asm volatile("pause"); }   // ← 这就是本核主循环
+ *
+ * ## ★ 一处必须纠正的旧说法(计划里写错过,依据在 `scheduler.cpp:358`)★
+ *
+ * 计划原来写"AP 的 idle 只被切走、不被切回"。**那是错的**:
+ *
+ *     tcb_t result = best != NULL ? best : (is_current_task_runnable(current) ? current : idle);
+ *
+ * `is_task_schedulable()` 把 idle 排除在候选之外(`:178`),所以 `idle`
+ * **只能**从这条兜底链进来 —— 它的用途正是"本核没有可运行线程时回到 idle"。
+ * 也就是说 idle 的 `ctx.pc` 在第一次被切走时就被现场帧填成非 0,
+ * 从此它是一个**可恢复的普通上下文**,最后一个线程挂起之后本核会**切回它**。
+ *
+ * 按错的断言实现,AP 会在最后一个线程挂起后卡在那个已挂起的线程上
+ * (该核永久停摆,而另一个核看起来一切正常)—— 这正是"断言要回源 OS 核"的
+ * 又一个实例。
+ */
+void sched_register_ap_idle(void)
+{
+    percpu_t    *pc = percpu_self();
+    kern_runq_t *kq;
+    tcb_t        t;
+    u32          i;
+
+    if (pc == NULL || pc->cpu_id == 0u) {
+        /* 只有 AP 走这条路;BSP 的 idle 是"启动上下文自己",两件事不能混 */
+        return;
+    }
+
+    kq = runq_of(pc->cpu_id);
+    if (kq == NULL) {
+        return;
+    }
+
+    t = &g_idle_tcb[pc->cpu_id];
+    memset(t, 0, sizeof(*t));
+
+    t->task_level   = TASK_IDLE_LEVEL;
+    t->status       = RUNNING;
+    t->kernel_stack = arch_read_sp(); /* 本核当前 sp —— 就是本核的启动栈 */
+    t->ctx.sp       = arch_read_sp();
+    t->ctx.pc       = 0u; /* ★ 0 = 上下文无效(第一次切走前)★ */
+    t->ctx.cpsr     = ARM_CPSR_KERNEL;
+    t->owns_kstack  = false; /* 它就是本核的启动栈,不归栈池管 */
+
+    for (i = 0u; i < sizeof(t->name) - 1u && "idle1"[i] != '\0'; i++) {
+        t->name[i] = "idle1"[i];
+    }
+
+    /* ← `scheduler_init_task(apu_idle)`:起点 vruntime = 0(不是队列平均值)*/
+    sched_entity_init(t, 0u, timer_read_ns());
+
+    g_idle[pc->cpu_id] = t;
+    sched_set_current(t);
+
+    /*
+     * ★ 进本核队列(照源 OS)★
+     *
+     * 与 BSP 版同样的理由:它是"名册上的一员、但不是候选" ——
+     * `sched_task_schedulable()` 排除 idle,只有兜底链才用它。
+     */
+    spin_lock(&kq->lock);
+    if (!sched_queue_append(&kq->q, t)) {
+        spin_unlock(&kq->lock);
+        g_idle[pc->cpu_id] = NULL;
+        sched_set_current(NULL);
+        return;
+    }
+    spin_unlock(&kq->lock);
 }
 
 /* ------------------------------------------------------------------ */
@@ -821,6 +1101,7 @@ arm_exc_frame_t *sched_tick(arm_exc_frame_t *frame)
     tcb_t           next;
     percpu_t       *pc;
     arm_exc_frame_t *nf;
+    kern_runq_t     *kq;
 
     if (frame == NULL) {
         return frame;
@@ -841,21 +1122,23 @@ arm_exc_frame_t *sched_tick(arm_exc_frame_t *frame)
     }
 
     /*
-     * ⚠ M4-10 之前**只有 CPU0 参与调度**。
+     * ★ M4-10.3:拆掉 CPU0 护栏(D6 结案)★
      *
-     * CPU1 的 1kHz 私有定时器同样会进这里,而 `g_runq[1]` 从来没被
-     * `sched_kern_init()` 碰过(那是 CPU0 在启动时调的),`g_boot_idle`
-     * 更是 **CPU0 的对象** —— 放 CPU1 走过去,它会去恢复 CPU0 的 idle 现场,
-     * 也就是**两个核同时往同一个上下文里塞现场**。
-     * 那是双核阶段典型的一类崩溃,而且现象与"内存坏了"几乎一样。
+     * M4-9 到 M4-9.5 期间这里有 `if (pc->cpu_id != 0u) return frame;` ——
+     * 那时的理由是真的:`g_runq[1]` 从来没被初始化过,`g_idle[0]` 更是
+     * **CPU0 的对象**,放 CPU1 过去它会去恢复 CPU0 的 idle 现场 ⇒
+     * **两个核同时往同一个上下文里塞现场**(双核阶段典型的一类崩溃,
+     * 现象与"内存坏了"几乎一样)。
      *
-     * 每个核一份队列 + 每核自己的 idle 是 M4-10 的事。
+     * 现在那三个前提都没了:
+     *   - 每个核有自己的 `g_runq[cpu]`(`sched_kern_init` 由本核自己调);
+     *   - 每个核有自己的 idle(`sched_register_boot_idle` / `_ap_idle`);
+     *   - `current_task` / `scheduler_ticks` / 三个计数器都在 `percpu_t` 里;
+     *   - VFP 的两个指针也按核取(10.6)。
+     * ⇒ 本函数现在对两个核都是同一段代码,与源 OS 的 `timer_handle` 一致。
      */
-    if (pc->cpu_id != 0u) {
-        return frame;
-    }
-
-    q   = &g_runq[pc->cpu_id];
+    kq  = runq_of(pc->cpu_id);
+    q   = (kq == NULL) ? NULL : &kq->q;
     cur = sched_current();
 
     /*
@@ -863,8 +1146,11 @@ arm_exc_frame_t *sched_tick(arm_exc_frame_t *frame)
      *
      * 没有"从哪来"可收:放过去就会挑一个线程切走,而启动上下文的 ctx
      * 从头到尾没人填过 —— 它被永久丢掉,kmain 再也回不来。
+     *
+     * ⚠ AP 在 `sched_register_ap_idle()` 之前就是这个状态(它的中断在
+     *   `irq_global_enable()` 之后就已经来了),所以这条早退对 AP 也是必需的。
      */
-    if (cur == NULL) {
+    if (cur == NULL || q == NULL) {
         return frame;
     }
 
@@ -899,8 +1185,21 @@ arm_exc_frame_t *sched_tick(arm_exc_frame_t *frame)
      * 睡眠任务留在队列里等着被扫到 —— 这就是 `sched_sleep_ns` 能醒的原因。
      *
      * 时钟由这里传进去(本层是纯逻辑,宿主上要能构造"过了 3ms")。
+     *
+     * ★ M4-10.4:整段选取在**本核队列的锁**里做 ★
+     *
+     * 源 OS 的 `select_next_task_safe()` 就是这样:进函数先
+     * `spin_lock(&queue->lock)`,连平均值扫描一起罩住(`scheduler.cpp:325-360`)——
+     * 因为**另一个核可能正在往这个队列里放线程**(`pick_runq` 会挑到它)。
+     *
+     * ⚠ 锁的持有范围到"选出是谁"为止,`sched_frame_for` / 搬帧在锁外 ——
+     *   与源 OS 一致(`change_proccess` 在 `spin_unlock` 之后)。
+     *   本移植里没有任何路径会**摘除**队列节点(D14/M4-11),所以选出来的
+     *   目标在锁外也不会消失。
      */
+    spin_lock(&kq->lock);
     next = sched_select_next(q, cur, timer_read_ns());
+    spin_unlock(&kq->lock);
 
     if (next == NULL || next == cur) {
         pc->scheduler_ticks = 0u;
@@ -988,7 +1287,6 @@ arm_exc_frame_t *sched_tick(arm_exc_frame_t *frame)
 
     sched_set_current(next);
     pc->scheduler_ticks = 0u;
-    g_switch_count++;
     pc->switched++;
     if (cur->task_level != TASK_IDLE_LEVEL) {
         pc->preempted++;
@@ -1009,7 +1307,6 @@ arm_exc_frame_t *sched_tick(arm_exc_frame_t *frame)
     if (g_reloc_skip != 0u) {
         pc->cur_vfp_d = 0u;
         pc->cur_vfp_f = 0u;
-        g_vfp_save_f  = 0u;
         return frame;
     }
 

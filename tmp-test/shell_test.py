@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 XSDC = r"C:\AMDDesignTools\2025.2\Vitis\bin\xsdb.bat"
 LOAD_TCL = ROOT / "tmp-test" / "jtag" / "run_kernel_uart.tcl"
 
-PROMPT = "> "
+PROMPT = "\n> "
 
 
 def open_port(port: str, baud: int):
@@ -58,6 +58,31 @@ def drain(handle, seconds: float) -> str:
 def send(handle, text: str) -> None:
     handle.write((text + "\r").encode("ascii"))
     handle.flush()
+
+
+def drain_until(handle, needles: list[str], deadline_s: float) -> str:
+    """读到**该出现的片段全出现**为止,或者到点为止。
+
+    ⚠ 为什么不是"读固定一段时间":9600 波特下一行要 60~80ms,而
+    `ver`/`dump` 这类命令的回显是好几十行 —— 固定窗口必然截断。
+    而且 M4-8.4 之后**串口有两个写者**(1Hz 状态行),固定窗口还会读到
+    "上一条命令的尾巴",于是判据看起来像"回显不对",其实只是没读完。
+    """
+    end = time.time() + deadline_s
+    chunks = bytearray()
+
+    while time.time() < end:
+        try:
+            data = handle.read(512)
+        except Exception:  # noqa: BLE001
+            break
+        if data:
+            chunks.extend(data)
+            text = chunks.decode("utf-8", errors="replace")
+            if all(n in text for n in needles):
+                break
+
+    return chunks.decode("utf-8", errors="replace")
 
 
 class Case:
@@ -126,10 +151,22 @@ def main() -> int:
             timeout=300,
         )
 
-    # 等命令通道就绪。横幅 + 自检报告大约 3~4 秒
-    boot = drain(handle, 8.0)
+    # 等命令通道就绪。
+    #
+    # ⚠ 这里原来是 `drain(handle, 8.0)` + "横幅 + 自检报告大约 3~4 秒" —— 
+    #   那个数字是 **M3-7 写的**,此后每一阶段都让它更远:
+    #     M4 各相的内核线程与自检项、M4-8.4 的 1Hz 状态行、
+    #     M4-8.5 的无饥饿相、M4-10 的两核相与对照组……
+    #   到 M4-10 时,**报告本身就有 81 行** × 60~80ms ≈ 6 秒,
+    #   加上各相与对照组,加载完成到提示符要 **二十多秒**。
+    #   8 秒窗口于是必然失败,而失败信息("等不到命令提示符,内核可能没跑到
+    #   那一步")会把人往**错的方向**带 —— 实测就是这么误导了我一轮。
+    #
+    #   ⇒ 改成"一直等到提示符出现,上限 60 秒"。判据本身没变松:
+    #     它仍然是"提示符必须出现",只是不再用一个过期的常数猜它什么时候出现。
+    boot = drain_until(handle, [PROMPT], 60.0)
     if PROMPT not in boot:
-        print("错误: 等不到命令提示符,内核可能没跑到那一步", file=sys.stderr)
+        print("错误: 60 秒内等不到命令提示符,内核可能真的没跑到那一步", file=sys.stderr)
         print(boot[-2000:], file=sys.stderr)
         return 1
 
@@ -139,7 +176,9 @@ def main() -> int:
     for case in CASES:
         label = case.line if case.line else "(空行)"
         send(handle, case.line)
-        reply = drain(handle, case.wait)
+        # 读到"该出现的片段都出现"为止;上限取 max(wait, 8s) ——
+        # 9600 波特下几十行回显本身就要好几秒
+        reply = drain_until(handle, case.must_contain, max(case.wait, 8.0))
 
         missing = [needle for needle in case.must_contain if needle not in reply]
         status = "PASS" if not missing else "FAIL"
