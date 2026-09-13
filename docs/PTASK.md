@@ -80,7 +80,8 @@
 
 ```
 内核线程入口 return
-   → process_exit()                      pcb.cpp:494-505   ← 每根内核线程栈上压的返回地址
+   → process_exit()                      pcb.cpp:494-505   ← create_kernel_thread 压在
+                                                              每根线程栈上的返回地址（pcb.cpp:2237）
         write_serial_string("Kernel thread exit, Code: ")   pcb.cpp:498
         kill_thread(get_current_task())                     pcb.cpp:501
         open_interrupt; while (true) hlt;                   pcb.cpp:502-504
@@ -89,6 +90,10 @@
         task->status = DEATH;                                                          :456
         // kill_thread0(task);   ← ★ 注释掉的 ★（注释自述「要用的解耦，但可能要加锁」）   :457
 ```
+
+⚠ 补一个精度:`process_exit()` 也被**用户线程的建栈失败路径**直接调用
+（`pcb.cpp:732` / `751` / `758`,都在 `switch_task_to_user_mode` 里）——
+也就是说它是"**这个线程到此为止**"的通用入口,不只服务内核线程的 return。
 
 **第二段（释放，由**别人**做）**：
 
