@@ -81,6 +81,20 @@ typedef struct
      * 取用处统一走 `percpu_task_ptr()` 做转换,不要到处写强制转换。
      */
     u32 current_task;
+
+    /*
+     * ---- 调度器状态(M4-8)----
+     *
+     * ⚠ 这三项也必须是**定宽或 u32 地址**,不能是指针:
+     *   本结构体的宿主机布局必须与目标板一致,理由见上面那条规则。
+     *   就绪队列的首节点于是存 **TCB 的地址**而不是指针。
+     *
+     * `scheduler_ticks` 是 64 位累加量(u64 在两个平台上都是 8 字节对齐),
+     * 所以它不破坏这条不变式。
+     */
+    u32 sched_head;      /* 就绪队列首节点的 TCB 地址;0 = 空队列 */
+    u32 sched_count;     /* 队列长度(与链表互为校验:一个是另一个的派生量)*/
+    u64 scheduler_ticks; /* 本核已调度的 tick 数(诊断用)*/
 } percpu_t;
 
 /* 把 current_task 取成 tcb_t。集中在一处,避免散落的强制转换 */
@@ -97,6 +111,24 @@ struct arm_thread_control_block;
  */
 _Static_assert(offsetof_arm(percpu_t, current_task) == ARM_PERCPU_OFF_CURRENT_TASK,
                "current_task 的偏移变了 —— 同步改 arch/taskctx_asm.h 的 ARM_PERCPU_OFF_CURRENT_TASK");
+
+/*
+ * ★ 布局不变式:本结构体里**不能出现指针宽度的字段** ★
+ *
+ * 宿主的指针是 8 字节、目标是 4 字节;只要有一个,宿主上的偏移就与目标不同 ——
+ * 而"在宿主机上验证汇编用的偏移"正是本项目对 M4-6 定下的做法。
+ * 所以下面这几条断言不只是钉数值,它们钉的是**这条不变式仍然成立**:
+ * sizeof 必须等于"全部字段按 u32 排下来"的结果。
+ */
+_Static_assert(offsetof_arm(percpu_t, sched_head) == ARM_PERCPU_OFF_CURRENT_TASK + 4u,
+               "sched_head 紧跟 current_task —— 中间多出字段说明有人插了东西");
+_Static_assert(offsetof_arm(percpu_t, sched_count) == ARM_PERCPU_OFF_CURRENT_TASK + 8u,
+               "sched_count 紧跟 sched_head");
+_Static_assert(offsetof_arm(percpu_t, scheduler_ticks) == 56u,
+               "scheduler_ticks 应当 8 字节对齐到 56");
+_Static_assert(sizeof(percpu_t) == 64u,
+               "sizeof(percpu_t) 不是 64 —— 多半是有人加了指针/uintptr_t 字段,"
+               "那会让宿主与目标的布局分叉");
 
 extern percpu_t g_percpu[PERCPU_MAX_CPUS];
 

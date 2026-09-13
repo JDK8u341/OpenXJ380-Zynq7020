@@ -199,8 +199,17 @@ int main(void)
          * 一旦有人往 percpu_t 里塞指针或 uintptr_t,这条会立刻失败,
          * 提醒他"宿主上验的偏移不再等于目标偏移"。
          */
-        CHECK(sizeof(percpu_t) == ARM_PERCPU_OFF_CURRENT_TASK + 4u);
-        CHECK(sizeof(percpu_t) % 4u == 0u);
+        /*
+         * ★ 布局不变式的判据:sizeof 必须等于"全部字段按 u32/u64 排下来"的结果 ★
+         *   只要有人往里塞指针或 uintptr_t,宿主上这个数就会变大 ——
+         *   而"宿主验的偏移就是目标偏移"这条前提随即失效。
+         */
+        CHECK(sizeof(percpu_t) == 64u);
+        CHECK(offsetof_arm(percpu_t, sched_head) == ARM_PERCPU_OFF_CURRENT_TASK + 4u);
+        CHECK(offsetof_arm(percpu_t, sched_count) == ARM_PERCPU_OFF_CURRENT_TASK + 8u);
+        CHECK(offsetof_arm(percpu_t, scheduler_ticks) == 56u);
+        CHECK(sizeof(((percpu_t *)0)->sched_head) == 4u);
+        CHECK(sizeof(((percpu_t *)0)->scheduler_ticks) == 8u);
         /* 地址字段是 u32,不是 uintptr_t —— 后者在宿主上是 8 字节 */
         CHECK(sizeof(((percpu_t *)0)->stack_top) == 4u);
         CHECK(sizeof(((percpu_t *)0)->current_task) == 4u);

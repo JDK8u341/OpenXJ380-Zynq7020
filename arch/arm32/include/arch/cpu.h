@@ -409,21 +409,42 @@ static inline void arch_dcache_clean_invalidate_mva(uintptr_t va)
     __asm__ volatile("mcr p15, 0, %0, c7, c14, 1" ::"r"(va) : "memory");
 }
 
-/* ------------------------------------------------------------------ */
-/* 自旋锁                                                               */
-/* ------------------------------------------------------------------ */
-
 /*
- * ARMv7 用 LDREX/STREX 独占访问实现,而 x86 用 lock 前缀。
- * Cortex-A9 是弱内存序,解锁后必须 DMB 才能保证临界区访存
- * 对下一个持锁者可见 —— 这是与 include/cpu/lock.h 最大的语义差异。
+ * ★ 中断状态是**锁的一部分**,不是调用方另拿一个变量 ★
+ *
+ * x86 的 `spin_t`(`include/cpu/lock.h:7-10`)里有一个 `rflags` 字段:
+ * `spin_lock()` 自己把中断状态存进去并关中断,`spin_unlock()` 自己恢复 ——
+ * 调用方**不需要**记住任何东西。ARM 侧必须沿用同一个契约,
+ * 否则所有调用点都要改(§4.7 的 A4/A5 两条)。
+ *
+ * ⚠ 与 x86 的实际差异只在"存什么":x86 存 RFLAGS(64 位,其中 IF 位才是关键),
+ *   ARM 存 CPSR 的控制域(32 位,I/F 位才是关键)。契约相同,载体不同 ——
+ *   所以字段名也叫 `cpsr` 而不是 `rflags`,别假装两边一样。
  */
 typedef struct
 {
     volatile u32 locked;
+    u32          cpsr; /* 持锁期间应当恢复的中断状态(不透明令牌)*/
 } spin_t;
 
-#define SPIN_INIT {0}
+/* 静态初始化。两个字段都要给:只给 locked 会让 cpsr 是 0 ——
+ * 而 0 在 CPSR 里表示"中断全开 + User 模式",恢复它会把核心拖进用户态。*/
+#define SPIN_INIT {0, 0}
+
+/* ← x86 `spin_init()` `lock.h:15` */
+static inline void spin_init(spin_t *lock)
+{
+    lock->locked = 0u;
+    lock->cpsr   = 0u;
+}
+
+/* ← x86 `barrier()` `lock.h:95`:两侧都要 —— 编译器屏障管重排,
+ *   DSB 管硬件访存完成顺序(ARMv7 是弱内存序,x86 不是)*/
+static inline void barrier(void)
+{
+    __asm__ volatile("" ::: "memory");
+    arch_dsb();
+}
 
 /*
  * 独占访问原语。
@@ -445,7 +466,9 @@ static inline u32 arch_strex(u32 value, volatile u32 *addr)
     return result;
 }
 
-static inline void spin_lock(spin_t *lock)
+/* 只自旋,不碰中断状态 —— 给"调用方已经关了中断"的场合用。
+ * ← x86 `spin_lock_no_irqsave()` `lock.h:52` */
+static inline void spin_lock_no_irqsave(spin_t *lock)
 {
     u32 expected;
 
@@ -465,24 +488,42 @@ static inline void spin_lock(spin_t *lock)
     arch_dmb();
 }
 
-static inline void spin_unlock(spin_t *lock)
+/* 只释放,不恢复中断状态 ← x86 `spin_unlock_no_irqstore()` `lock.h:85` */
+static inline void spin_unlock_no_irqstore(spin_t *lock)
 {
     /* 释放屏障:保证临界区访存先于解锁可见 */
     arch_dmb();
-    lock->locked = 0;
+    lock->locked = 0u;
     arch_dsb();
 }
 
-/* 关中断版自旋锁:用于中断上下文可能竞争的临界区 */
-static inline u32 spin_lock_irqsave(spin_t *lock)
+/*
+ * 加锁:(1) 先把当前中断状态存进锁里 (2) 关中断 (3) 再自旋。
+ *
+ * ⚠ 顺序不能反。"先关中断再自旋"看起来更自然,但那样自旋期间的中断状态
+ *   就没被保存 —— 解锁时也就无从恢复,只能一律开中断,
+ *   于是"调用方本来就关着中断"的嵌套情形会被破坏。
+ */
+static inline void spin_lock(spin_t *lock)
 {
-    u32 flags = arch_irq_save();
-    spin_lock(lock);
-    return flags;
+    lock->cpsr = arch_irq_save(); /* 保存并关中断 */
+    spin_lock_no_irqsave(lock);
 }
 
-static inline void spin_unlock_irqrestore(spin_t *lock, u32 flags)
+/*
+ * 解锁:恢复加锁时保存的中断状态。
+ *
+ * ★ 必须在**释放锁之前**把 cpsr 读出来 ★
+ *
+ * 这是 x86 侧特意写了一句注释的地方(`include/cpu/lock.h:67-68`)。
+ * 原因:一旦 `locked` 被清零,另一个核可以立刻拿到锁,并把它**自己的**
+ * 中断状态写进同一个 `cpsr` 字段;这时再去读,恢复的就是别人的状态 ——
+ * 本核的中断可能被错误地重新打开,而临界区其实还没退出干净。
+ */
+static inline void spin_unlock(spin_t *lock)
 {
-    spin_unlock(lock);
+    u32 flags = lock->cpsr; /* ★ 先读,再放锁 ★ */
+
+    spin_unlock_no_irqstore(lock);
     arch_irq_restore(flags);
 }
