@@ -2073,10 +2073,10 @@ switched=30 preempted=27 invalid=0
 | D5 | **`is_task_schedulable` 省掉了 `parent_group` 两条** | `src/sched.c` | 内核对线程还没有进程组（M7 才有） | M7。照抄会让**每一个**线程都不可调度（`parent_group == NULL`），所以只能先省 |
 | D6 | **`sched_tick` 里的 CPU0 护栏** | `src/sched_kern.c` | `g_runq[1]` 与 CPU1 的 idle 都还没建，放 CPU1 过去会两个核同时往一个上下文里塞现场 | **M4-10**（每核队列 + 每核 idle）|
 | D7 | **异常帧可能不是 8 字节对齐** | `boot/vectors.S` 的 `EXC_FRAME_ENTER` | 本板实测扛得住（被拒绝那一轮里 `sched_tick` 在 4-mod-8 的 SP 上跑了 3 万多次没出错）| 需要时。根治要把帧从 16 字加宽到 18 字、把原始 SP 存进帧里。用 `irq_frame_unaligned8` 量出的规模（一轮 **20** 次）决定值不值得做 |
-| ★ D8 ★ | ★★ **VFP 上下文根本没保存/恢复** ★★ | **全树零条 VFP 传输指令**；`TCB.vfp[64]`/`fpscr` 是**死字段** | **不成立 —— 这是活 bug 的引信，不是"暂时够用"** | **现在就欠着**：源 OS 每次 `change_proccess` 都做 `save_fpu_context`/`restore_fpu_context`（`scheduler.cpp:121-122`）。M4-9 之前切换是罕见的主动行为，M4-9 之后是**每 4ms 一次的非自愿抢占** —— 暴露面从理论变成现实。内核是硬浮点编译的，任何线程里一个 `double` 局部变量就够触发，而症状是**算错数，不是崩** |
-| D9 | **`runtime_ticks` 从不累加** | `src/sched.c:149` 只清 0 | 没有读者 | 源 OS 每个 tick `__atomic_fetch_add(&current->runtime_ticks, 1ULL, …)`（`scheduler.cpp:398`）。等 procfs / 记账要用它时补 |
-| D10 | **`sched_tick_account()` 成了死函数** | `src/sched_kern.c:444` | — | M4-8 的遗留物：M4-9 把计费并进了 `sched_tick`。要么删、要么标注"仅调试用" |
-| D11 | **`SCHED_MAX_SWITCHES_TRACKED` 成了死宏** | `include/arch/sched.h:252` | — | 同上，M4-9 重写 `sched_switch_count` 的用法后没人引用了 |
+| ~~D8~~ | ~~**VFP 上下文根本没保存/恢复**~~ | — | — | **已结案(M4-9.5,`53da560`)**。见下面「VFP 现场:补账」一节 —— 判据在板上成立(65/0),且有破坏性 A/B |
+| ~~D9~~ | ~~**`runtime_ticks` 从不累加**~~ | — | — | **已清(M4-9.5)**：照源 OS `scheduler.cpp:398` 每 tick 加一 |
+| ~~D10~~ | ~~**`sched_tick_account()` 成了死函数**~~ | — | — | **已删(M4-9.5)** |
+| ~~D11~~ | ~~**`SCHED_MAX_SWITCHES_TRACKED` 成了死宏**~~ | — | — | **已删(M4-9.5)** |
 | D12 | **就绪队列无锁** | `src/sched.h` 的 `sched_queue_t` | 单核；只有 CPU0 碰它 | **M4-10**。源 OS 用带自旋锁的 `lock_queue`。每核化之后要么每核一把锁、要么走无锁（`sched_next` 是侵入式的，天然适合）|
 | ~~D3~~ | ~~内核用硬浮点编译~~ | — | — | **已结案：不是退化，是照源 OS 的设计。** 见下方「FP 上下文」一节 |
 
@@ -2128,16 +2128,76 @@ d0–d31 —— 而症状是**算出错的数**，不是崩溃。
 
 ⇒ 修法（照源 OS 的形状）：在 `boot/context.S` 加
 `arch_vfp_save(u32 *d, u32 *fpscr)` / `arch_vfp_restore(const u32 *d, u32 fpscr)`
-（`vstmia`/`vldmia` 存取 d0–d31、`vmrs`/`vmsr` 读写 FPSCR），
-在 `sched_tick` 的搬帧那一段调用 —— **不能放进 `sched_ctx_from_frame`**，
-那是纯逻辑层、宿主可测，一旦碰 VFP 就不能在宿主上跑了。
-验收判据：两个线程各自用 `double` 累加一个已知数列并核对结果，
-再把保存/恢复关掉做 A/B（应当算错）。
-之前倾向它是因为那样能省掉内核 FP 上下文，但那是**为了省事而改设计**，
-与 B5"两个架构共用同一套契约"直接冲突。
+（`vstmia`/`vldmia` 存取 d0–d31、`vmrs`/`vmsr` 读写 FPSCR）。
+**但调用点不在 `sched_tick` 的搬帧那一段** —— 见下面 M4-9.5 那一节，
+那里把"为什么不能在 C 链里做"查清楚了。
 
-实现位置：M4-6（TCB 结构）定型后，M4-7（上下文切换）里加上
-`fpu_save`/`fpu_restore` 两个原语与切换点的调用。**新增一处，就得进这张表。**
+### VFP 现场：补账（M4-9.5，`53da560`）
+
+**结论：已补上，板上 65/0，并且有破坏性 A/B 证明它承重。**
+
+#### 放在哪 —— 这个决定是查出来的，不是顺手选的
+
+直觉做法是在 `sched_tick` 的搬帧那一段调 `arch_vfp_save/restore`。
+**不行**，理由是实测出来的：
+
+> GCC 在**本内核里**已经用 `vldr d16,[pc]; vstr d16,[rN]` 这个
+> **64 位清零惯用法**（`palloc_selftest` / `percpu_table_reset` /
+> `sched_entity_init` / `smp_release_cpu1` 四处都在用），
+> 而 `sched_tick` 里那句 `pc->scheduler_ticks = 0u` 正是"64 位存零" ——
+> 今天编成两条整数 store，**换个版本或改一行就可能变成上面那个惯用法**。
+
+一旦那条链上任何一处碰了浮点寄存器，恢复完 next 的现场之后就会被它的尾声
+（`vpop {d8-d15}` 之类）踩掉 —— 而**其余部分全是对的**。
+
+⇒ 存与取都放进汇编，**卡在 C 的两端**：
+
+```
+_vec_irq:
+    EXC_FRAME_ENTER                @ 帧已建好
+    bl  arch_vfp_save_current      @ ★ 任何 C 之前 ★
+    mov r0, sp
+    bl  c_irq_handler              @ 这一整段爱怎么用 VFP 就怎么用
+    mov sp, r0
+    bl  arch_vfp_restore_current   @ ★ 所有 C 返回之后 ★
+    EXC_FRAME_LEAVE                @ 之后只剩纯整数指令
+```
+
+判据里于是**不再含任何"编译器不会…"的前提**。`_vec_svc` 同样处理。
+
+#### 那两个指针从哪来
+
+汇编**不去算 TCB 的偏移**（那要求宿主与目标布局一致，而 TCB 有指针字段）。
+它读**每核结构**里的 `cur_vfp_d` / `cur_vfp_f` —— 由 `sched_set_current()`
+用 C 算好写进去。每核结构是"全 u32 字段"的（`percpu.h` 有断言），
+偏移两边一致，汇编可以放心用。`sizeof(percpu_t)` 56 → 64。
+
+两个函数都查 `percpu_t.cpu_id`，**只在 CPU0 生效** —— 否则 CPU1 的 1kHz
+定时器会去消费 CPU0 布下的状态，两个核同时用一份 d0–d31。
+
+#### 判据为什么长这样
+
+两个线程各自把 **d0–d31 整片**填成自己的图案（**只填一次**），
+然后反复读回核对，并核对 FPSCR 的舍入模式（两位 `RMode` —— FPSCR 其余
+大多是**累积状态标志**，任何一次浮点运算都能置位，拿它们做地标会误判）。
+
+- ★ **"只填一次"是判据成立的关键**：每轮重填的话，线程被切回来时会先把
+  自己的图案写回去，"寄存器被对方改过"这件事就被它自己抹掉了 —— 判据永远通过。
+- ★ 因此两个线程**不对称**：只有"被换下又换回来"的那一个读得到对方的图案。
+  判据是"**至少一个**检出"，不是"两个都检出"。这一点写在代码注释里，
+  实测也正好是 `(8183, 0)` —— **一正一零**。
+
+#### 结果
+
+```
+正例      Sched fp : bad=(0,0) rmode_bad=(0,0) done=1        → PASS
+对照组    VFP A/B  : bad=(8183,0) rmode_bad=(8184,0) done=1  → 检出
+```
+
+对照组是 `g_vfp_skip = 1`：那个变量的**存储与读取都在汇编里** ——
+不能为了问一句"跳不跳"再调进 C，那就又把 C 拉回窗口里了。
+
+实现位置：M4-9.5（已做）。**新增一处退化，就得进上面那张表。**
 
 （后续 M4 各阶段每引入一处退化，都往这张表里加一行。表里任何一行在
 对应条件满足后仍未替换，都是需要解释的。）
