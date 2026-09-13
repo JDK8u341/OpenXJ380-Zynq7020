@@ -92,8 +92,13 @@ if {$mio_bad == 0} {
 
 puts ""
 puts "=== 关键寄存器核对 ==="
-puts "MIO_PIN_48  = 0x[rd 0xF80007C0]   (期望 000016E0 = UART1_TX)"
-puts "MIO_PIN_49  = 0x[rd 0xF80007C4]   (期望 000016E1 = UART1_RX)"
+# MIO_PIN 的 [11:9] 是 IO 标准: 1=LVCMOS18(bank1 实际 1.8V) / 3=LVCMOS33(错的)。
+# 配对了是 0x12E0/0x12E1;[11:9]=3 时是 0x16E0/0x16E1 —— 那正是旧 XSA 的错值,
+# 别把 0x16E0 当成"期望值"。真正的判据是下面的 uartok 与 MIO bank1 硬校验。
+# ⚠ 下面两条 puts **故意用 ASCII**:tclsh 在 Windows 上按系统代码页读写脚本,
+#   这里的中文会被往返一次而掉字节(实测)。关键数字别再交给它去转。
+puts "MIO_PIN_48  = 0x[rd 0xF80007C0]   (correct here: 000012E0 = UART1_TX, LVCMOS18)"
+puts "MIO_PIN_49  = 0x[rd 0xF80007C4]   (correct here: 000012E1 = UART1_RX, LVCMOS18)"
 puts "APER_CLK    = 0x[rd 0xF800012C]"
 puts "UART_CLK    = 0x[rd 0xF8000154]"
 puts "UART1 MR    = 0x[rd 0xE0001004]   <== 非 0 就说明 UART1 活了"
