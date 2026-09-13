@@ -661,10 +661,17 @@ def arm32_graph(n: Ninja, out_path: Path) -> list[Path]:
         depfile="$out.d",
     )
     # Assembly goes through the GNU driver so it sees the same -mcpu/-mfpu set.
+    #
+    # -I is required, not cosmetic: boot/vectors.S includes <arch/taskctx.h> so
+    # that the exception-frame offsets have ONE definition shared with C.  The
+    # static asserts in that header therefore also protect the assembly side --
+    # see docs/ZYNQ7020_PORT_PLAN.md 4.7.6 (x86 hard-codes the same kind of
+    # offsets in kernel/intr/handler.S with no compile-time check at all).
     n.rule(
         "arm32_as",
-        "$arm_cc $arm_arch_flags -c $in -o $out",
+        f"$arm_cc $arm_arch_flags -I{ARM32_SOURCE_ROOT}/include -MMD -MP -MF $out.d -c $in -o $out",
         log_desc("ASM", "$in -> $out"),
+        depfile="$out.d",
     )
     # libgcc is passed as an explicit path: the Xilinx tree is a multilib
     # layout that -L/-lgcc does not resolve correctly.
@@ -681,7 +688,9 @@ def arm32_graph(n: Ninja, out_path: Path) -> list[Path]:
     arm_objs: list[Path] = []
     for src in arm_s_sources:
         obj = Path(ARM32_OBJ_ROOT) / src.relative_to(arm_source_root_abs).with_suffix(".o")
-        n.build(obj, "arm32_as", src)
+        # implicit=arm_headers:vectors.S 现在 include <arch/taskctx.h>,
+        # 改帧布局必须触发汇编重编,否则跑的还是旧偏移。
+        n.build(obj, "arm32_as", src, implicit=arm_headers)
         arm_objs.append(obj)
     for src in arm_c_sources:
         obj = Path(ARM32_OBJ_ROOT) / src.relative_to(arm_source_root_abs).with_suffix(".o")

@@ -64,16 +64,36 @@
 /* ------------------------------------------------------------------ */
 
 /*
- * _vec_irq 在 IRQ 栈上压入 r0-r12 和修正后的返回地址,共 14 个字。
- * 这个布局是汇编与 C 之间的 ABI,改动必须两边同步。
+ * 帧的布局与偏移宏都在 arch/taskctx.h —— 汇编(vectors.S)与 C 共用同一份宏,
+ * 那里的 _Static_assert 因此同时保护了两侧。见该文件顶部的实测 LR 偏移表。
+ *
+ * ⚠ 这里只是把类型名转出来,**不要再定义一份布局**。
  */
-typedef struct
-{
-    u32 r[13]; /* r0 .. r12 */
-    u32 pc;    /* 被中断指令的地址(lr 已减 4 修正) */
-} arm_irq_frame_t;
+#include <arch/taskctx.h>
+
+/*
+ * 兼容别名。旧的 `arm_irq_frame_t` 只有 `r[13] + pc`,既没有 SPSR,
+ * 也无法区分"返回地址"与"出错指令" —— M4-6 换成了完整帧。
+ * 保留别名只为少改一处引用,新代码请直接用 arm_exc_frame_t。
+ */
+typedef arm_exc_frame_t arm_irq_frame_t;
 
 typedef void (*irq_handler_t)(u32 intid, void *arg);
+
+/*
+ * 异常帧布局的运行时自检结果(M4-6)。
+ *
+ * 由 fault_test 的选择器 9 触发,c_svc_handler 里逐个核对帧槽。
+ *   0  = 全部一致
+ *   1..13 = 第几个寄存器槽不对
+ *   14 = SPSR 槽不对(读到的不是 SVC 模式)
+ *   15 = ret 与 pc 的关系不对
+ *   -1 = 还没跑过
+ *
+ * 为什么值得单独报一项:`_Static_assert` 只能钉住 C 侧的偏移宏,
+ * 钉不住"汇编真的按这些宏存了"。见 arch/taskctx.h 顶部。
+ */
+int irq_svc_frame_check_result(void);
 
 /* ------------------------------------------------------------------ */
 /* 初始化                                                              */

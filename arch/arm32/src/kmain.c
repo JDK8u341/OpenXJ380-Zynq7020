@@ -168,6 +168,9 @@ static kstack_t      g_kstack_ap_probe;
 
 static u32 g_kstack_ap_ok;
 
+/* M4-6:异常帧布局的运行时自检结果(-1 = 没跑过) */
+static int g_svc_frame_check = -1;
+
 static u32 g_kstack_selftest;
 static u32 g_kstack_slots_ok;
 static u32 g_kstack_guard_ok;
@@ -1316,6 +1319,34 @@ void kmain(void)
         }
     }
 
+    /* ---- 9.48 异常帧布局的运行时自检(M4-6) ---- */
+    /*
+     * 位置:在自检报告**之前**(它要往报告里写一项),但要等中断已经开起来 ——
+     * 选择器是通过 shell/主循环之外的路径触发的,这里直接调一次即可。
+     *
+     * 为什么必须真跑一遍:帧布局是汇编与 C 之间的 ABI,`_Static_assert`
+     * 只能钉住 C 侧的宏。见 arch/taskctx.h 顶部。
+     *
+     * ⚠ 这一项依赖 `pc` 的偏移是对的 —— 处理函数靠读 pc 处那条指令的立即数
+     *   来判断"这是不是一个布局自检"。偏移错了它就静默地什么都不做,
+     *   于是"没跑过"(-1)和"跑过了"必须能被区分开:报告里 -1 会判 FAIL。
+     */
+    {
+        int before = irq_svc_frame_check_result();
+
+        fault_test_trigger(FAULT_SEL_SVC_FRAME);
+
+        g_svc_frame_check = irq_svc_frame_check_result();
+
+        if (before != -1 || g_svc_frame_check == -1) {
+            console_printf(" Exc frame   : check did not run (before=%d after=%d)\n", before,
+                           g_svc_frame_check);
+        } else {
+            console_printf(" Exc frame   : %s (result=%d)\n",
+                           (g_svc_frame_check == 0) ? "PASS" : "FAIL", g_svc_frame_check);
+        }
+    }
+
     /* ---- 10. 启动自检总账 ---- */
     /*
      * 位置:所有自检都跑完之后、主循环之前。
@@ -1415,6 +1446,16 @@ void kmain(void)
     selftest_report("kstack_free_reuse", g_kstack_reuse_ok, 1u, SELFTEST_EQ);
     /* AP=0b000 那一路:guard 页是**映射着的**,拦住访问的是 AP 而不是"没映射" */
     selftest_report("kstack_ap_guard_ap0", g_kstack_ap_ok, 1u, SELFTEST_EQ);
+
+    /*
+     * ---- 异常帧布局(M4-6)----
+     *
+     * 判据是 == 0,而不是 ">= 0":没跑过(-1)必须算失败 ——
+     * 否则"汇编没按宏存"与"自检根本没触发"在报告上长得一样。
+     */
+    selftest_report("exc_frame_layout", (u32)((g_svc_frame_check < 0) ? 0xFFFFFFFFu
+                                                                     : (u32)g_svc_frame_check),
+                    0u, SELFTEST_EQ);
 
     selftest_report("smp_cpu1_online", g_percpu[1].online, 1u, SELFTEST_EQ);
     selftest_report("smp_cpu1_stage", HB[HB_SLOT_CPU1_STAGE], HB_CPU1_STAGE_ONLINE, SELFTEST_EQ);

@@ -481,7 +481,18 @@ static void dump_regs(arm_irq_frame_t *frame)
         return;
     }
 
-    console_printf("  pc       = 0x%08X\n", frame->pc);
+    /*
+     * `pc` 与 `ret` 是两个不同的东西,所以要分别打 ——
+     * 这是本板实测出来的(见 arch/taskctx.h 顶部的 LR 偏移表):
+     *   pc  = 出错/被中断的那条指令(只用于报告)
+     *   ret = 首选返回地址(只用于 `movs pc, lr`)
+     * 旧代码只有一个字段,于是 SVC 与 Data Abort 打印的 pc 各偏 4 字节 ——
+     * 一个"看起来很正常、实际指向隔壁那条指令"的值。
+     */
+    console_printf("  pc       = 0x%08X   (faulting/interrupted instruction)\n", frame->pc);
+    console_printf("  ret      = 0x%08X   (preferred return address)\n", frame->ret);
+    console_printf("  spsr     = 0x%08X   (mode %u, %s)\n", frame->spsr, frame->spsr & ARM_CPSR_MODE_MASK,
+                   arm_mode_text(frame->spsr));
     console_printf("  r0-r3    = 0x%08X 0x%08X 0x%08X 0x%08X\n",
                    frame->r[0], frame->r[1], frame->r[2], frame->r[3]);
     console_printf("  r4-r7    = 0x%08X 0x%08X 0x%08X 0x%08X\n",
@@ -498,6 +509,84 @@ static void dump_regs(arm_irq_frame_t *frame)
 static void dump_halt(void)
 {
     console_puts("  System halted. Registers remain readable via JTAG (rrd).\n");
+}
+
+/*
+ * (CPSR 模式位的文本现在是 arch/taskctx.h 里的 `arm_mode_text()` ——
+ *  纯函数,宿主机上就能单测。这里不再留一份副本:两份实现早晚会分叉。)
+ */
+
+/* ------------------------------------------------------------------ */
+/* 异常帧布局的运行时自检(M4-6)                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 为什么需要它:帧布局是**汇编与 C 之间的 ABI**。
+ * `_Static_assert` 能钉住 C 侧的偏移宏,但钉不住"汇编真的按这些宏存了" ——
+ * 比如 `stmia sp, {r0-r12}` 的寄存器顺序、`sub sp` 的字节数、`mrs` 存到哪个槽。
+ * 这些只有**真的跑一遍**才知道。
+ *
+ * 做法:fault_test 的选择器 4 会把 r0-r12 设成已知图案再执行 `svc #0xA5A5`。
+ * 这里逐个核对帧里的 13 个槽是否等于那些图案。
+ *
+ * ★ 这个检查还顺带证明了 `pc` 的偏移是对的 ★
+ *   因为"这是不是一个布局自检的 SVC"这件事,是靠**读 `pc` 处那条指令的立即数**
+ *   判断出来的。旧代码的 pc 指向 SVC 的下一条,按它取立即数会取到随机的
+ *   下一条指令 —— 于是这个检查根本不会被触发(静默地什么都不做)。
+ *   现在 pc 指向 SVC 本身,立即数才取得到。
+ *
+ * 返回 0 = 全部一致;非 0 = 第几个寄存器不对(1..13),-1 = 不是布局自检。
+ */
+static int svc_frame_check(const arm_exc_frame_t *frame)
+{
+    u32 insn;
+    u32 i;
+
+    if (frame == NULL) {
+        return -1;
+    }
+
+    /*
+     * pc 指向那条 SVC 指令 —— 直接读它的编码。
+     * 这是内核自己的代码段,读取是安全的;真读不到也只会在返回前停机。
+     */
+    insn = *(const volatile u32 *)(uintptr_t)frame->pc;
+
+    if (arm_svc_immediate(insn) != ARM_SVC_FRAME_CHECK) {
+        return -1;
+    }
+
+    for (i = 0; i < 13u; i++) {
+        u32 expect = ARM_FRAME_CHECK_PATTERN ^ i;
+
+        if (frame->r[i] != expect) {
+            return (int)(i + 1u);
+        }
+    }
+
+    /*
+     * SPSR 也要是"从 SVC 模式来的" —— 这一条顺手验证了
+     * `mrs r0, spsr` 确实被存进了 ARM_EXC_OFF_SPSR 那个槽。
+     * 存错槽的话这里会读到 r12 或别的什么,模式位几乎不可能正好是 SVC。
+     */
+    if ((frame->spsr & ARM_CPSR_MODE_MASK) != ARM_MODE_SVC) {
+        return 14;
+    }
+
+    /* ret 应当是 SVC 的下一条(实测 LR_svc = SVC + 4,不减) */
+    if (frame->ret != (frame->pc + 4u)) {
+        return 15;
+    }
+
+    return 0;
+}
+
+/* 自检结果:kmain 读它进自检报告 */
+static int g_svc_frame_check = -1;
+
+int irq_svc_frame_check_result(void)
+{
+    return g_svc_frame_check;
 }
 
 void c_undef_handler(arm_irq_frame_t *frame)
@@ -520,10 +609,20 @@ void c_svc_handler(arm_irq_frame_t *frame)
      * M1 阶段还没有用户态;走到这里说明有人主动发了 SVC。
      *
      * ⚠ 这个处理函数**会返回**,不能打 "System halted":
-     *   vectors.S 的 _vec_svc 没有 wfe 自旋,它是 pop 之后 movs pc, lr
+     *   vectors.S 的 _vec_svc 没有 wfe 自旋,它是 ldmia 之后 movs pc, lr
      *   返回到 SVC 的下一条指令。照抄另外三个致命异常的说法会让人
      *   以为系统停了,而实际上它继续在跑 —— 这类误导在排障时代价很高。
+     *
+     * 先看这是不是帧布局自检(M4-6):是的话不打印长篇现场,
+     * 只记录结论,免得把自检报告淹掉。
      */
+    int check = svc_frame_check(frame);
+
+    if (check >= 0) {
+        g_svc_frame_check = check;
+        return;
+    }
+
     console_puts("\n!!! SVC (no syscall layer yet) - diagnostic only, returning !!!\n");
     dump_regs(frame);
     console_puts("  Returning to the instruction after SVC.\n");

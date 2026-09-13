@@ -82,7 +82,7 @@ void fault_test_trigger(u32 selector)
     }
 
     case FAULT_SEL_SVC: {
-        console_puts("    svc #0 -> expect SVC handler (diagnostic only, will return)\n");
+        console_puts("    svc -> expect SVC handler (diagnostic only, will return)\n");
         timer_delay_ms(50);
 
         /*
@@ -93,6 +93,48 @@ void fault_test_trigger(u32 selector)
         __asm__ volatile("svc #0" ::: "memory");
 
         console_puts("    SVC returned normally -> handler ran and returned as designed\n");
+        return;
+    }
+
+    case FAULT_SEL_SVC_FRAME: {
+        /*
+         * ★ 异常帧布局的运行时自检(M4-6)★
+         *
+         * 把 r0-r12 设成已知图案,再发一个立即数为 ARM_SVC_FRAME_CHECK 的 SVC。
+         * c_svc_handler 会逐个核对帧里的 13 个槽。
+         *
+         * 为什么必须"真的跑一遍":帧布局是汇编与 C 之间的 ABI。
+         * _Static_assert 钉得住 C 侧的偏移宏,但钉不住"汇编真的按这些宏存了" ——
+         * stmia 的寄存器顺序、sub sp 的字节数、mrs 存到哪个槽,只有跑起来才知道。
+         *
+         * 而且这个自检**依赖 pc 的偏移是对的**:处理函数靠读 pc 处那条指令的
+         * 立即数来判断"这是不是一个布局自检"。旧代码的 pc 指向 SVC 的下一条,
+         * 按它取立即数会取到别的指令 —— 于是自检会静默地什么都不做。
+         */
+        console_puts("    svc #ARM_SVC_FRAME_CHECK with r0-r12 = known pattern\n");
+        timer_delay_ms(50);
+
+        __asm__ volatile(
+            "ldr r0,  =0x5A5A0000\n\t"
+            "ldr r1,  =0x5A5A0001\n\t"
+            "ldr r2,  =0x5A5A0002\n\t"
+            "ldr r3,  =0x5A5A0003\n\t"
+            "ldr r4,  =0x5A5A0004\n\t"
+            "ldr r5,  =0x5A5A0005\n\t"
+            "ldr r6,  =0x5A5A0006\n\t"
+            "ldr r7,  =0x5A5A0007\n\t"
+            "ldr r8,  =0x5A5A0008\n\t"
+            "ldr r9,  =0x5A5A0009\n\t"
+            "ldr r10, =0x5A5A000A\n\t"
+            "ldr r11, =0x5A5A000B\n\t"
+            "ldr r12, =0x5A5A000C\n\t"
+            "svc #0xA5A5\n\t"
+            :
+            :
+            : "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12",
+              "memory");
+
+        console_puts("    frame check ran (result reported in the self-test)\n");
         return;
     }
 

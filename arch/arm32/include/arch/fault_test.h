@@ -16,6 +16,7 @@
  *   xsdb> mwr -force 0x00020080 6     # 栈溢出进 guard 页(验证 guard 生效)
  *   xsdb> mwr -force 0x00020080 7     # 同上,但 guard 用 AP=0b000 实现
  *   xsdb> mwr -force 0x00020080 8     # ★ 对照组:关掉 guard 再溢出,应当不报错 ★
+ *   xsdb> mwr -force 0x00020080 9     # 异常帧布局自检(会返回,结果进自检报告)
  */
 
 #include <arch/types.h>
@@ -90,6 +91,17 @@
 #define FAULT_SEL_STACK_GUARD_OFF  8u
 
 /*
+ * 异常帧布局的运行时自检(M4-6)。
+ *
+ * 把 r0-r12 设成已知图案,再发一个立即数为 `ARM_SVC_FRAME_CHECK` 的 SVC;
+ * `c_svc_handler` 逐个核对帧里的 13 个槽,外加 SPSR 的模式位与 ret 的值。
+ *
+ * 会**返回**(SVC 的向量没有 wfe 自旋),结论进自检报告。
+ * 与选择器 4 的区别:4 是"诊断路径能不能跑",9 是"帧布局对不对"。
+ */
+#define FAULT_SEL_SVC_FRAME        9u
+
+/*
  * 哪些选择器会真的停机。
  *
  * 除 SVC 与 8 之外全部是致命的:处理函数打完现场后停在 vectors.S 的 wfe
@@ -107,6 +119,8 @@
      (sel) == FAULT_SEL_XN_FETCH ||                    \
      (sel) == FAULT_SEL_STACK_GUARD ||                 \
      (sel) == FAULT_SEL_STACK_GUARD_AP)
+/* 明确记下"不致命"的两个:SVC(4)与帧布局自检(9)都会返回 */
+_Static_assert(FAULT_SEL_SVC != FAULT_SEL_SVC_FRAME, "两个非致命用例的选择器不能撞号");
 
 
 /*
