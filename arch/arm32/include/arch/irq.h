@@ -205,6 +205,18 @@ const irq_stats_t *irq_get_stats(void);
 /* ------------------------------------------------------------------ */
 
 void c_undef_handler(arm_irq_frame_t *frame);
-void c_svc_handler(arm_irq_frame_t *frame);
 void c_prefetch_abort_handler(arm_irq_frame_t *frame);
 void c_data_abort_handler(arm_irq_frame_t *frame);
+
+/*
+ * SVC 处理函数。与 c_irq_handler 同一套协议:**返回值是"要从哪个帧离开"**。
+ *
+ * 为什么要返回值(而 M4-8 时是 void):
+ *   `svc` 不只是"系统调用" —— M4-9 之后它同时是**陷阱式让出**的入口
+ *   (`arch_svc_yield()`),而让出必须真的切走。切走 = 在目标任务栈上
+ *   搭一个帧并返回它。见 boot/vectors.S 的 `_vec_svc`。
+ *
+ * 立即数 = ARM_SVC_YIELD 时交给 sched_tick;= ARM_SVC_FRAME_CHECK 时做帧自检;
+ * 其余落到"还没有系统调用层"的诊断分支。
+ */
+arm_exc_frame_t *c_svc_handler(arm_irq_frame_t *frame);

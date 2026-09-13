@@ -218,12 +218,21 @@ _vec_undefined:
  *   诊断 pc → LR-4,也就是**那条 SVC 指令**
  * 后者不是装饰:c_svc_handler 要靠它取出 svc 的立即数当系统调用号 ——
  * 而取它的前提正是 pc 指对了地方。
+ *
+ * ★ M4-9:SVC 也是"陷阱式让出"的入口 ★
+ *   `arch_svc_yield()` 发 `svc #ARM_SVC_YIELD`,处理函数把帧交给调度器,
+ *   调度器可能返回**另一个帧**(在目标任务栈上新搭的)。
+ *   所以这里与 `_vec_irq` 用同一套协议:`mov sp, r0` 之后再 EXC_FRAME_LEAVE。
+ *
+ *   ⚠ 不切换时 `c_svc_handler` 原样返回传进来的帧,`mov sp, r0` 是空操作 ——
+ *     两条路共用一段收尾代码,不会分叉。
  */
     .global _vec_svc
 _vec_svc:
     EXC_FRAME_ENTER ARM_EXC_RET_FIX_SVC
     mov     r0, sp
     bl      c_svc_handler
+    mov     sp, r0                  /* ★ 返回值即"从哪个帧离开" ★ */
     EXC_FRAME_LEAVE
 
 /*

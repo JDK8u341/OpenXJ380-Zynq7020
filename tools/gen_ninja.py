@@ -534,6 +534,12 @@ ARM32_COMMON_FLAGS = (
     "-fno-tree-loop-distribute-patterns",
     "-Wall",
     "-Wextra",
+    # Warnings in a kernel are bugs waiting for the right hardware state.
+    # This one is not theoretical: the ARM build shipped a `return;` inside
+    # a function declared to return a stack pointer (c_irq_handler's spurious
+    # path). With -Werror absent it compiled to a warning, and the caller's
+    # `mov sp, r0` would have loaded a garbage stack pointer.
+    "-Werror",
     "-g",
     "-I./arch/arm32/include",
     "-MMD",

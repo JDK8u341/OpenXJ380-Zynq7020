@@ -1,17 +1,37 @@
 /*
- * 内核侧调度器 —— M4-8.3
+ * 内核侧调度器 —— M4-8.3 起步,M4-9 完成
  *
  * 与 src/sched.c 的分工:
- *   sched.c      **纯逻辑**(策略)。不含 MMIO/CP15,宿主可穷尽测 ——
- *                那是策略的唯一判据,因为"等权 + 纯占用"负载下任何策略都会通过。
+ *   sched.c      **纯逻辑**(策略 + 帧搬迁的数据搬运)。不含 MMIO/CP15,
+ *                宿主可穷尽测 —— 那是策略的唯一判据,因为"等权 + 纯占用"
+ *                负载下任何策略都会通过。
  *   本文件        把这些策略接到真实的 TCB、栈池、上下文切换上。
  *
  * 本文件里唯一"架构相关"的动作是切栈,而它已经由 M4-7 的
- * `arch_ctx_switch()` 封装好了 —— 所以这里连内联汇编都没有。
+ * `arch_ctx_switch()` / M4-9 的"帧路径"封装好了 —— 所以这里连内联汇编都没有。
  *
- * ⚠ M4-8 的切换是**协作式**的(线程自己调 sched_yield 让出)。
- *   抢占在 M4-9:那一步要在异常返回路径上做切换,也就是真正需要
- *   "连 CPSR 一起换"的地方(见 boot/context.S 顶部的分工表)。
+ * ====================================================================
+ * 唯一的一条切换路径(M4-9)
+ * ====================================================================
+ *
+ * 源 OS 只有**一个**切换点:`timer_handle()`,跑在异常帧上。
+ * `scheduler_yield()` 也不另开一条路 —— 它只是
+ * "`scheduler_ticks = TIME_SLICE; int $32`",即软中断进同一个入口。
+ *
+ * 本移植照这个形状做:
+ *
+ *     timer IRQ ──┐
+ *                 ├──> c_irq_handler / c_svc_handler ──> sched_tick(frame)
+ *     svc #YIELD ─┘                                            │
+ *                                       ┌──────────────────────┘
+ *                          "从哪个帧离开"← 不切换:原 frame
+ *                                          切换:在目标栈上新搭的帧
+ *
+ * M4-8 曾经用 `arch_ctx_switch` 另拼过一个协作式让出 —— 那是权宜之计
+ * (那时还没有"返回值即新帧"的协议),M4-9 之后它必须退场:
+ * 两套机制保存的寄存器集不同,一个被抢占过的线程若被"协作式"切回来,
+ * r1-r3/r12 就是垃圾,而这种错**不报任何东西**。
+ * `arch_ctx_switch` 现在只剩 M4-7 那个原语自检在用。
  */
 
 #include <arch/console.h>
@@ -34,14 +54,16 @@ static struct arm_thread_control_block g_boot_idle_tcb;
 static tcb_t                           g_boot_idle;
 
 /*
- * 启动上下文的丢弃槽。
+ * 启动上下文的丢弃槽 —— **M4-9 起不再需要**。
  *
- * `arch_ctx_switch(from, to)` 总会**保存**当前状态到 from。从启动流程
- * 切进 idle/第一个线程时,没有任何"当前线程"可以当 from ——
- * 于是给它一个明确的丢弃槽,而不是 `&idle->ctx`(那会把 idle 自己的
- * 上下文覆盖掉,下次切到 idle 就跳回启动流程了)。
+ * M4-8 的协作式让出用 `arch_ctx_switch(&g_boot_ctx, &next->ctx)` 从启动流程
+ * 切走,因为 `arch_ctx_switch(from, to)` 总要先**保存**当前状态到 from,
+ * 而那时没有任何"当前线程"可以当 from。
+ *
+ * M4-9 的帧路径不需要它:现场是**收进 `cur->ctx`** 的,而启动上下文
+ * 从 `sched_register_boot_idle()` 那一刻起就有一个真实的 TCB 当容器。
+ * 于是这里没有这个变量了 —— 留一段说明,免得后来者以为它丢了。
  */
-static arm_task_ctx_t g_boot_ctx;
 
 /*
  * 栈池与堆由调用方在启动时绑进来,而不是 extern 全局量 ——
@@ -95,6 +117,43 @@ void sched_kern_init(void)
 
     sched_queue_init(&g_runq[pc->cpu_id]);
     g_switch_count = 0u;
+}
+
+/* ------------------------------------------------------------------ */
+/* 调度开关 ← `disable_scheduler()` / `enable_scheduler()`             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * ← `scheduler.cpp:31-34` 与 KernelMain 里的 `enable_scheduler()`。
+ *
+ * ## 与源 OS 的一处差别(要说清楚)
+ *
+ * 源 OS 里 `is_scheduler` **初值是 false**,直到 KernelMain 走到
+ * "打开调度器"那一步才置真 —— 在此之前每个 tick 都在 `timer_handle` 的第一行
+ * 就返回了。本移植没有那个"打开"的时刻:`sched_tick` 从第一发中断起就被调用,
+ * 靠 `current == NULL` 早退(注册 idle 之前 current 就是空的)。
+ * 两种写法在注册 idle 之前的行为完全一致。
+ *
+ * ⇒ 所以这里的**初值是"开"**,这对开关只用于"造线程/改调度状态"的窗口 ——
+ *   那是一个真实存在的竞态:`sched_kthread_create` 是微秒级,而 tick 是毫秒级,
+ *   于是"造第一个"和"造第二个"之间**可能**被切走,第二个线程根本没造出来。
+ *   属于"偶尔错一次"的那一类,最难查,所以用开关罩起来而不是靠时序侥幸。
+ */
+static u32 g_sched_enabled = 1u;
+
+void sched_disable(void)
+{
+    g_sched_enabled = 0u;
+}
+
+void sched_enable(void)
+{
+    g_sched_enabled = 1u;
+}
+
+bool sched_is_enabled(void)
+{
+    return g_sched_enabled != 0u;
 }
 
 static sched_queue_t *self_runq(void)
@@ -155,7 +214,53 @@ tcb_t sched_kthread_create(void (*entry)(void *), void *arg, const char *name)
     t->ctx.sp   = stk.top;
     t->ctx.lr   = 0u; /* 线程不该"返回";真返回了就跳到 0,那是明确的错误 */
     t->ctx.pc   = (u32)(uintptr_t)entry;
-    t->ctx.cpsr = 0u; /* 协作式切换不动 CPSR,这里只是记录 */
+
+    /*
+     * ★★★ 先修:模式位 ★★★
+     *
+     * 这里原本写的是 `0u`,注释说"协作式切换不动 CPSR,这里只是记录"。
+     * 那句话在 M4-8 成立,在 M4-9 **不再成立** —— 帧路径会用 `rfeia`
+     * 把这个值**真的装进 CPSR**。
+     *
+     * ## `0` 到底是什么(这一条我先前写错了,已按架构改正)
+     *
+     * 我先前的说法是"0 = User 模式 + 中断全开"。**不对。**
+     * AArch32 的 CPSR.M[4:0] 里,**每一个已分配的模式编码 bit4 都是 1**:
+     *
+     *     USR 0b10000   FIQ 0b10001   IRQ 0b10010   SVC 0b10011
+     *     MON 0b10110   ABT 0b10111   HYP 0b11010   UND 0b11011   SYS 0b11111
+     *
+     * (本项目的表就在 arch/taskctx_asm.h 的 ARM_MODE_*,一眼可核。)
+     *
+     * `0` 的 M[4:0] = **0b00000**,bit4 = 0 —— 它**不是任何一个模式**,
+     * 而是一个未分配的编码。按架构,把这样一个值装回 CPSR 是
+     * **UNPREDICTABLE**。
+     *
+     * ⇒ 真正的理由不是"它会变成用户态",而是**它什么都不是**:
+     *   代码的意图是"内核线程跑在 SVC 模式",而写下来的却是一个未定义值。
+     *   本项目**刻意没有去实测** Cortex-A9 遇到它会怎样 ——
+     *   那是故意制造 UB,不是值得花上板时间的问题。
+     *
+     * ## 正确值从哪来
+     *
+     * ← 源 OS 造内核线程时写的是 `context0.rflags = 0x202`(bit9 IF = 1,
+     *   即"中断开着"),段选择子 `cs = 0x8` 是**内核**代码段。
+     *   两者合起来的语义 = "SVC 模式 + IRQ 使能"。
+     *
+     * ARM 侧的对应值:
+     *     ARM_MODE_SVC | ARM_CPSR_F_BIT  =  0x13 | 0x40  =  0x53
+     *
+     * ⚠ I 位必须**为 0**:I=1 的线程永远不会被 tick 打断,抢占对它无效 ——
+     *   而且那不会报错,只表现为"这个线程独占 CPU"。
+     * ⚠ F 位必须**为 1**(屏蔽 FIQ):本内核所有中断都走 IRQ,GIC 也没配
+     *   FIQ 组。`start.S` 从建立模式栈那一刻起就一直是 `MODE_SVC|I|F`,
+     *   正常内核代码跑起来时 `arch_ctx_save` 读到的 CPSR 就是 **0x53** ——
+     *   新线程与"被抢占的线程"于是有同一个 CPSR,两条路径不会分叉。
+     *
+     * 这个值不再是"只是记录":`sched_ctx_switchable()` 会核对它的模式位,
+     * 写错了在那里就会被拒绝切换,而不是让一个未定义的 CPSR 上 CPU。
+     */
+    t->ctx.cpsr = ARM_MODE_SVC | ARM_CPSR_F_BIT;
 
     /* ---- 调度状态 ---- */
     sched_entity_init(t, sched_queue_avg_vruntime(q, NULL, 0u));
@@ -175,96 +280,71 @@ tcb_t sched_kthread_create(void (*entry)(void *), void *arg, const char *name)
 /* ------------------------------------------------------------------ */
 
 /*
- * 让出 CPU。这是 M4-8 唯一改变执行流的函数,所以每一句为什么都要写清楚。
+ * ★ 破坏性 A/B 的对照组开关 ★ —— 定义与理由见 include/arch/sched.h。
+ * 生产路径上恒为 0;只有 kmain 在自检报告**之后**才会短暂置 1。
+ */
+u32 g_reloc_skip;
+
+/*
+ * 让出 CPU —— **走陷阱**,与"被抢占"是同一条路径。
+ *
+ * ← `scheduler_yield()` `scheduler.cpp:460-465`:
+ *      get_current_cpu()->scheduler_ticks = TIME_SLICE;
+ *      __asm__ volatile("int %0" ::"i"(32));
+ *
+ * ⚠ 这里**没有**任何"挑下一个 / 切上下文"的代码,那是刻意的:
+ *   一旦这里再写一套,就有了两套切换机制、两份真相。
+ *   本函数只做两件事:把时间片记账设成"已用尽",然后软中断。
+ *
+ * ⚠ `svc` 会把 CPSR.I 置 1(所有异常都这样),但 **SPSR_svc 里存的是
+ *   进去之前的 CPSR**,而帧路径用 `rfeia` 从 spsr 恢复 —— 于是中断开关
+ *   回到进入时的那一刻,不需要在这里手动存/恢复。
  */
 void sched_yield(void)
 {
-    sched_queue_t *q = self_runq();
-    tcb_t          cur;
-    tcb_t          next;
-    u64            ran;
+    percpu_t *pc = percpu_self();
 
-    if (q == NULL) {
-        return;
-    }
-
-    cur = sched_current();
-
-    /*
-     * 给"刚刚跑过的那一段"计费。
-     *
-     * ⚠ 计费必须在**入队之前**:入队要按 deadline 排序,而 deadline
-     *   正是由这次计费算出来的。顺序反了的话,线程会带着上一次的
-     *   deadline 去排队,公平性立刻失真 —— 而且那种失真不会报错,
-     *   只表现为"某些线程拿到的 CPU 偏多",极难察觉。
-     *
-     * 用固定片长而不是读时钟:协作式让出本来就不按时间片,
-     * 而"跑一次算一片"与源 OS 的 tick 计费在长期份额上等价,
-     * 又不必在这条热路径上碰全局定时器。
-     */
-    if (cur != NULL && cur != g_boot_idle) {
-        cur->status = RUNNING;
-        sched_account_run(cur, SCHED_BASE_SLICE_NS);
-    }
-
-    next = sched_pick(q);
-    if (next == NULL || next == cur) {
+    if (pc == NULL) {
         return;
     }
 
     /*
-     * ⚠ `next->ctx.pc == 0` 表示"这个线程的上下文无效"(源 OS 用
-     *   `context0.rip != 0` 做同一个判断)。挑到这种线程时**不许切过去** ——
-     *   它的现场根本不在内存里(启动上下文就是这样)。
-     *   源 OS 在这种情况下是"什么都不做,继续跑 current"。
+     * 设成 TIME_SLICE(不是 +1):`sched_tick` 还会再 `scheduler_ticks++`,
+     * 于是 `scheduler_ticks < TIME_SLICE` 这一关必然放过 ——
+     * 与源 OS 的 `scheduler_ticks = TIME_SLICE; int $32` 逐字对应。
      */
-    if (next->ctx.pc == 0u) {
+    pc->scheduler_ticks = SCHED_TIME_SLICE;
+
+    arch_svc_yield();
+}
+
+/*
+ * 把自己挂起,然后切走。
+ *
+ * ⚠ 必须走 `sched_yield()` 而不是自己去挑下一个并 `arch_ctx_switch`:
+ *   内核线程跑在自己的内核栈上,"切走"只有一条合法路径 ——
+ *   经过异常帧,让 `rfeia` 把栈和 CPSR 一起换掉。直接从 C 里跳走
+ *   会留在同一个栈上,那不是切换。
+ *
+ * ⚠ 本函数不会返回:状态是 WAIT,调度器不会再挑中自己。
+ *   真返回了说明调度器出了别的问题,那就让它继续跑 ——
+ *   在自检探针里,继续跑会立刻把 `done` 之后的死循环暴露出来。
+ */
+void sched_park_self(void)
+{
+    tcb_t cur = sched_current();
+
+    if (cur == NULL) {
         return;
     }
-
-    /* ---- 把当前线程放回队列,再把下一个摘下来 ---- */
-    if (cur != NULL && cur != g_boot_idle) {
-        cur->status = START;
-        (void)sched_queue_insert(q, cur);
+    if (cur->task_level == TASK_IDLE_LEVEL) {
+        return; /* 启动上下文不能把自己停掉 —— 停了就没人再跑启动了 */
     }
 
-    sched_queue_remove(q, next);
-    next->status = RUNNING;
+    cur->status      = WAIT;
+    cur->wakeup_time = 0u; /* 0 = **不按时间唤醒**,不是"立刻唤醒" */
 
-    sched_set_current(next);
-    g_switch_count++;
-    if (g_switch_count > SCHED_MAX_SWITCHES_TRACKED) {
-        /*
-         * 计数器不封顶会让"切换太频繁"这件事在日志里变成一个大数字;
-         * 反过来,封顶又会让它失去"到底切了多少次"的信息。
-         * 这里保留真值,只是不再往队列里加 —— 真正的开销在切换本身。
-         */
-    }
-    (void)ran;
-
-    /*
-     * ★ 切换点 ★
-     *
-     * `arch_ctx_switch(&cur->ctx, &next->ctx)` —— 它会把当前寄存器与栈
-     * 存进 `cur->ctx`,再从 `next->ctx` 恢复。
-     *
-     * ⚠ 从 cur 的角度看,**这一句之后不会立刻继续**:要等别的线程切回来。
-     *   所以它下面不能假设 `next` 还是被选中的那个 —— 回来时世界已经变了。
-     *
-     * ⚠ cur 为 NULL(第一次启动)时不能走这条路:`&cur->ctx` 是空指针解引用。
-     *   那时的正确做法是"只恢复 next,不保存任何人" ——
-     *   用一个丢弃槽当 from。
-     */
-    if (cur == NULL || cur == g_boot_idle) {
-        /*
-         * 从"上下文不在内存里"的线程切走:没有现场可保存,用丢弃槽。
-         * (启动上下文就属于这种 —— 它的现场在 CPU 里,而且按源 OS 的模型
-         *  它只被切走、会被 M4-9 的帧改写路径切回来。)
-         */
-        arch_ctx_switch(&g_boot_ctx, &next->ctx);
-    } else {
-        arch_ctx_switch(&cur->ctx, &next->ctx);
-    }
+    sched_yield();
 }
 
 u32 sched_switch_count(void)
@@ -287,20 +367,31 @@ u32 sched_switch_count(void)
  *     // context0.rip 从头到尾没设过 -> 保持 0
  *
  * 也就是说:**"idle"不是另一个线程,而是启动上下文自己**。
- * 它的 `context0.rip` 是 0,而 `timer_handle` 拿 `rip != 0` 当"上下文有效"的守卫
- * (`scheduler.cpp:444`)—— 挑到它时**什么都不做**,启动流程继续跑。
- * 这就是 idle 的执行方式:没有"切进 idle"这回事。
  *
- * ⚠ 第一版我造了一个真的 `for(;;) wfi()` idle 线程 + `sched_kern_start()` 交棒。
- *   那是**偏离源 OS** 的,而且立刻推出一堆不存在的问题:
- *   "协作式让出会把当前线程重新入队 ⇒ 队列永不为空 ⇒ 挑不到 idle ⇒ 出不来"。
- *   源 OS 里 idle 永远是 current,压根不需要"进去"。
+ * ⚠ 那个 `rip == 0` 标记只说明"**在被第一次切走之前**不许切进来" ——
+ *   那时它的现场在 CPU 里,不在内存里,切进去就是跳到地址 0。
+ *   `change_proccess` 从 idle 切走时会把 `reg->rip` 收进 `idle->context0`,
+ *   于是**从此它就是一个可恢复的普通上下文**。
  *
- * ARM 侧的"上下文无效"标记同样用 `ctx.pc == 0`(源 OS 用 `context0.rip`)。
- * `ctx.sp` 取**当前** sp —— 现场就在 CPU 里,不需要保存,
- * 因为这台"线程"只被切**走**,从不会被切**回来**…
- * 需要被切回来时,x86 的 `change_proccess` 会把改写后的帧交回 iretq,
- * ARM 侧对应的是改写现场帧再 rfeia(M4-9)。
+ * ★ 这一点我先前读错过 ★ 本文件原来的注释写"idle 只被切走、从不会被切回来,
+ *   所以没有'切进 idle'这回事"。那是错的,而且后果不小:启动流程被切走
+ *   之后必须能回来,靠的正是"idle 变成一个普通上下文"这条路。
+ *   等两个自检探针线程干完活挂起,`select_next_task` 挑不到别人、
+ *   current 又不可运行时,兜底返回的就是 idle —— 于是 kmain 从被中断的
+ *   那条指令继续,自检报告照常打出来。
+ *
+ * ARM 侧:
+ *   - "上下文无效"标记同样用 `ctx.pc == 0`;
+ *   - `ctx.sp` 取**当前** sp(照源 OS 的 `get_rsp()`),它只是占位 ——
+ *     真正有意义的 sp 是第一次被切走时从现场帧里收进来的那个;
+ *   - **idle 不进就绪队列**。源 OS 把 idle 排进队列,但
+ *     `is_task_schedulable()` 里那条 `task_level == TASK_IDLE_LEVEL`
+ *     把它挡在候选之外,只在最后兜底时才用;而且它的 vruntime 永远是 0
+ *     (计费对它早退),deadline 恒为最小 —— 真让它参与"取队首"的挑选,
+ *     它会把队首永远占住。这里用"不排队 + 显式兜底"表达同一件事。
+ *
+ * ⚠ 更早的第一版我造了一个真的 `for(;;) wfi()` idle 线程 + 交棒函数。
+ *   那才是真正偏离源 OS 的地方。
  */
 void sched_register_boot_idle(void)
 {
@@ -312,8 +403,15 @@ void sched_register_boot_idle(void)
     g_boot_idle_tcb.status       = RUNNING;
     g_boot_idle_tcb.kernel_stack = arch_read_sp(); /* 当前 sp,不另取栈 */
     g_boot_idle_tcb.ctx.sp       = arch_read_sp();
-    g_boot_idle_tcb.ctx.pc       = 0u; /* ★ 0 = 上下文无效,调度器不许切进来 ★ */
-    g_boot_idle_tcb.owns_kstack  = false; /* 它就是启动栈,不归栈池管 */
+    g_boot_idle_tcb.ctx.pc       = 0u; /* ★ 0 = 上下文无效(第一次切走前)★ */
+    /*
+     * ⚠ cpsr 必须显式写成内核的正常 CPSR(0x53 = SVC + 屏蔽 FIQ)。
+     *   留成 0 会让 `sched_ctx_switchable()` 判定"不可切换",
+     *   于是 idle 被切走一次之后就永远回不来了 —— 自检报告再也打不出来。
+     *   (与 sched_kthread_create 里那个"先修"是同一条理由。)
+     */
+    g_boot_idle_tcb.ctx.cpsr    = ARM_MODE_SVC | ARM_CPSR_F_BIT;
+    g_boot_idle_tcb.owns_kstack = false; /* 它就是启动栈,不归栈池管 */
     for (i = 0; i < sizeof(g_boot_idle_tcb.name) - 1u && "idle"[i] != '\0'; i++) {
         g_boot_idle_tcb.name[i] = "idle"[i];
     }
@@ -354,40 +452,71 @@ void sched_tick_account(void)
     sched_account_run(cur, SCHED_TICK_NS);
 }
 
-/* (sched_tick / sched_tick_would_switch / sched_tick_invalid_ctx
+/* (sched_tick / sched_tick_switched / sched_tick_preempted / sched_tick_invalid_ctx
  *  实现在文件末尾 —— 它们是完整的决策路径,而本函数只是其中的计费部分。) */
 
 /* ------------------------------------------------------------------ */
-/* M4-9:tick 里的调度决策                                              */
+/* M4-9:tick 里的调度决策 —— 真的搬帧                                  */
 /* ------------------------------------------------------------------ */
 
-static u32 g_tick_would_switch;
+static u32 g_tick_switched;   /* 真的完成了切换(搬了帧)的次数 */
+static u32 g_tick_preempted;  /* 其中"被换下的是真实线程"的次数 */
 static u32 g_tick_invalid_ctx;
 
 /*
- * ← `timer_handle()` `scheduler.cpp:430-470`。逐段对应:
+ * ← `timer_handle()` `scheduler.cpp:381-458`。逐段对应:
  *
+ *   if (current == NULL) { send_eoi(); return reg; }
  *   if (current 在跑 且 不是 idle) { scheduler_ticks++;
  *                                    charge_current_eevdf_runtime(current, TICK_NS);
- *                                    if (scheduler_ticks < TIME_SLICE) return; }
+ *                                    if (scheduler_ticks < TIME_SLICE) return reg; }
  *   else scheduler_ticks = 0;
  *
  *   best = select_next_task();
- *   if (best == NULL || best == current) { scheduler_ticks = 0; return; }
- *   if (best->context0.rip != 0) 换;  else 什么都不做;
+ *   if (best == NULL || best == current) { scheduler_ticks = 0; return reg; }
+ *   if (current->status == RUNNING) current->status = START;
+ *   if (best->status == START || best->status == CREATE) best->status = RUNNING;
+ *   if (best->context0.rip != 0) { change_proccess(...); cpu->current_task = best; }
+ *   else { current->status = RUNNING; scheduler_ticks = 0; }
  *
  * ⚠ 时间片计数放在**每核**结构里(源 OS 用 `cpu->scheduler_ticks`):
  *   两个核各跑各的 tick,共用一个静态变量会让两核互相把对方的时间片清零 ——
  *   表现为"抢占几乎不发生",而且只在双核下出现。
+ *
+ * ## 与源 OS 的三处**结构**差异(每一处都写清楚为什么)
+ *
+ * 1. **顺序:先判可切换性,再动状态。**
+ *    源 OS 先把 current/best 的状态改掉,发现 `rip == 0` 再改回来。
+ *    这里把判断提前 —— 因为本移植还要挪**队列成员关系**(current 在跑时
+ *    不在队列里、就绪时才在),"改完再回滚"要回滚两样东西,
+ *    而回滚漏一半是静默的。可观测行为完全一致。
+ *
+ * 2. **队列成员关系由本函数维护。**
+ *    源 OS 的 current 一直留在队列里,靠 `is_task_schedulable` 排除。
+ *    这里用"跑着的不在队列里"表达同一件事(见 include/arch/sched.h 的说明),
+ *    于是切换时必须一进一出。
+ *
+ * 3. **idle 不进队列**,用显式兜底代替源 OS 的 `idle` 出参。
+ *    理由见 `sched_register_boot_idle()`。
  */
 arm_exc_frame_t *sched_tick(arm_exc_frame_t *frame)
 {
-    sched_queue_t *q;
-    tcb_t          cur;
-    tcb_t          next;
-    percpu_t      *pc;
+    sched_queue_t  *q;
+    tcb_t           cur;
+    tcb_t           next;
+    percpu_t       *pc;
+    arm_exc_frame_t *nf;
 
     if (frame == NULL) {
+        return frame;
+    }
+
+    /*
+     * ← `timer_handle()` 的第一行(`scheduler.cpp:384-387`):
+     *      if (!is_scheduler) { send_eoi(); return reg; }
+     *   关掉时连计费都不做 —— 照抄。
+     */
+    if (g_sched_enabled == 0u) {
         return frame;
     }
 
@@ -396,11 +525,36 @@ arm_exc_frame_t *sched_tick(arm_exc_frame_t *frame)
         return frame;
     }
 
+    /*
+     * ⚠ M4-10 之前**只有 CPU0 参与调度**。
+     *
+     * CPU1 的 1kHz 私有定时器同样会进这里,而 `g_runq[1]` 从来没被
+     * `sched_kern_init()` 碰过(那是 CPU0 在启动时调的),`g_boot_idle`
+     * 更是 **CPU0 的对象** —— 放 CPU1 走过去,它会去恢复 CPU0 的 idle 现场,
+     * 也就是**两个核同时往同一个上下文里塞现场**。
+     * 那是双核阶段典型的一类崩溃,而且现象与"内存坏了"几乎一样。
+     *
+     * 每个核一份队列 + 每核自己的 idle 是 M4-10 的事。
+     */
+    if (pc->cpu_id != 0u) {
+        return frame;
+    }
+
     q   = &g_runq[pc->cpu_id];
     cur = sched_current();
 
+    /*
+     * ★ current 为空必须早退 ★(源 OS `scheduler.cpp:390-393`)
+     *
+     * 没有"从哪来"可收:放过去就会挑一个线程切走,而启动上下文的 ctx
+     * 从头到尾没人填过 —— 它被永久丢掉,kmain 再也回不来。
+     */
+    if (cur == NULL) {
+        return frame;
+    }
+
     /* ---- 1. 计费 + 时间片 ---- */
-    if (cur != NULL && cur->status == RUNNING && cur->task_level != TASK_IDLE_LEVEL) {
+    if (cur->status == RUNNING && cur->task_level != TASK_IDLE_LEVEL) {
         pc->scheduler_ticks++;
         sched_account_run(cur, SCHED_TICK_NS);
 
@@ -412,44 +566,112 @@ arm_exc_frame_t *sched_tick(arm_exc_frame_t *frame)
     }
 
     /* ---- 2. 挑下一个 ---- */
-    next = sched_pick(q);
+    next = sched_pick_next(q, cur);
+    if (next == NULL) {
+        /*
+         * ← `select_next_task_safe()` 的最后一行
+         *   (`scheduler.cpp:358`):
+         *       result = best ? best : (is_current_task_runnable(current) ? current : idle);
+         *
+         * 队列里没有可调度的别人时:current 还能跑就继续跑它,
+         * 否则用 idle 兜底。**这两个分支都要有** ——
+         * 少了后一个,探针线程全部挂起之后就没有任何东西能让启动流程回来。
+         */
+        next = sched_current_runnable(cur) ? cur : g_boot_idle;
+    }
+
     if (next == NULL || next == cur) {
         pc->scheduler_ticks = 0u;
         return frame;
     }
 
-    /* ---- 3. ★ 上下文有效才切换 ★(源 OS:`context0.rip != 0`)*/
-    if (next->ctx.pc == 0u) {
+    /* ---- 3. ★ 先判可切换性,再动任何状态 ★(源 OS 用 `context0.rip != 0`)*/
+    if (!sched_ctx_switchable(next)) {
         /*
-         * 上下文无效 —— 源 OS 在这里**什么都不做**,并把 current 的状态
-         * 恢复成 RUNNING。这正是 idle 的执行方式:启动上下文没有可恢复的
-         * 现场,所以"挑到它"等于"不切换"。
+         * 源 OS 在这里把 current 的状态改回 RUNNING —— 因为它在上面
+         * 已经改过了。本函数把判断放在状态迁移**之前**,所以这里
+         * 什么都不用回滚(见上面"结构差异 1")。
          */
         pc->scheduler_ticks = 0u;
         g_tick_invalid_ctx++;
-        if (cur != NULL && cur->status != RUNNING) {
-            cur->status = RUNNING;
-        }
         return frame;
     }
 
-    /*
-     * ---- 4. 到这里"本来应该切换" ----
-     *
-     * ⚠ 本步**只记数、不搬帧**:先让决策路径每 tick 跑起来并被观测,
-     *   确认"该不该切"是对的,再让它动帧。
-     *   "该不该切"错 与 "搬帧搬错" 是两类完全不同的错误,混在一起没法归因 ——
-     *   这个项目已经因为"把两位信息压成一位"多花过一整轮上板时间。
-     */
-    g_tick_would_switch++;
-    pc->scheduler_ticks = 0u;
+    /* ---- 4. 状态与队列(← `timer_handle:436-441`)---- */
+    if (cur->status == RUNNING) {
+        cur->status = START;
+        /*
+         * ⚠ idle 不重新入队:它的 vruntime 永远是 0(计费对它早退),
+         *   于是 deadline 恒为最小 —— 一旦进了队列,`sched_pick_next`
+         *   每次都先挑到它,真实线程就再也拿不到 CPU。
+         *   它的"回来"由第 2 步的兜底负责。
+         */
+        if (cur->task_level != TASK_IDLE_LEVEL) {
+            (void)sched_queue_insert(q, cur);
+        }
+    }
+    /* WAIT / 已挂起的线程**不入队** —— 那正是 sched_park_self 的用处 */
 
-    return frame;
+    if (next->status == START || next->status == CREATE) {
+        next->status = RUNNING;
+    }
+    sched_queue_remove(q, next);
+
+    /* ---- 5. ★★★ 搬帧 ★★★ ---- */
+    /*
+     * 5a. 把 current 的现场收进它的 ctx。
+     *
+     *     ⚠ cur 是 idle 时**照样要收** —— 那个 0 标记只是"还没被切走过",
+     *       收完它就是一个可恢复的普通上下文了。这正是启动流程能回来的原因。
+     */
+    sched_ctx_from_frame(cur, frame);
+
+    /* 5b. 在**目标任务自己的栈上**搭新帧 */
+    nf = sched_frame_for(next);
+    if (nf == NULL) {
+        /*
+         * 第 3 步已经查过一遍,理论上到不了这里。
+         * 真到了就**放弃切换**而不是硬写 —— `nf` 是野指针时写 64 字节
+         * 会静默踩坏别的栈,那种错比"不切换"难查得多。
+         * (状态已经改了,世界会有点歪;但那一支本来就表示"有更严重的错"。)
+         */
+        g_tick_invalid_ctx++;
+        pc->scheduler_ticks = 0u;
+        return frame;
+    }
+    (void)sched_frame_from_ctx(next, nf);
+
+    sched_set_current(next);
+    pc->scheduler_ticks = 0u;
+    g_switch_count++;
+    g_tick_switched++;
+    if (cur->task_level != TASK_IDLE_LEVEL) {
+        g_tick_preempted++;
+    }
+
+    /*
+     * ★ 破坏性 A/B:只差这一步 ★
+     *
+     * 上面全部照做,只有"把新帧交出去"被跳过。返回原来的帧 ⇒ `rfeia`
+     * 回到**原线程被打断的地方**,执行流一步没动。
+     * 于是同一段代码、同一个负载,行为从"两个线程真的交错"
+     * 变成"两个线程一次都没跑起来" —— 那是"搬帧承重"的唯一证明方式。
+     */
+    if (g_reloc_skip != 0u) {
+        return frame;
+    }
+
+    return nf;
 }
 
-u32 sched_tick_would_switch(void)
+u32 sched_tick_switched(void)
 {
-    return g_tick_would_switch;
+    return g_tick_switched;
+}
+
+u32 sched_tick_preempted(void)
+{
+    return g_tick_preempted;
 }
 
 u32 sched_tick_invalid_ctx(void)

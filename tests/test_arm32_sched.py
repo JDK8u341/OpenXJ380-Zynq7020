@@ -280,6 +280,284 @@ int main(void)
     CHECK(ta.sched_next == NULL);
     sched_entity_init(NULL, 1u); /* 不崩即可 */
 
+    /* ================================================================ */
+    /* 11. 可调度性判据(M4-9)                                           */
+    /* ================================================================ */
+
+    /*
+     * ← is_task_schedulable / is_current_task_runnable。
+     *
+     * 这一段的重点是那条**不对称**:两者对 idle 的处理不同 ——
+     * 挑别人时 idle 不算候选,而 idle 当 current 时算"能跑"。
+     * 抄成一个函数会让调度器要么永远挑不到 idle(启动流程回不来),
+     * 要么永远只挑 idle(真实线程拿不到 CPU)。两种都不会报错。
+     */
+    CHECK(sched_status_runnable(RUNNING));
+    CHECK(sched_status_runnable(START));
+    CHECK(sched_status_runnable(CREATE));
+    CHECK(!sched_status_runnable(WAIT));
+    CHECK(!sched_status_runnable(DEATH));
+    CHECK(!sched_status_runnable(FUTEX));
+    CHECK(!sched_status_runnable(OUT));
+    CHECK(!sched_status_runnable(ZOMBIE));
+
+    sched_queue_init(&q);
+
+    /* 排三个:一个普通、一个 idle、一个挂起 */
+    mk(&ta, TASK_KERNEL_LEVEL, 100u, 10u, SCHED_BASE_SLICE_NS); /* 普通,可调度 */
+    mk(&tb, TASK_IDLE_LEVEL, 0u, 0u, SCHED_BASE_SLICE_NS);      /* idle:不是候选 */
+    mk(&tc, TASK_KERNEL_LEVEL, 200u, 20u, SCHED_BASE_SLICE_NS);
+    tc.status = WAIT;                                           /* 挂起:不是候选 */
+
+    /* idle 的 deadline 最小(0),所以它在队首 —— 正是"不能让它占住队首"的场景 */
+    sched_queue_insert(&q, &tb);
+    sched_queue_insert(&q, &ta);
+    sched_queue_insert(&q, &tc);
+    CHECK(sched_pick(&q) == &tb); /* 队首确实是 idle —— 取队首的做法会错在这里 */
+
+    /* sched_pick_next 必须跳过 idle 与挂起的,挑到 ta */
+    CHECK(sched_pick_next(&q, NULL) == &ta);
+    /* current 自己也要跳过 */
+    CHECK(sched_pick_next(&q, &ta) == NULL);
+    CHECK(sched_pick_next(NULL, NULL) == NULL);
+
+    CHECK(!sched_task_schedulable(NULL, NULL));
+    CHECK(!sched_task_schedulable(&tb, NULL)); /* idle 永不作为候选 */
+    CHECK(!sched_task_schedulable(&ta, &ta));  /* 自己不算 */
+    CHECK(sched_task_schedulable(&ta, NULL));
+    CHECK(sched_task_schedulable(&ta, &tc));
+    CHECK(!sched_task_schedulable(&tc, NULL)); /* WAIT */
+
+    /* ★ 不对称在这里:同一个 idle 对象,作为 current 时是"能跑"的 ★ */
+    CHECK(sched_current_runnable(&tb));
+    CHECK(sched_current_runnable(&ta));
+    CHECK(!sched_current_runnable(&tc));
+    CHECK(!sched_current_runnable(NULL));
+
+    /* ================================================================ */
+    /* 12. ★ M4-9:帧搬迁 ★                                             */
+    /* ================================================================ */
+
+    /*
+     * 这四条要钉住的是那条**架构事实**:
+     *
+     *     ARM 的异常帧里没有 SP,返回后的 SP 恒等于"帧基址 + 64"。
+     *     ⇒ 帧在谁的栈上,谁就被恢复。
+     *
+     * 所以"搬迁"这件事的全部内容就是两个方向的数据搬运,
+     * 而它们必须是**互逆**的 —— 收现场再铺回去,ctx 必须一字不差。
+     * 这一条只能在宿主上穷尽测:板上只能证明"跑起来了",
+     * 证明不了"每个字段都对"。
+     */
+
+    /* 12a. 帧布局:结构体字段偏移必须与汇编共用的一致 */
+    CHECK(sizeof(arm_exc_frame_t) == ARM_EXC_FRAME_BYTES);
+    CHECK(offsetof_arm(arm_exc_frame_t, r) == ARM_EXC_OFF_R0);
+    CHECK(offsetof_arm(arm_exc_frame_t, svc_lr) == ARM_EXC_OFF_SVC_LR);
+    CHECK(offsetof_arm(arm_exc_frame_t, ret) == ARM_EXC_OFF_RET);
+    CHECK(offsetof_arm(arm_exc_frame_t, spsr) == ARM_EXC_OFF_SPSR);
+    CHECK(sizeof(arm_task_ctx_t) == ARM_CTX_BYTES);
+
+    {
+        /*
+         * ⚠ 这里有一个**宿主特有的**陷阱,必须说清楚,否则这一段的写法
+         *   看起来像是"判据放宽了"。
+         *
+         * `arm_task_ctx_t.sp` 是 **u32** —— 这是目标板的 ABI(ARM32 的
+         * 地址就是 32 位,而且汇编按这个宽度访问它)。宿主的指针却是 8 字节,
+         * 于是"把一个真指针存进 ctx.sp"在宿主上会**截断**。
+         *
+         * 本项目在 vmap 的 l2_pool 上已经因为同样的事踩过一次
+         * (`u32` 装指针 → 野地址)。所以:
+         *
+         *   - 帧本身用**真指针**(要真的读写那 64 字节);
+         *   - 凡是与 `ctx.sp` 比较的地方,期望值也按 `(u32)` 截断一次 ——
+         *     **目标板上那个截断是空操作**,于是同一条判据在两边都成立、
+         *     而且都是精确相等,不是"近似"或"跳过"。
+         *
+         * 换句话说:判据没有放宽,只是把"目标板上恒等的那个转换"写了出来。
+         */
+        static u64        arena[32];
+        arm_exc_frame_t  *fr = (arm_exc_frame_t *)(void *)&arena[4]; /* 8 字节对齐 */
+        u32               sp32;
+        struct arm_thread_control_block t;
+        u32               i;
+
+        CHECK(sizeof(arena) >= 2u * ARM_EXC_FRAME_BYTES);
+        CHECK(((uintptr_t)fr & 7u) == 0u);
+
+        sp32 = (u32)(uintptr_t)fr + ARM_EXC_FRAME_BYTES; /* 目标板上就是入口那一刻的 sp */
+        memset(&t, 0, sizeof(t));
+
+        /* ---- 12b. sched_ctx_switchable:四条拒绝理由,逐条钉 ---- */
+
+        /* (1) pc == 0 = 上下文无效(启动上下文在被第一次切走之前) */
+        t.ctx.pc   = 0u;
+        t.ctx.sp   = sp32;
+        t.ctx.cpsr = ARM_MODE_SVC;
+        CHECK(!sched_ctx_switchable(&t));
+        CHECK(sched_frame_for(&t) == NULL);
+
+        /* (2) ★ cpsr 的模式位不是 SVC ★
+         *
+         *     `0` 的 CPSR.M[4:0] = 0b00000。AArch32 里**每一个已分配的
+         *     模式编码 bit4 都是 1**(USR 0b10000、SVC 0b10011、SYS 0b11111…),
+         *     所以 0 不是"User 模式",而是**一个未分配的编码** ——
+         *     按架构把它装回 CPSR 是 UNPREDICTABLE。
+         *
+         *     这正是 M4-9 开工时 `sched_kthread_create` 里真实写着的值
+         *     (注释还写着"协作式切换不动 CPSR,这里只是记录" ——
+         *     那句话在帧路径上线的那一刻就失效了)。
+         *     所以它必须有一条判据,而且判据要钉的是"**必须是 SVC**",
+         *     不是"必须是某个我们猜的模式"。 */
+        t.ctx.pc   = 0x1234u;
+        t.ctx.cpsr = 0u;
+        CHECK((0u & ARM_CPSR_MODE_MASK) != ARM_MODE_SVC);
+        /* 0 也不是 User:每个合法模式的 bit4 都是 1 */
+        CHECK((0u & ARM_CPSR_MODE_MASK) != ARM_MODE_USR);
+        CHECK(!sched_ctx_switchable(&t));
+        t.ctx.cpsr = ARM_MODE_USR;
+        CHECK(!sched_ctx_switchable(&t));
+        t.ctx.cpsr = ARM_MODE_IRQ;
+        CHECK(!sched_ctx_switchable(&t));
+        t.ctx.cpsr = ARM_MODE_SYS; /* 特权,但**不是** SVC —— 同样拒绝 */
+        CHECK(!sched_ctx_switchable(&t));
+        /* 中断屏蔽位不参与判定:FIQ 屏蔽开着才是内核的正常状态 */
+        t.ctx.cpsr = ARM_MODE_SVC | ARM_CPSR_F_BIT;
+        CHECK(sched_ctx_switchable(&t));
+        t.ctx.cpsr = ARM_MODE_SVC; /* I=0/F=0 也接受 —— 只看模式域 */
+        CHECK(sched_ctx_switchable(&t));
+
+        /* (3) sp 必须 8 字节对齐(AAPCS)与非 0 */
+        t.ctx.cpsr = ARM_MODE_SVC;
+        t.ctx.sp   = sp32 + 4u;
+        CHECK(!sched_ctx_switchable(&t));
+        t.ctx.sp = 0u;
+        CHECK(!sched_ctx_switchable(&t));
+
+        /* (4) 栈必须落在自己那块栈区里(仅当栈来自栈池) */
+        t.ctx.sp       = sp32;
+        t.owns_kstack  = true;
+        t.kstack_base  = sp32 - ARM_EXC_FRAME_BYTES; /* 帧整体刚好贴着栈底:合法 */
+        t.kernel_stack = sp32;
+        CHECK(sched_ctx_switchable(&t));
+        t.kstack_base = sp32 - ARM_EXC_FRAME_BYTES + 4u; /* 帧会有一半落进 guard 页:拒绝 */
+        CHECK(!sched_ctx_switchable(&t));
+        t.kstack_base = sp32 + 8u; /* sp 在栈区之外:拒绝 */
+        CHECK(!sched_ctx_switchable(&t));
+        t.kernel_stack = sp32 - 8u; /* sp 超出栈顶:拒绝 */
+        t.kstack_base  = 0u;
+        CHECK(!sched_ctx_switchable(&t));
+
+        /*
+         * ⚠ 启动上下文(owns_kstack == false)**不做范围检查**:
+         *   它的两个边界是注册那一刻的快照,而启动流程在任何深度都可能
+         *   被中断 —— 拿快照当区间会把"kmain 跑到更浅的调用深度"
+         *   误判成"栈指针是野的",于是启动流程再也回不来。
+         */
+        t.owns_kstack  = false;
+        t.kstack_base  = 0u;
+        t.kernel_stack = 0u;
+        CHECK(sched_ctx_switchable(&t));
+
+        CHECK(!sched_ctx_switchable(NULL));
+
+        /* ---- 12c. sched_frame_for:帧就在 sp - 64 ---- */
+        t.ctx.sp = sp32;
+        CHECK((uintptr_t)sched_frame_for(&t) == (uintptr_t)(u32)(uintptr_t)fr);
+        /* 帧地址与 sp 同余,所以"对齐"只需要 sp 一条就够 */
+        CHECK((((uintptr_t)sched_frame_for(&t)) & 7u) == 0u);
+
+        /* ---- 12d. ★ 收现场:帧 -> ctx ★ ---- */
+        memset(fr, 0, sizeof(*fr));
+        for (i = 0u; i < 13u; i++) {
+            fr->r[i] = 0xA0000000u + i;
+        }
+        fr->svc_lr = 0xDEADBEEFu;
+        fr->ret    = 0x00101904u;
+        fr->spsr   = ARM_MODE_SVC; /* 被中断时在 SVC 模式 */
+
+        memset(&t, 0, sizeof(t));
+        sched_ctx_from_frame(&t, fr);
+        for (i = 0u; i < 13u; i++) {
+            CHECK(t.ctx.r[i] == 0xA0000000u + i);
+        }
+        CHECK(t.ctx.lr == 0xDEADBEEFu);
+        CHECK(t.ctx.pc == 0x00101904u);
+        CHECK(t.ctx.cpsr == ARM_MODE_SVC);
+        /*
+         * ★★ 这一行就是"搬帧"的全部内容 ★★
+         *
+         *   帧基址 + 64 == 异常入口那一刻的 sp
+         *   (srsdb -8、push lr -4、push {r0-r12} -52,共 64 字节)
+         *
+         * 反过来说:因为 `EXC_FRAME_LEAVE` 的收尾是
+         * `add sp,sp,#0x38; rfeia sp!`,所以返回后的 sp **恒等于帧基址 + 64**
+         * —— "帧搭在谁的栈上,谁就被恢复"就是这么来的。
+         */
+        CHECK(t.ctx.sp == (u32)(uintptr_t)fr + ARM_EXC_FRAME_BYTES);
+
+        /* 收了现场之后这个上下文就可切换;而它的帧正好落回原处(原地往返)*/
+        CHECK(sched_ctx_switchable(&t));
+        CHECK((uintptr_t)sched_frame_for(&t) == (uintptr_t)(u32)(uintptr_t)fr);
+
+        /* ---- 12e. ★ 铺回去:ctx -> 帧,必须与 12d 互逆 ★ ---- */
+        {
+            arm_exc_frame_t fr2;
+
+            memset(&fr2, 0, sizeof(fr2));
+            CHECK(sched_frame_from_ctx(&t, &fr2) == &fr2);
+
+            for (i = 0u; i < 13u; i++) {
+                CHECK(fr2.r[i] == 0xA0000000u + i);
+            }
+            CHECK(fr2.svc_lr == 0xDEADBEEFu);
+            CHECK(fr2.ret == 0x00101904u);
+            CHECK(fr2.spsr == ARM_MODE_SVC);
+
+            /* 逐字节相同:16 个字全部被写到,没有哪个槽漏了 */
+            CHECK(memcmp(&fr2, fr, sizeof(fr2)) == 0);
+        }
+
+        /* NULL 参数不崩,也不写坏东西 */
+        sched_ctx_from_frame(NULL, fr);
+        sched_ctx_from_frame(&t, NULL);
+        CHECK(sched_frame_from_ctx(NULL, fr) == NULL);
+        CHECK(sched_frame_from_ctx(&t, NULL) == NULL);
+        (void)sched_frame_from_ctx(&t, fr); /* 复原 */
+
+        /* ---- 12f. 往返:ctx -> 帧 -> ctx' ---- */
+        {
+            struct arm_thread_control_block t2;
+            arm_exc_frame_t                fr3;
+            u32                            k;
+
+            memset(&t2, 0, sizeof(t2));
+            t2.ctx = t.ctx;
+
+            (void)sched_frame_from_ctx(&t2, &fr3);
+            memset(&t, 0, sizeof(t));
+            sched_ctx_from_frame(&t, &fr3);
+
+            CHECK(t.ctx.pc == t2.ctx.pc);
+            CHECK(t.ctx.lr == t2.ctx.lr);
+            CHECK(t.ctx.cpsr == t2.ctx.cpsr);
+            for (k = 0u; k < 13u; k++) {
+                CHECK(t.ctx.r[k] == t2.ctx.r[k]);
+            }
+
+            /*
+             * ★ sp **不**随帧搬运 ★ —— 它是从帧的**位置**算出来的。
+             *
+             * 这不是缺陷,正是设计:ARM 的异常帧里根本没有 sp 这个槽
+             * (SP 按模式 banked,硬件不压),所以"帧在哪"就等价于"sp 是多少"。
+             * 于是往返之后 sp 指向 fr3,而不是原来的 sp32。
+             */
+            CHECK(t.ctx.sp == (u32)(uintptr_t)&fr3 + ARM_EXC_FRAME_BYTES);
+            CHECK(t.ctx.sp != sp32);
+        }
+    }
+
     if (failures != 0) {
         printf("%d check(s) failed\n", failures);
         return 1;

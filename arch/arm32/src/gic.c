@@ -327,7 +327,18 @@ arm_exc_frame_t *c_irq_handler(arm_irq_frame_t *frame)
         if (pc == NULL || pc->cpu_id == 0u) {
             g_irq_stats.spurious_count++;
         }
-        return;
+        /*
+         * ⚠ 必须是 `return frame` 而不是 `return`。
+         *
+         * 本函数返回的是"要从哪个帧离开",调用方(vectors.S)会
+         * `mov sp, r0` —— 写成一个裸 return,r0 里就是**上一次调用留下的
+         * 任意值**,于是 SP 被设成垃圾,下一条指令就踩到不知道哪里去。
+         *
+         * 这个错在 M4-9 第一步把签名从 void 改成返回指针时漏掉了,
+         * 而编译器只给了一句警告(-Wreturn-type)就放过去了 ——
+         * 因为当时的 ARM 构建**没有 -Werror**。现在有了。
+         */
+        return frame;
     }
 
     if (pc != NULL) {
@@ -724,19 +735,39 @@ void c_undef_handler(arm_irq_frame_t *frame)
     dump_halt();
 }
 
-void c_svc_handler(arm_irq_frame_t *frame)
+arm_exc_frame_t *c_svc_handler(arm_irq_frame_t *frame)
 {
+    u32 imm = 0u;
+
     g_last_pc_fix = ARM_EXC_PC_FIX_SVC;
     if (frame != NULL) {
         g_last_svc_frame = (u32)(uintptr_t)frame;
+        /*
+         * 取立即数要先有 `pc`,而 `pc = ret - PC_FIX_SVC`。seq 由汇编保证
+         * (见 svc_frame_check 的说明),这里读的是内核自己的代码段。
+         */
+        imm = arm_svc_immediate(*(const volatile u32 *)(uintptr_t)arm_exc_pc(frame, ARM_EXC_PC_FIX_SVC));
+    }
+
+    /*
+     * ★ M4-9:陷阱式让出 ★
+     *
+     * `sched_yield()` -> `arch_svc_yield()` -> 这里。**必须排在帧自检之前**,
+     * 否则每次让出都会走一遍自检路径(自检对非 0xA5A5 的立即数返回 -1,
+     * 不算错,但会让"这是不是让出"这件事变成靠巧合判断)。
+     *
+     * 与 IRQ 那条路一样,把帧交给调度器,并由它决定从哪个帧离开 ——
+     * 于是"让出"和"被抢占"是**同一条**路径(源 OS 的 `int $32` 也是这样)。
+     */
+    if (imm == ARM_SVC_YIELD) {
+        return sched_tick(frame);
     }
 
     /*
      * M1 阶段还没有用户态;走到这里说明有人主动发了 SVC。
      *
-     * ⚠ 这个处理函数**会返回**,不能打 "System halted":
-     *   vectors.S 的 _vec_svc 没有 wfe 自旋,它是 ldmia 之后 movs pc, lr
-     *   返回到 SVC 的下一条指令。照抄另外三个致命异常的说法会让人
+     * ⚠ 这个处理函数**会返回**(`_vec_svc` 收尾是 EXC_FRAME_LEAVE),
+     *   不能打 "System halted":照抄另外三个致命异常的说法会让人
      *   以为系统停了,而实际上它继续在跑 —— 这类误导在排障时代价很高。
      *
      * 先看这是不是帧布局自检(M4-6):是的话不打印长篇现场,
@@ -746,12 +777,14 @@ void c_svc_handler(arm_irq_frame_t *frame)
 
     if (check >= 0) {
         g_svc_frame_check = check;
-        return;
+        return frame;
     }
 
     console_puts("\n!!! SVC (no syscall layer yet) - diagnostic only, returning !!!\n");
     dump_regs(frame);
     console_puts("  Returning to the instruction after SVC.\n");
+
+    return frame;
 }
 
 void c_prefetch_abort_handler(arm_irq_frame_t *frame)

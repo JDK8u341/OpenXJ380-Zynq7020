@@ -183,31 +183,44 @@ static int g_svc_frame_check = -1;
 /* M4-6:TCB 里 ctx 偏移的运行时自检结果(-1 = 没跑过) */
 static int g_tcb_ctx_check = -1;
 
-/* ---- M4-8.3:协作式调度的自检状态 ---- */
-static arm_task_ctx_t g_sched_return; /* 测试的"回程点" */
-static arm_task_ctx_t g_sched_throw;  /* 线程离开时的丢弃槽 */
-static u32            g_yield_a;
-static u32            g_yield_b;
-static u32            g_yield_ok;
-static u32            g_yield_switches;
-static u32            g_yield_local_ok;
-static u32            g_sched_idle_ok;
-static u64            g_tick_acc_delta;
-static u32            g_tick_acc_ok;
-static u32            g_tick_would_switch;
-static u32            g_tick_invalid_ctx;
-static u32            g_tick_decision_ok;
+/* ---- M4-9:抢占(帧搬迁)的自检状态 ---- */
+static u32 g_yield_a;
+static u32 g_yield_b;
+static u32 g_yield_ok;
+static u32 g_yield_switches;
+static u32 g_yield_local_ok;
+static u32 g_sched_idle_ok;
+static u64 g_tick_acc_delta;
+static u32 g_tick_acc_ok;
+static u32 g_tick_switched;    /* tick 里真的搬了帧的次数 */
+static u32 g_tick_preempted;   /* 其中被换下的是真实线程的次数 */
+static u32 g_tick_invalid_ctx;
+static u32 g_idle_pc_was_zero;   /* 注册时 idle->ctx.pc == 0(还没被切走过)*/
+static u32 g_idle_pc_harvested;  /* 跑完之后 != 0(启动现场真的被收进了 ctx)*/
+static u32 g_spin_ok;            /* 两个见证都成立 */
+static u32 g_spin_sp_isolated;   /* 两个线程的 sp 都没掉出自己栈区 */
+static u32 g_spin_both_done;
+static u32 g_preempt_switches_ok;
+/* 对照组(搬帧关掉)*/
+static u32 g_reloc_ctl_a;
+static u32 g_reloc_ctl_b;
+static u32 g_reloc_ctl_detected;
 
 #define YIELD_ROUNDS 8u
 
 /*
- * 两个探针线程:各自累加一个计数,然后主动让出。
+ * 让出探针:各累加一个计数,然后主动让出。
  *
- * 它们**故意不做别的事** —— 这一步要验的是"协作式切换本身"能不能工作,
- * 把业务混进来只会让失败时不好归因。真正的工作负载在 M4-8.4(1Hz 状态行)。
+ * ★ M4-9 起"让出"不再是自己实现的一套切换 ★
  *
- * 干完活之后**切回测试的回程点**而不是停在原地:线程没有"退出"这个概念,
- * 停在这里就等于把一个死线程留在就绪队列里。
+ * 旧版跑完之后用 `arch_ctx_switch(&g_sched_throw, &g_sched_return)` 手动交回
+ * 测试点 —— 那是 M4-8 的权宜写法。现在 `sched_yield()` 走 `svc` 陷阱、
+ * 与抢占同一条路径,于是线程只要**挂起自己**就够了:调度器挑不到任何
+ * 可运行的任务时会兜底挑 idle,而 idle 就是启动流程 —— kmain 从被中断的
+ * 那条指令继续,自检报告照常打。
+ *
+ * 它们**故意不做别的事**:这一步验的是"陷阱式让出 + 帧路径"能不能工作,
+ * 混进业务只会让失败时不好归因。
  */
 static void yield_probe_a(void *arg)
 {
@@ -219,7 +232,7 @@ static void yield_probe_a(void *arg)
         sched_yield();
     }
 
-    arch_ctx_switch(&g_sched_throw, &g_sched_return); /* 交回测试 */
+    sched_park_self(); /* 不再可调度 —— 这是启动流程能回来的前提 */
     for (;;) {
         arch_wfi();
     }
@@ -235,7 +248,162 @@ static void yield_probe_b(void *arg)
         sched_yield();
     }
 
-    arch_ctx_switch(&g_sched_throw, &g_sched_return);
+    sched_park_self();
+    for (;;) {
+        arch_wfi();
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* M4-9:抢占探针 —— **绝不主动让出**                                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * ## 判据为什么不能是"两个计数都大于零"
+ *
+ * 那一条**区分不出抢占有没有生效**:没有抢占时,先跑的那个线程会一路跑完
+ * 再挂起,然后另一个线程才开始跑 —— 两个计数照样都是正的。
+ * (本项目已经不止一次因为"判据太松"白跑一轮上板。)
+ *
+ * 真正的区分点是**交错**,而交错是可以被线程自己见证的:
+ *
+ *     我在跑的时候,对方是不是已经跑过了?
+ *
+ * 无抢占时**第一个跑的线程永远见证不到** —— 它跑完之前对方一次都没动过。
+ * 而"谁是第一个"不影响结论:两个见证必须**同时**为 1,
+ * 先跑的那个必然是 0。有抢占时第一次时间片到点就会换人,两个见证都会成立。
+ *
+ * ## 另外两条同源判据
+ *
+ *   - **sp 自检**:线程每一轮都核对"我的 sp 在我自己的栈区里吗"。
+ *     "帧搭在目标任务栈上"这件事一旦失效(比如搭在了被换下那个的栈上),
+ *     违反的正是这条 —— 而那种错**不会报任何东西**,只会静默踩坏别人的栈。
+ *   - **idle 的 ctx.pc 从 0 变成非 0**:说明启动流程的现场真的被收进了 ctx
+ *     (只被切走、没被收现场的话它永远是 0),而且 kmain 真的被切回来了。
+ */
+typedef struct
+{
+    volatile u32       count;     /* 本轮跑了多少次 */
+    volatile u32       saw_other; /* ★ 我跑的时候,对方已经跑过了吗 ★ */
+    volatile u32       sp_bad;    /* sp 掉出自己栈区的次数(正常恒为 0)*/
+    volatile u32       done;      /* 循环跑完了 */
+    const volatile u32 *other;    /* 对方的 count */
+} spin_probe_t;
+
+#define SPIN_BUDGET_US 20000u /* 每个线程跑 20ms 墙钟(不是 20ms CPU 时间)*/
+
+static spin_probe_t g_spin[2];
+static spin_probe_t g_spin_ctl[2]; /* 对照组的两个 */
+
+/*
+ * 用**墙钟**而不是固定迭代次数来结束循环,是有意的:
+ * 迭代次数依赖编译出来的指令数与 CPU 频率,一旦估小,线程就永远跑不完,
+ * 于是启动流程再也回不来 —— 那是一个"自检把系统挂住"的失败模式,
+ * 而上板调试恰恰最怕这个。墙钟预算则与这些都无关。
+ *
+ * ⚠ 读的是全局定时器(自由运行),不是 tick 计数 —— 被抢占的时间也算进去,
+ *   所以"20ms"是真的 20ms,不会因为被换下而拖长。
+ */
+static void spin_probe(void *arg)
+{
+    spin_probe_t *p    = (spin_probe_t *)arg;
+    tcb_t         self = sched_current();
+    u64           t0   = timer_read_us();
+
+    while ((timer_read_us() - t0) < (u64)SPIN_BUDGET_US) {
+        u32 sp;
+
+        p->count++;
+        if (*p->other != 0u) {
+            p->saw_other = 1u;
+        }
+
+        /*
+         * ★ "这个线程跑在自己的栈上" ★
+         *
+         * 用 <= 与 > 的不对称区间:`kernel_stack` 是栈顶上界,初始 sp
+         * **正好等于**它(满递减栈第一次写落在 top-4),所以上界取闭、
+         * 下界取开。写成双闭会把初始那一轮误判成越界。
+         */
+        sp = arch_read_sp();
+        if (self != NULL && (sp <= self->kstack_base || sp > self->kernel_stack)) {
+            p->sp_bad++;
+        }
+    }
+
+    p->done = 1u;
+    sched_park_self();
+    for (;;) {
+        arch_wfi();
+    }
+}
+
+static void spin_probe_a(void *arg)
+{
+    spin_probe((void *)&g_spin[0]);
+    (void)arg;
+}
+
+static void spin_probe_b(void *arg)
+{
+    spin_probe((void *)&g_spin[1]);
+    (void)arg;
+}
+
+static void spin_ctl_a(void *arg)
+{
+    spin_probe((void *)&g_spin_ctl[0]);
+    (void)arg;
+}
+
+static void spin_ctl_b(void *arg)
+{
+    spin_probe((void *)&g_spin_ctl[1]);
+    (void)arg;
+}
+
+/* 把一对探针清零并互相指认 */
+static void spin_reset(spin_probe_t *pair)
+{
+    u32 i;
+
+    for (i = 0u; i < 2u; i++) {
+        pair[i].count     = 0u;
+        pair[i].saw_other = 0u;
+        pair[i].sp_bad    = 0u;
+        pair[i].done      = 0u;
+        pair[i].other     = &pair[1u - i].count;
+    }
+}
+
+/*
+ * 计费探针:独占 CPU 跑 20ms,量自己的 vruntime 涨了多少。
+ *
+ * 用**自己**的 vruntime 而不是"把 current 硬指到某个线程上":
+ * 后者在帧路径上线之后是错的 —— 那等于让调度器把正在跑的 kmain 的现场
+ * 收进那个线程的 ctx。判据的实现方式必须跟着机制走。
+ *
+ * ⚠ `timer_delay_us` 用全局定时器(自由运行),所以这 20ms 是墙钟。
+ */
+static void acc_probe(void *arg)
+{
+    tcb_t self = sched_current();
+    u64   t0;
+
+    (void)arg;
+
+    if (self == NULL) {
+        sched_park_self();
+        for (;;) {
+            arch_wfi();
+        }
+    }
+
+    t0 = self->eevdf_vruntime;
+    timer_delay_us(20000u);
+    g_tick_acc_delta = self->eevdf_vruntime - t0;
+
+    sched_park_self();
     for (;;) {
         arch_wfi();
     }
@@ -1718,112 +1886,148 @@ void kmain(void)
         sched_kern_bind(&g_kstack, &g_heap);
         sched_kern_init();
 
-        g_yield_a   = 0u;
-        g_yield_b   = 0u;
+        g_yield_a        = 0u;
+        g_yield_b        = 0u;
         g_tick_acc_delta = 0u;
 
+        /*
+         * ★ 造线程期间必须关掉调度 ★
+         *
+         * 只要 idle 注册过、队列里有一个可运行的线程,**下一发 tick**
+         * 就会把启动流程切走(不是"过一会儿",是下一毫秒)。于是
+         * "造第一个线程"与"造第二个线程"之间可能就被切走了 ——
+         * 第二个线程根本没被造出来,而自检会以一个看起来毫无道理的方式失败。
+         *
+         * 这是个真实存在的竞态,不是理论担忧:CPU 667MHz,一次
+         * `sched_kthread_create` 是微秒级,而 1kHz 的 tick 是毫秒级 ——
+         * 属于"偶尔错一次"的那一类,最难查。
+         *
+         * ⇒ 用 `sched_disable()` 把造线程的窗口罩起来。
+         *   (源 OS 也有这对开关,它用 `disable_scheduler()` /
+         *    `enable_scheduler()` 把 `change_proccess` 本身罩住。)
+         */
+        sched_disable();
+
+        /*
+         * ★ 照源 OS:把**启动上下文**注册成 idle(current 从此刻起非空)★
+         *   idle 不是另一个线程,而是跑启动流程的这个上下文自己;
+         *   它的 ctx.pc = 0 是"上下文无效"的标记 —— 但**只到第一次被切走为止**:
+         *   那一刻它的现场被收进 ctx,从此它就是一个可恢复的普通上下文,
+         *   于是启动流程才回得来(这正是下面 `g_idle_pc_harvested` 验的事)。
+         */
+        sched_register_boot_idle();
+        g_sched_idle_ok = ((sched_current() == sched_boot_idle()) &&
+                           (sched_boot_idle()->ctx.pc == 0u) &&
+                           (sched_boot_idle()->task_level == TASK_IDLE_LEVEL))
+                              ? 1u
+                              : 0u;
+        g_idle_pc_was_zero = (sched_boot_idle()->ctx.pc == 0u) ? 1u : 0u;
+
+        /* ---- 相 0:tick 里给 current 计费(照源 OS scheduler.cpp:437)---- */
+        /*
+         * 做法:造**一个**线程,让它独占着跑一段,量它自己的 vruntime 增长。
+         *
+         * ⚠ 不能像早先那样"把 current 硬指到某个没在跑的线程上" ——
+         *   帧路径一上线,那等于让调度器把**正在跑的 kmain 的现场**
+         *   收进那个线程的 ctx。自检的实现方式本身必须跟着机制改。
+         *
+         * 为什么用一个独跑的线程就够了:它是队列里唯一的一个,
+         * `sched_pick_next` 挑不到别人,兜底 `current 可运行 ⇒ 继续跑它`,
+         * 于是它确实连续占着 CPU 20ms —— 判据于是是干净的
+         * "vruntime 涨了 ≈ 墙钟 20ms"。
+         *
+         * (早先失败过的那一版测的是 idle 的 vruntime,得到恒 0 ——
+         *  而那是**对的**:`sched_account_run` 对 idle 早退,源 OS 的
+         *  `charge_current_eevdf_runtime` 也一样,idle 不参与公平分配。
+         *  判据写错了不是代码错了。)
+         */
+        if (sched_kthread_create(acc_probe, NULL, "acc") == NULL) {
+            console_puts(" Sched acc   : kthread_create FAILED\n");
+        } else {
+            sched_enable();
+            timer_delay_ms(100);
+            g_tick_acc_ok = ((g_tick_acc_delta >= 10u * SCHED_TICK_NS) &&
+                             (g_tick_acc_delta <= 40u * SCHED_TICK_NS))
+                                ? 1u
+                                : 0u;
+            console_printf(" Sched tick  : vruntime += %u us over 20 ms wall (%s)\n",
+                           (u32)(g_tick_acc_delta / 1000u), g_tick_acc_ok ? "PASS" : "FAIL");
+        }
+
+        /* ---- 相 1:陷阱式让出(svc #ARM_SVC_YIELD)---- */
+        sched_disable();
         if (sched_kthread_create(yield_probe_a, NULL, "ya") == NULL ||
             sched_kthread_create(yield_probe_b, NULL, "yb") == NULL) {
             console_puts(" Sched       : kthread_create FAILED\n");
         } else {
-            console_printf(" Sched       : 2 threads created, stack pool used=%u\n",
-                           g_kstack.used_slots);
-
             /*
-             * ★ 照源 OS:把**启动上下文**注册成 idle(current 从此刻起非空)★
-             *   idle 不是另一个线程,而是跑启动流程的这个上下文自己;
-             *   它的 ctx.pc = 0 是"上下文无效"的标记。
-             */
-            sched_register_boot_idle();
-            /* 两项一起判:idle 就是启动上下文自己,且它的 pc == 0(上下文无效)*/
-            g_sched_idle_ok = ((sched_current() == sched_boot_idle()) &&
-                               (sched_boot_idle()->ctx.pc == 0u) &&
-                               (sched_boot_idle()->task_level == TASK_IDLE_LEVEL))
-                                  ? 1u
-                                  : 0u;
-
-            if (arch_ctx_save(&g_sched_return) == 0u) {
-                g_sched_return.r[0] = 1u;
-                /* 直接把控制权交给测试线程(协作式入口;源 OS 的切换点在 tick,
-                 * 那是 M4-9 —— 这里用的是 M4-7 的 arch_ctx_switch 原语) */
-                sched_yield();
-            }
-
-            /*
-             * 回到启动上下文了 —— 把 current 也指回 idle。
-             * (探针切回来用的是 arch_ctx_switch 原语,它只搬寄存器与栈,
-             *  不负责改 current_task;那是调度器的账。)
-             */
-            /*
-             * ---- M4-9:tick 里的调度决策(只记数,不搬帧)----
+             * 两个线程各让出 8 轮。判据是**两边都正好到 8** ——
+             * 等号而不是"大于零":少一次说明让出丢了,多一次说明有重入。
              *
-             * 让两个**不让出**的线程在就绪队列里待着,然后跑一段时间。
-             * 每 tick 的决策路径都会跑:时间片计数 -> 到点挑下一个 ->
-             * 上下文有效就"本来应该切换"。
-             *
-             * 判据(二值、且能区分两类错误):
-             *   - would_switch > 0:决策路径真的走到了"该切"那一支
-             *   - invalid_ctx 计数变化正常:idle 被挑到时走的是"放弃"那一支
-             *   ★ 而系统**没有崩**:帧没有被搬,所以行为应当与之前完全一致 ★
+             * 跑完之后它们**挂起自己**(sched_park_self),队列于是变空,
+             * 调度器兜底挑 idle —— 而 idle 就是 kmain,于是控制权回到这里。
+             * 整个过程没有一句"手动切回测试点"的代码:这是 M4-9 与 M4-8
+             * 最本质的差别。
              */
-            g_tick_would_switch = sched_tick_would_switch();
-            g_tick_invalid_ctx  = sched_tick_invalid_ctx();
-            timer_delay_ms(20);
-            g_tick_would_switch = sched_tick_would_switch() - g_tick_would_switch;
-            g_tick_invalid_ctx  = sched_tick_invalid_ctx() - g_tick_invalid_ctx;
+            sched_enable();
+            timer_delay_ms(200);
+        }
 
-            g_tick_decision_ok = (g_tick_would_switch > 0u) ? 1u : 0u;
+        g_yield_switches = sched_switch_count();
+        g_yield_local_ok = (local_check == 0xC0FFEE00u) ? 1u : 0u;
+        g_yield_ok       = ((g_yield_a == YIELD_ROUNDS) && (g_yield_b == YIELD_ROUNDS) &&
+                            (g_yield_switches > YIELD_ROUNDS))
+                               ? 1u
+                               : 0u;
 
-            console_printf(" Sched tick  : would_switch=%u invalid_ctx=%u decision=%s\n",
-                           g_tick_would_switch, g_tick_invalid_ctx,
-                           g_tick_decision_ok ? "PASS" : "FAIL");
+        console_printf(" Sched       : yield a=%u/%u b=%u/%u switches=%u caller_stack=%s\n", g_yield_a,
+                       YIELD_ROUNDS, g_yield_b, YIELD_ROUNDS, g_yield_switches,
+                       g_yield_local_ok ? "PASS" : "FAIL");
+        console_printf(" Sched       : trap yield (svc) = %s\n", g_yield_ok ? "PASS" : "FAIL");
 
-            /* ---- tick 计费:跑 20ms,一个**非 idle** 线程的 vruntime 应当涨 ≈ 20ms ---- */
-            /*
-             * ⚠ 第一版测的是 idle 的 vruntime,得到恒为 0 —— 而那是**对的**:
-             *   `sched_account_run` 对 idle 早退,源 OS 的
-             *   `charge_current_eevdf_runtime` 也一样("idle 不参与公平分配")。
-             *   判据写错了不是代码错了。所以这里临时把一个真实线程设成 current,
-             *   让 tick 去计它的费。
-             */
-            {
-                tcb_t probe = sched_kthread_create(yield_probe_b, NULL, "acc");
-                u64   before;
-                u64   after;
+        /* ---- 相 2:★ M4-9 的验收 —— 抢占(帧搬迁)★ ---- */
+        /*
+         * 两个**绝不主动让出**的线程。它们能不能都动起来,完全取决于
+         * 时间片到点时"搬帧"这一步是不是真的发生。
+         *
+         * 判据见 spin_probe_t 的说明:核心是**两个线程互相见证**,
+         * 而不是"两个计数都大于零"(那一条在没有抢占时也成立)。
+         */
+        sched_disable();
+        spin_reset(g_spin);
+        {
+            tcb_t sa = sched_kthread_create(spin_probe_a, NULL, "sa");
+            tcb_t sb = sched_kthread_create(spin_probe_b, NULL, "sb");
 
-                if (probe != NULL) {
-                    probe->status = RUNNING;
-                    sched_set_current(probe);
-                    before = probe->eevdf_vruntime;
+            if (sa == NULL || sb == NULL) {
+                console_puts(" Sched preempt: kthread_create FAILED\n");
+            } else {
+                sched_enable();
+                timer_delay_ms(SPIN_BUDGET_US / 1000u + 300u);
 
-                    timer_delay_ms(20);
+                g_tick_switched    = sched_tick_switched();
+                g_tick_preempted   = sched_tick_preempted();
+                g_tick_invalid_ctx = sched_tick_invalid_ctx();
 
-                    after            = probe->eevdf_vruntime;
-                    g_tick_acc_delta = after - before;
-                    g_tick_acc_ok    = ((g_tick_acc_delta >= 10u * SCHED_TICK_NS) &&
-                                        (g_tick_acc_delta <= 40u * SCHED_TICK_NS))
+                g_spin_both_done     = (g_spin[0].done && g_spin[1].done) ? 1u : 0u;
+                g_spin_ok            = ((g_spin[0].count > 0u) && (g_spin[1].count > 0u) &&
+                                        g_spin[0].saw_other && g_spin[1].saw_other)
                                            ? 1u
                                            : 0u;
+                g_spin_sp_isolated   = ((g_spin[0].sp_bad == 0u) && (g_spin[1].sp_bad == 0u)) ? 1u : 0u;
+                g_preempt_switches_ok = (g_tick_preempted >= 2u) ? 1u : 0u;
+                g_idle_pc_harvested  = (sched_boot_idle()->ctx.pc != 0u) ? 1u : 0u;
 
-                    console_printf(" Sched tick  : vruntime += %u us over 20 ms (%s)\n",
-                                   (u32)(g_tick_acc_delta / 1000u), g_tick_acc_ok ? "PASS" : "FAIL");
-
-                    sched_set_current(sched_boot_idle()); /* 交还给 idle */
-                } else {
-                    console_puts(" Sched tick  : kthread_create FAILED\n");
-                }
+                console_printf(" Sched preempt: a=%u b=%u saw=(%u,%u) sp_bad=(%u,%u) done=%u\n",
+                               g_spin[0].count, g_spin[1].count, g_spin[0].saw_other,
+                               g_spin[1].saw_other, g_spin[0].sp_bad, g_spin[1].sp_bad,
+                               g_spin_both_done);
+                console_printf(" Sched preempt: switched=%u preempted=%u invalid=%u idle_ctx=%s\n",
+                               g_tick_switched, g_tick_preempted, g_tick_invalid_ctx,
+                               g_idle_pc_harvested ? "harvested" : "STILL-INVALID");
+                console_printf(" Sched preempt: interleaving witness = %s\n",
+                               g_spin_ok ? "PASS" : "FAIL");
             }
-
-            g_yield_switches  = sched_switch_count();
-            g_yield_local_ok  = (local_check == 0xC0FFEE00u) ? 1u : 0u;
-            g_yield_ok        = ((g_yield_a == YIELD_ROUNDS) && (g_yield_b == YIELD_ROUNDS) &&
-                                 (g_yield_switches > YIELD_ROUNDS)) ? 1u : 0u;
-
-            console_printf(" Sched       : a=%u/%u b=%u/%u switches=%u local=%s\n", g_yield_a,
-                           YIELD_ROUNDS, g_yield_b, YIELD_ROUNDS, g_yield_switches,
-                           g_yield_local_ok ? "PASS" : "FAIL");
-            console_printf(" Sched       : cooperative switching = %s\n",
-                           g_yield_ok ? "PASS" : "FAIL");
         }
     }
 
@@ -1968,50 +2172,72 @@ void kmain(void)
     selftest_report("irq_frame_violations", irq_frame_violations(), 0u, SELFTEST_EQ);
 
     /*
-     * ---- 协作式上下文切换(M4-7 后半段)----
+     * ---- 协作式上下文切换原语(M4-7 后半段)----
+     *
+     * 这一项验的是 `arch_ctx_save` / `arch_ctx_switch` **这两个原语本身**,
+     * 与调度器无关(调度器 M4-9 之后不再用它 —— 它走帧路径)。
+     * 保留它是因为"保存/恢复被调用者保存寄存器与栈"这件事仍然是
+     * 后续可睡眠原语(M4-11)的基础。
      *
      * 三项分开报,因为它们失败的原因完全不同:
      *   ctx_a      切回来之后 A 的调用点状态没保住(r4-r11 / sp 恢复错了)
      *   ctx_b      B 没跑起来,或它看到的 r4-r11 不是切换器恢复的那些
      *   stack      最要紧的一项:B 跑在**别人的栈**上(不换栈不会报任何错)
-     *   switch_ab  上面那条判据**承重性**的对照:故意不换栈时必须能检出
      */
+
     /*
-     * ---- 协作式调度(M4-8.3)----
+     * ---- idle 的注册方式(照源 OS)----
      *
-     * 三项分开:计数到没到、切换有没有真发生、切换有没有踩坏别人的栈。
-     * 第三项是 M4-7 那套判据的复用 —— 调度器错了往往先表现在这里。
-     */
-    /*
-     * ---- idle 的注册方式(M4-8,照源 OS)----
-     *
-     * idle 是**启动上下文自己**,不是另一个线程。判据是
-     * `current_task` 在注册后就是它、且它的 `ctx.pc == 0`(上下文无效标记)——
-     * 后者正是源 OS 里 `context0.rip == 0` 的对应物。
+     * idle 是**启动上下文自己**,不是另一个线程。两项判据:
+     *   - 注册后 `current_task` 就是它;
+     *   - 它的 `ctx.pc == 0` —— 源 OS 里 `context0.rip == 0` 的对应物,
+     *     含义是"**还没被切走过**,现场在 CPU 里不在内存里,不许切进来"。
      */
     selftest_report("sched_boot_idle", g_sched_idle_ok, 1u, SELFTEST_EQ);
 
     /*
-     * ---- tick 里给 current 计费(照源 OS scheduler.cpp:437)----
+     * ---- tick 里给 current 计费(← `scheduler.cpp:437`)----
      *
-     * 这是 M4-8 里唯一让策略在板上活起来的地方:跑 N 个 tick,
-     * current 的 vruntime 应当正好涨 N 毫秒。判据留了余量 ——
-     * 取样期间 tick 数是变化的,所以验的是"涨了、且量级对",
-     * 精确值由宿主单测保证。
+     * 一个线程独占 CPU 跑 20ms 墙钟,它自己的 vruntime 应当涨 ≈ 20ms。
+     * 判据留了余量(10..40ms):取样期间 tick 数是变化的,精确值由宿主单测保证。
      */
     selftest_report("sched_tick_account", g_tick_acc_ok, 1u, SELFTEST_EQ);
 
-    /*
-     * ---- tick 里的调度决策(M4-9,本步只决策不搬帧)----
-     *
-     * 判据是"决策路径走到了该切的那一支" —— 而系统行为与之前完全一致
-     * (帧没动)。这样"该不该切"与"搬帧搬得对不对"这两类错误就能分开归因。
-     */
-    selftest_report("sched_tick_decision", g_tick_decision_ok, 1u, SELFTEST_EQ);
-
+    /* ---- 陷阱式让出(M4-9):svc 进调度器,与抢占同一条路径 ---- */
     selftest_report("sched_yield_rounds", g_yield_ok, 1u, SELFTEST_EQ);
     selftest_report("sched_switches", (g_yield_switches > YIELD_ROUNDS) ? 1u : 0u, 1u, SELFTEST_EQ);
     selftest_report("sched_caller_intact", g_yield_local_ok, 1u, SELFTEST_EQ);
+
+    /*
+     * ---- ★ M4-9 的验收:抢占(搬帧)★ ----
+     *
+     * 五项分开报,因为它们的失败原因完全不同、排查方向也完全不同:
+     *
+     *   interleave   两个**互不见证**都成立 —— 这是唯一能区分
+     *                "真的交错"与"两个线程先后各跑一遍"的判据。
+     *   preempted    被换下的是真实线程(不是 idle)的次数 >= 2:
+     *                说明时间片到点真的把线程换下来了。
+     *   sp_isolated  两个线程的 sp **一次都没有**掉出自己那块栈区 ——
+     *                "帧搭在目标任务栈上"这件事的直接判据。
+     *   both_done    两个线程都跑完了各自那 20ms 墙钟预算。
+     *   idle_ctx     启动流程的现场**真的被收进了 idle 的 ctx**
+     *                (pc 从 0 变成非 0)。它同时是"kmain 被切走了"
+     *                与"kmain 又被切回来了"这两件事的证据:
+     *                没有前者这个值不会变,没有后者这一行根本打不出来。
+     */
+    selftest_report("sched_preempt_interleave", g_spin_ok, 1u, SELFTEST_EQ);
+    selftest_report("sched_preempt_switched", g_preempt_switches_ok, 1u, SELFTEST_EQ);
+    selftest_report("sched_preempt_sp_isolated", g_spin_sp_isolated, 1u, SELFTEST_EQ);
+    selftest_report("sched_preempt_both_done", g_spin_both_done, 1u, SELFTEST_EQ);
+    selftest_report("sched_idle_ctx_harvested", g_idle_pc_harvested, 1u, SELFTEST_EQ);
+    selftest_report("sched_idle_pc_was_zero", g_idle_pc_was_zero, 1u, SELFTEST_EQ);
+    /*
+     * `invalid_ctx` 必须恒为 0:它不是"发生过多少件坏事"的计数,
+     * 而是"调度器有没有挑到过不可切换的上下文"。挑了就是有 bug ——
+     * 正常路径上 idle 的 pc==0 只在注册与第一次切走之间成立,
+     * 而那个窗口里 current 就是 idle 自己(第 2 步直接返回,轮不到第 3 步)。
+     */
+    selftest_report("sched_preempt_invalid_ctx", g_tick_invalid_ctx, 0u, SELFTEST_EQ);
 
     selftest_report("switch_ctx_a", g_sw_ctx_a_ok, 1u, SELFTEST_EQ);
     selftest_report("switch_ctx_b", g_sw_ctx_b_ok, 1u, SELFTEST_EQ);
@@ -2086,6 +2312,86 @@ void kmain(void)
     HB[HB_SLOT_SELFTEST_FAILED] = selftest_summary();
     console_puts("\n");
 
+    /* ---- 9.75 抢占的破坏性对照组(必须在自检报告**之后**)---- */
+    /*
+     * 为什么必须在报告之后:对照组会**故意把调度状态搅歪**
+     * (决策照做、执行流不动 ⇒ `current_task` 与真正在跑的上下文不一致),
+     * 放进报告之前会让别的自检项跟着一起歪 ——
+     * 那三条 FAIL 会看起来像"别的地方也坏了",而实际只有一个原因。
+     *
+     * ## 对照的是什么
+     *
+     * 同一段抢占代码、同一对探针线程、同一段时间预算,**只把最后一步
+     * "把新帧交出去"关掉**(`g_reloc_skip = 1`)。于是:
+     *
+     *   搬帧开:两个线程都跑起来、互相见证、各自跑满 20ms  → 计数非 0
+     *   搬帧关:决策做了一堆(current_task 都在两个线程之间轮转了好几遍),
+     *           而**执行流一步没动** → 两个计数恒为 0
+     *
+     *   ⇒ 这两个数的差别,就是"搬帧"这件事的承重性。
+     *
+     * ⚠ 判据是"两者**都为 0**"(检出),不是"有一个非 0"。
+     *   像 M4-7 那个"不换栈"的对照组一样,这里是**预期它坏**。
+     */
+    {
+        tcb_t ca;
+        tcb_t cb;
+
+        spin_reset(g_spin_ctl);
+
+        sched_disable();
+        ca = sched_kthread_create(spin_ctl_a, NULL, "ca");
+        cb = sched_kthread_create(spin_ctl_b, NULL, "cb");
+
+        if (ca == NULL || cb == NULL) {
+            console_puts(" Preempt A/B : kthread_create FAILED\n");
+        } else {
+            u32 switched_before = sched_tick_switched();
+
+            g_reloc_skip = 1u; /* ★ 对照组:决策照做,不交出目标帧 ★ */
+            sched_enable();
+            timer_delay_ms(SPIN_BUDGET_US / 1000u + 200u);
+            g_reloc_skip = 0u;
+
+            g_reloc_ctl_a = g_spin_ctl[0].count;
+            g_reloc_ctl_b = g_spin_ctl[1].count;
+
+            /*
+             * 检出条件有两个,都要成立:
+             *   1. 两个探针计数都是 0(线程一次都没跑起来);
+             *   2. 这期间**确实做了切换决策**(否则"没跑起来"只是因为
+             *      压根没人被挑中,那就什么也证明不了)。
+             */
+            g_reloc_ctl_detected =
+                ((g_reloc_ctl_a == 0u) && (g_reloc_ctl_b == 0u) &&
+                 (sched_tick_switched() > switched_before))
+                    ? 1u
+                    : 0u;
+
+            console_printf(" Preempt A/B : skip_frame -> a=%u b=%u switched=%u\n", g_reloc_ctl_a,
+                           g_reloc_ctl_b, sched_tick_switched() - switched_before);
+            console_printf(" Preempt A/B : 未搬帧 -> %s(这就是「决策说切了、执行流没动」的样子)\n",
+                           g_reloc_ctl_detected ? "检出" : "未检出 —— 判据不承重!");
+
+            /*
+             * ---- 收拾:对照组把状态搅歪了,必须复位 ----
+             *
+             * 两个 ctl 线程**从来没跑过**,它们的 ctx 在对照组期间被
+             * 收进去的是 **kmain 的现场**(因为 `current_task` 被轮转到了
+             * 它们身上)—— 那是垃圾,所以只能把它们挂起,不能留着。
+             * 队列里也可能还挂着它们,所以整队复位。
+             */
+            ca->status      = WAIT;
+            ca->wakeup_time = 0u;
+            cb->status      = WAIT;
+            cb->wakeup_time = 0u;
+
+            sched_set_current(sched_boot_idle());
+            sched_boot_idle()->status = RUNNING;
+            sched_kern_init();
+        }
+    }
+
     /* ---- 9.7 切换器的破坏性对照组(必须在自检报告**之后**)---- */
     /*
      * 为什么放在最后:**这个对照组会故意毁掉调用者的栈**。
@@ -2103,6 +2409,11 @@ void kmain(void)
      *
      * 所以它只能放在最后跑,而且结论以普通输出给出(不进报告)——
      * 进了报告反而会因为它自己造成的破坏而变成误报。
+     *
+     * ⚠ M4-9 之后 `arch_ctx_switch` **不再被调度器使用**(它走帧路径了),
+     *   所以这一段验的是"这个原语本身"—— 它仍然是 M4-11 那些
+     *   可睡眠原语的基础。放在 `sched_kern_init()` 复位之后,
+     *   两者不会互相干扰。
      */
     if (g_kstack.inited) {
         kstack_t stk_c;

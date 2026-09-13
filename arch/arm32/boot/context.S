@@ -228,3 +228,39 @@ arch_ctx_switch:
     .align  2
 g_ctx_skip_sp:
     .word   0
+
+/* ==================================================================== */
+/* 陷阱式让出(M4-9)                                                    */
+/* ==================================================================== */
+/*
+ * void arch_svc_yield(void)
+ *
+ * 一条 `svc`,然后 `bx lr`。
+ *
+ * 关键全在 `svc` 做了什么(ARMv7-A):
+ *
+ *   SPSR_svc <- CPSR        (进去之前的 CPSR,含 I/F 位)
+ *   LR_svc   <- 返回地址     (也就是下面那条 `bx lr` 的地址)
+ *   CPSR.mode <- SVC        (本来就在 SVC 模式,不变)
+ *   CPSR.I   <- 1           (所有异常都会置 I)
+ *
+ * 于是 `EXC_FRAME_ENTER ARM_EXC_RET_FIX_SVC`(RET_FIX = 0)把 LR_svc 原样
+ * 当返回地址存进帧的 `ret` 槽 —— 恢复时 `rfeia` 正好落回 `bx lr`。
+ * I 位不用担心:帧的 `spsr` 槽存的是**进去之前**的 CPSR,`rfeia` 会把它
+ * 整个装回去。
+ *
+ * ⚠ 这一条**不能被编译器优化掉或内联**:它必须是一次真的异常入口,
+ *   否则帧路径(以及"现场收进 ctx")就无从谈起。
+ *   放在独立的 .S 文件里、由 C 以函数调用触达,是保证这件事的最简做法。
+ *
+ * ⚠ 为什么是 SVC 而不是 GIC 的 SGI:`int n`(x86 的软中断)**不受 IF 屏蔽**,
+ *   而 SGI 是一条 IRQ,CPSR.I=1 时会被挂起。`scheduler_sleep_ns()` 那种
+ *   `do { yield(); } while (WAIT);` 在关中断的上下文里用 SGI 会空转不切换。
+ *   理由详见 arch/taskctx_asm.h。
+ */
+    .global arch_svc_yield
+    .type   arch_svc_yield, %function
+arch_svc_yield:
+    svc     #ARM_SVC_YIELD
+    bx      lr
+    .size   arch_svc_yield, . - arch_svc_yield
