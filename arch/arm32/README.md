@@ -1392,7 +1392,44 @@ FPEXC.EN(bit30)          = 1       VFP 本身使能
 |---|---|---|---|---|
 | D1 | **`errno` 是全局变量，不是每任务** | `src/krlibc.c` | M4-1 阶段还没有线程可谈 | **M4-6 有了 TCB 之后**，改成 per-task（与 Linux 的 `current->errno` 同构）|
 | D2 | **`strtok` 的状态是全局静态变量** | `src/krlibc.c` | fs 层只有 `vfs.cpp` 的 2 处调用，暂时可控 | M4-11 有了可睡眠原语与任务之后。两个任务同时 strtok 会互相踩 —— 旧 XJ380 也是这个实现，所以不是移植引入的，但必须记下来 |
-| D3 | **内核用硬浮点编译，且会真的执行 VFP 指令** | `boot/start.S` 已使能 CPACR/FPEXC | 现在没有任务切换，FP 状态不需要保存/恢复 | **M4-6/M4-7 二选一**：(a) 调度器保存/恢复 VFP 上下文（32 个 D 寄存器 × 2 核，代价不小）；(b) **把内核改成 `-mgeneral-regs-only`，让内核永不碰 FP**（Linux 的做法），用户态仍可用硬浮点。**倾向 (b)** —— 它同时消掉"内核 FP 上下文"这一整类问题 |
+| ~~D3~~ | ~~内核用硬浮点编译~~ | — | — | **已结案：不是退化，是照源 OS 的设计。** 见下方「FP 上下文」一节 |
+
+
+#### FP 上下文：已按源 OS 对齐（D3 结案）
+
+加 palloc 时炸出的 FPU 雷（见上一节）牵出一个必须跟源 OS 对齐的设计点。
+查 **x86 XJ380 的实际做法**：
+
+```c
+/* include/cpu/fpu.h —— 每个任务一份 */
+typedef struct { uint8_t fxsave_area[512] __attribute__((aligned(16))); } fpu_context_t;
+void save_fpu_context(fpu_context_t *ctx);     /* fxsave64  */
+void restore_fpu_context(fpu_context_t *ctx);  /* fxrstor64 */
+
+/* kernel/task/scheduler.cpp:121-122 —— 每次上下文切换都做 */
+save_fpu_context(&current_task0->fpu_context);
+restore_fpu_context(&target->fpu_context);
+```
+
+`kernel/task/pcb.cpp` 的 fork 路径 `memcpy(..., 512)` 复制它，`main.cpp` 给 idle
+线程也存一份。编译选项里只有 `-mno-80387`（禁 x87），**没有 `-mno-sse`** ——
+也就是说**源 OS 允许内核使用 SIMD**。
+
+**⇒ 结论：ARM 侧照做，不要改成"内核永不碰 FP"。**
+
+| x86 XJ380 | ARM32 对应物 |
+|---|---|
+| `fpu_context_t` = 512B FXSAVE 区 | VFP 上下文 = d0–d31（32×8=256B）+ FPSCR（4B），对齐 8 |
+| `fxsave64` / `fxrstor64` | `vstmia` / `vldmia` 存取 d0–d31，`vmrs`/`vmsr` 读写 FPSCR |
+| 放进 PCB，切换时保存/恢复 | 放进 TCB（M4-6 定结构），M4-7 的切换点调用 |
+| 内核可自由用 SSE | 内核可自由用 VFP（`-mfpu=vfpv3 -mfloat-abi=hard` **保持不变**）|
+
+**⚠ 因此 `-mgeneral-regs-only` 是错的** —— 它会让 ARM 侧偏离源 OS。
+之前倾向它是因为那样能省掉内核 FP 上下文，但那是**为了省事而改设计**，
+与 B5"两个架构共用同一套契约"直接冲突。
+
+实现位置：M4-6（TCB 结构）定型后，M4-7（上下文切换）里加上
+`fpu_save`/`fpu_restore` 两个原语与切换点的调用。**新增一处，就得进这张表。**
 
 （后续 M4 各阶段每引入一处退化，都往这张表里加一行。表里任何一行在
 对应条件满足后仍未替换，都是需要解释的。）
