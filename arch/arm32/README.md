@@ -2440,16 +2440,34 @@ CPU0 布的指针会被 CPU1 覆盖 ⇒ **CPU0 把 FPSCR 存进别人的 TCB**�
 
 ```
 自检          smp_sched_two_cores / smp_sched_created / smp_sched_placement
-              smp_sched_cpu1_ran / smp_ap_idle / smp_ap_idle_back
-              smp_cpu1_sched_ready / kstack_headroom       全部 PASS
-板上总计      81 passed / 0 failed（上一阶段 73/0）
+              smp_sched_cpu1_ran / smp_sched_cpu0_ran / smp_app_level_cpu0
+              smp_fp_cpu1_checked / smp_fp_cpu1_ok / smp_fp_all_ok
+              smp_ap_idle / smp_ap_idle_back / smp_cpu1_sched_ready
+              kstack_headroom                              全部 PASS
+板上总计      86 passed / 0 failed（上一阶段 73/0）
 六组 A/B      搬帧 / VFP / 扫描唤醒 / 无饥饿 / 选核 / 不换栈 —— 全部检出
+              + `Preempt A/B: invalid bound: delta=53 <= 59 -> PASS`
 宿主          9 failed / 73 passed（9 项预先存在且无关）
 命令通道      tmp-test/shell_test.py 10/10（顺带修好了它的过期等待窗口，见坑 44）
 ```
 
 **没有新增退化条目** —— D6/D12/D15 结案，新增的注意点写在计划的未决项里
 （名册倾斜、栈池余量、`online` 含义加强）。
+
+#### 收尾补掉的五个缺口（用户点名，一次补齐）
+
+| 缺口 | 补法 | 实测 |
+|---|---|---|
+| ★ **CPU1 上的浮点现场从没被验过**（10.6 的理由是"两核会互踩"，而 FP 探针全钉在 CPU0）| `smp_sched_probe` 顺手核对 d0-d31（图案只填一次），而这一批探针按"最短队列"正好落在 CPU1 | `fp: bad_all=0 cpu1_bad=0 cpu1_checks=19010`；判据拆成"真的核对过"(`smp_fp_cpu1_checked`)与"没被破坏"(`smp_fp_cpu1_ok`) |
+| ★ **10.5 应用级→CPU0 在板上不可达** | 新增 `sched_kthread_create_level()`（M7 建应用线程走同一条路），相 6 造一个应用级线程：**哪怕 CPU1 更空也必须落 CPU0** | `app_level cpu=0 (must be 0)`；顺带 `ran=(1,3)` ⇒ "两个核都跑过**我的**探针"成立 |
+| **相 4 仍在用 `timer_delay_ms`**（N 次串行 1ms，被抢占多久就多花多久）| 改名 `wait_ms_wall()` 并把**全部 9 处**等待（相 0/2/3/4 + 三组对照组窗口）换成截止时刻语义 | 相 4 从 **5.4 s 回到 3.0 s**，整机启动短约 4 秒；`phase=XXXX ms` 从此是设计值 |
+| **`invalid=0->53` 那个"时序敏感点"** | 定位 + 变成**有上界**的判据：`invalid` 每次派发决策涨一次 ⇒ 上界 = 窗口 ÷ 片长 | `delta=53 <= 59 -> PASS`，差额正是最前面那两次（那时 ca/cb 的 ctx 还是自己的 ⇒ `switched=+2`）——**两个数现在同一条账** |
+| **"均衡性"** | 不是缺口而是决定：源 OS 没有周期性均衡（全树零命中）⇒ 不改；这次把**规则**两个方向都验了 | `place_bad=0`（内核级按最短队列）+ 应用级钉 CPU0 |
+
+⚠ **补第 4 条时踩到的一条既有约定**：报告在 9.75 **之前**就打完了，所以
+**对照组里算出来的判据不能当报告项**（这正是另外五组 A/B 的结论只以普通输出给出的原因）。
+我第一版把 `invalid bound` 写成了报告项 ⇒ 它读到的永远是初值 0 ⇒ **一条假 FAIL**。
+**"判据放在报告的哪一侧"本身是有约束的** —— 这条现在也写进了代码注释。
 
 ### 12. 其它待办（AM3 及以后）
 
