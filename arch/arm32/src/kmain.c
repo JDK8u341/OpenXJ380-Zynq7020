@@ -130,6 +130,7 @@ void kmain(void)
     u32      last_ps    = 0xFFFFFFFFu;
     u32      before_us  = 0; /* 使能缓存前的基准耗时 */
     bool     uart_present;
+    bool     uart_loopback_ok = false;
 
     /* static: 由 BSS 自动清零。这样在"无串口"路径下打印诊断也不会读未初始化值 */
     static uart_baud_result_t baud_result;
@@ -195,6 +196,25 @@ void kmain(void)
          */
         uart_init(PLAT_CONSOLE_UART_BASE, uart_clk, PLAT_CONSOLE_BAUD, &baud_result);
         console_init(PLAT_CONSOLE_UART_BASE, uart_clk, PLAT_CONSOLE_BAUD);
+
+        /*
+         * ---- 收发通路自检(必须在这里做,不能挪到自检报告那一节)----
+         *
+         * 用它把"驱动/寄存器有问题"与"外部线缆有问题"分开:
+         * 内部环回把发送端在芯片内直接接到接收端,不经过外部引脚。
+         *
+         * ⚠ 位置是有讲究的,放在这里有两个硬理由:
+         *
+         * (a) 它会临时把 MR 切成环回再切回来。放在报告打印中途做,
+         *     会把已经排队但还没发出去的输出冲掉(实测:整条
+         *     `CHECK uart_baud_ppm` 消失、上一行只剩半行)。
+         * (b) 本地环回模式下 TX 引脚**仍然在输出**,探针字节会漏到线上。
+         *     放在横幅之前,漏出来的那个字符落在报告区间之外,
+         *     不会把 `CHECK` 行首污染成 `UCHECK` 而让解析脚本漏读一项。
+         *
+         * 结果缓存下来给后面的自检报告用。
+         */
+        uart_loopback_ok = uart_loopback_selftest(PLAT_CONSOLE_UART_BASE);
     }
 
     HB[HB_SLOT_UARTCLK] = uart_clk;
@@ -634,22 +654,10 @@ void kmain(void)
     selftest_report("uart_clock_source", clock_source, 1u, SELFTEST_EQ);
     selftest_report("uart_baud_ppm", baud_result.error_ppm, 50u, SELFTEST_LE);
     /*
-     * 收发通路自检。
-     *
-     * 这一项**专为命令通道而加**:命令通道靠 RX,而"收不到数据"有两类
-     * 完全不同的原因 —— 驱动/寄存器配置有问题,或者外部线缆/对端有问题。
-     * 现象一模一样,排查方向却相反。
-     *
-     * 内部环回把发送端在芯片内直接接到接收端,不经过外部引脚,
-     * 于是能把这两类**分开**:环回通说明 UART 与驱动都好,
-     * 收不到就是外部的事;环回不通则与线缆无关。
-     *
-     * ⚠ 必须在控制台横幅打完、且没有别的东西在用串口时调用 ——
-     *   它会临时把 MR 切成环回模式再切回来。
+     * 收发通路自检的结果在串口初始化之后就已经拿到(见前面的说明):
+     * 它必须在没有任何待发输出、且报告区间之外的时刻执行。
      */
-    selftest_report("uart_loopback",
-                    uart_present ? (uart_loopback_selftest(PLAT_CONSOLE_UART_BASE) ? 1u : 0u) : 0u, 1u,
-                    SELFTEST_EQ);
+    selftest_report("uart_loopback", uart_loopback_ok ? 1u : 0u, 1u, SELFTEST_EQ);
 
     selftest_report("mmu_stage", HB[HB_SLOT_MMUSTAGE], HB_MMU_STAGE_ON, SELFTEST_EQ);
     selftest_report("mmu_enabled", mmu_is_enabled() ? 1u : 0u, 1u, SELFTEST_EQ);

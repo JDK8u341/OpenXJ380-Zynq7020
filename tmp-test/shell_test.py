@@ -82,8 +82,15 @@ CASES = [
     Case("dump", ["Board devices:", "axi_gpio_0", "xlnx,axi-gpio-2.0"]),
     Case("probe", ["Board probe", "probed=1"]),
     Case("selftest", ["SELF-TEST BEGIN", "SELF-TEST SUMMARY"]),
-    # peek 读我们自己刚写进去的 LED 寄存器,应当等于 0(自检结束后清零了)
-    Case("peek 41200008", ["peek 0x41200008", "0x00000000"], wait=2.0),
+    # peek 读心跳区的 magic 槽。
+    #
+    # 这里原来读的是 0x41200008(AXI GPIO 的 LED 数据寄存器)并期待 0,
+    # 前提就是错的 —— 主循环的流水灯一直在改写它,所以它几乎不可能是 0。
+    # 上板实测读回 0x00000010 而判定 FAIL,是**期望值定错**,不是 peek 有问题。
+    #
+    # 换成 OCM 心跳的 magic:内核在 kmain 开头写死 0x4F583338("OX38"),
+    # 是个常量,与 JTAG 加载器里的同名校验互为交叉验证。
+    Case("peek 20000", ["peek 0x00020000", "0x4F583338"], wait=2.0),
     # 未知命令必须有明确报错,而不是静默什么都不做
     Case("nosuchcmd", ["unknown command: nosuchcmd"]),
     # 前缀不能匹配(与 nosuchcmd 同等重要:敲少一个字母不该执行别的命令)

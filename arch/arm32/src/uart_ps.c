@@ -63,6 +63,15 @@
 #define UART_POLL_LIMIT 2000000u
 
 /*
+ * 环回自检最多读几个字节去找探针。
+ *
+ * 正常只需要 1 个;之所以多给几个,是因为 TXEMPTY 只表示 FIFO 空、
+ * 不表示移位寄存器空 —— 切到环回瞬间可能还有上一批输出的尾巴绕回来,
+ * 排在探针前面。给到 8 足够容错,又不会在真失败时拖长启动时间。
+ */
+#define UART_LOOPBACK_TRIES 8
+
+/*
  * 上一次闭环收敛实际用掉的迭代次数。
  *
  * 之所以要把它暴露出来:收敛"返回 100.5MHz"和"失败后用 100.5MHz 兜底"
@@ -246,27 +255,51 @@ char uart_getc(uintptr_t base)
  *
  * 这一步把"要不要去查线"从一个猜测变成一个有结论的问题。
  *
- * ⚠ 自检会临时改 MR 再改回来。调用时应当确保没有别的代码正在用这个串口
- *   (启动阶段调用即可)。
+ * ⚠ 自检会临时改 MR 再改回来,并且**会把探针字节发到 TX 引脚上**
+ *   (本地环回并不切断引脚输出)。所以:
+ *     - 应当在"没有待发输出"的时刻调用,否则会打乱正在打印的内容;
+ *     - 漏出来的那个探针字符会出现在串口上,是正常现象,不是故障。
+ *   启动阶段在横幅之前调用即可。
  */
 bool uart_loopback_selftest(uintptr_t base)
 {
     const char probe = 'U';
     u32        saved_mr;
     u32        spins;
-    char       got;
+    int        tries;
+    char       got = 0;
 
     if (!uart_probe(base)) {
         return false;
     }
+
+    /*
+     * ⚠⚠ 必须先等发送器排空,再碰 FIFO。见下方"环回自检吃掉串口输出"的注释。
+     * 顺序反了会静默丢掉几十字节已经排队、但还没发出去的输出。
+     */
+    (void)uart_wait_tx_empty(base);
 
     saved_mr = mmio_read32(base + UART_MR);
 
     /* CHM = 0b10 (本地环回);其余位保持原样,尤其是 8N1 那几位 */
     mmio_write32(base + UART_MR, (saved_mr & ~UART_MR_CHM_MASK) | UART_MR_CHM_LOCAL_LOOPBACK);
 
-    /* 清掉 FIFO 里可能残留的东西,避免把旧数据当成环回结果 */
-    mmio_write32(base + UART_CR, UART_CR_TXRST | UART_CR_RXRST);
+    /*
+     * 只清 RX,不写 TXRST。
+     *
+     * TX 已经在上面排空了,没有东西需要冲;而 TXRST 会**连带丢掉已经
+     * 排队但尚未发出的字节** —— uart_putc 只等 TXFULL 清零(保证 FIFO 里
+     * 有一个空位)就返回,并**不等待字节真的发出去**。9600 波特下 64 字节
+     * 的 FIFO 要 ~67ms 才能排空,所以调用到这里时 FIFO 里通常还压着
+     * 刚打印的报告文本。
+     *
+     * 这个坑真实发生过,而且极难定位:启动自检报告里
+     * `CHECK uart_baud_ppm` 整行消失、`uart_clock_source` 只剩半行,
+     * 被下一行拼上,看上去像"串口丢包"或"printf 截断"。
+     * 实测两次抓包字节完全一致(确定性),才排除掉抓包竞态,
+     * 最终定位到这里 —— 丢的正是"打印完还没发出去"的那一段。
+     */
+    mmio_write32(base + UART_CR, UART_CR_RXRST);
     mmio_write32(base + UART_CR, UART_CR_TXEN | UART_CR_RXEN);
 
     /* 发一个字节 */
@@ -279,21 +312,38 @@ bool uart_loopback_selftest(uintptr_t base)
     }
     mmio_write32(base + UART_TX_FIFO, (u32)probe);
 
-    /* 等它从内部绕回来。有超时 —— 否则通路断了就是死循环 */
-    spins = UART_POLL_LIMIT;
-    while ((mmio_read32(base + UART_SR) & UART_SR_RXEMPTY) != 0) {
-        if (--spins == 0) {
+    /*
+     * 在最先收到的若干个字节里找探针,而不是"读第一个就下结论"。
+     *
+     * 为什么不能只读一个:TXEMPTY 只表示 **FIFO 空**,不表示移位寄存器空。
+     * 切到环回那一刻,上一批输出里最后一个字节可能还在往外移,
+     * 它会一起绕回 RX FIFO 并排在探针前面 —— 只读第一个就会拿到它而误判 FAIL。
+     * 实测正是如此:报告里 `uart_loopback = 0 FAIL`,线上还多出一个 'U'。
+     *
+     * 多读几个既不用猜延时,也不依赖波特率。注意第一个字节用完整超时
+     * (它在等"有没有东西绕回来"),一旦完全没东西就立刻失败,
+     * 所以失败的代价只有一次超时。
+     */
+    for (tries = 0; tries < UART_LOOPBACK_TRIES; tries++) {
+        spins = UART_POLL_LIMIT;
+        while ((mmio_read32(base + UART_SR) & UART_SR_RXEMPTY) != 0) {
+            if (--spins == 0) {
+                mmio_write32(base + UART_MR, saved_mr);
+                return false;
+            }
+        }
+
+        got = (char)(mmio_read32(base + UART_RX_FIFO) & 0xFFu);
+        if (got == probe) {
             mmio_write32(base + UART_MR, saved_mr);
-            return false;
+            return true;
         }
     }
-
-    got = (char)(mmio_read32(base + UART_RX_FIFO) & 0xFFu);
 
     /* 恢复通道模式。这一步必须做,否则串口就再也发不出去了 */
     mmio_write32(base + UART_MR, saved_mr);
 
-    return got == probe;
+    return false;
 }
 
 /* ------------------------------------------------------------------ */

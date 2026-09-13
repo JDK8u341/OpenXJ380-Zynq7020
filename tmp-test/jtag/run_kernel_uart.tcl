@@ -7,6 +7,7 @@
 
 set BIT "C:/Users/VeryS/Documents/fpgap/zynqs/AXI_GPIO_1/AXI_GPIO_1_SOFT/platform/hw/sdt/System_wrapper.bit"
 set PS7 "C:/Users/VeryS/Documents/others/OpenXJ380/tmp-test/zynq/ps7_init_uart1.tcl"
+set MIOFIX "C:/Users/VeryS/Documents/others/OpenXJ380/tmp-test/zynq/ps7_mio_bank1_18v.tcl"
 set ELF "C:/Users/VeryS/Documents/others/OpenXJ380/out/kernel-arm.elf"
 
 proc step {m} { puts "\n>>> $m" }
@@ -61,6 +62,20 @@ if {[catch {source $PS7} e]} { puts "FAIL source: $e"; exit 1 }
 if {[catch {ps7_init} e]}    { puts "FAIL ps7_init: $e"; exit 1 }
 if {[catch {ps7_post_config} e]} { puts "FAIL post_config: $e"; exit 1 }
 puts "OK"
+
+# opjtmp.xsa 把 MIO bank 1 的电压声明成了 3.3V,而本板实际是 1.8V
+# (核心板 VCCIO_BANK1 接 VCC1P8)。不修的话 MIO16-53 的输入阈值按
+# LVCMOS33(~2.0V) 走,而 CH9102F 只能驱动到 1.8V —— UART1 RX(MIO49)
+# 会恒读低,一个字节都收不到,且没有任何报错。详见该文件的注释。
+step "修正 MIO bank1 IO 标准 (LVCMOS33 -> LVCMOS18)"
+if {[catch {source $MIOFIX} e]} { puts "FAIL source miofix: $e"; exit 1 }
+if {[catch {ps7_mio_bank1_18v_fixup} e]} { puts "FAIL miofix: $e"; exit 1 }
+set mio_bad [ps7_mio_bank1_18v_check]
+if {$mio_bad == 0} {
+    puts "OK  MIO16-53 全部为 LVCMOS18"
+} else {
+    puts "警告: 仍有 $mio_bad 个 MIO 不是 LVCMOS18"
+}
 
 puts ""
 puts "=== 关键寄存器核对 ==="
