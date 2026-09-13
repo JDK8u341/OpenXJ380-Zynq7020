@@ -177,27 +177,41 @@ bool sched_wake_if_due(tcb_t t, u64 now, u64 base_vruntime)
     return false;
 }
 
-void sched_entity_init(tcb_t t, u64 now)
+void sched_entity_init(tcb_t t, u64 base_vruntime, u64 now)
 {
     if (t == NULL) {
         return;
     }
 
     /*
-     * 新线程的 vruntime 从"当前时刻"起步,而不是从 0。
+     * ← `init_task_eevdf_entity()` `scheduler.cpp:289-297`,逐句对应:
      *
-     * 为什么:如果新线程从 0 开始,而老线程已经累积到很大的 vruntime,
-     * 新线程的 deadline 会小得离谱 —— 它会独占 CPU 直到追上别人。
-     * 源 OS 用 `init_task_eevdf_entity(task, queue_average_vruntime(...), now)`
-     * 表达同一件事:以队列的平均 vruntime 为起点。这里由调用方传 now,
-     * 保持函数是纯的。
+     *     uint64_t slice = task_sched_slice(task);
+     *     task->eevdf_slice    = slice;
+     *     task->eevdf_vruntime = base > EEVDF_WAKEUP_CREDIT ? base - EEVDF_WAKEUP_CREDIT : 0;
+     *     task->eevdf_deadline = task->eevdf_vruntime + slice;
+     *     task->eevdf_last_start = now;
+     *
+     * ★ 那个 `base - CREDIT` 是 M4-10 开工调研时**查出来的欠账(D15)** ★
+     *
+     *   M4-8 写这一处时把 `base_vruntime` 当成了"当前时刻",于是直接
+     *   `vruntime = base` —— 源 OS 是**先减掉一个睡醒补偿**再落地的。
+     *   两者在等权负载下看不出区别(M4-8 到 M4-8.5 一路全绿),
+     *   但新线程因此比源 OS **晚 4 ms** 才被优先考虑 —— 那不是源 OS 的行为。
+     *
+     *   教训还是那一条(§0.5.6c):**同一个参数名在两边含义不同**时,
+     *   照抄要看函数体,不能看调用点。
+     *
+     * `now` 只用来记 `eevdf_last_start`(诊断量),不参与选取。
      */
-    t->eevdf_vruntime    = now;
-    t->eevdf_slice       = SCHED_BASE_SLICE_NS;
-    t->eevdf_deadline    = t->eevdf_vruntime + sched_slice(t);
-    t->eevdf_last_start  = now;
-    t->runtime_ticks     = 0u;
-    t->sched_next        = NULL;
+    t->eevdf_slice = sched_slice(t); /* ← task_sched_slice():0 表示还没设过 ⇒ 回落到基础片长 */
+
+    t->eevdf_vruntime = (base_vruntime > SCHED_WAKEUP_CREDIT) ? (base_vruntime - SCHED_WAKEUP_CREDIT) : 0u;
+    t->eevdf_deadline = t->eevdf_vruntime + t->eevdf_slice;
+
+    t->eevdf_last_start = now;
+    t->runtime_ticks    = 0u;
+    t->sched_next       = NULL;
 }
 
 /* ------------------------------------------------------------------ */

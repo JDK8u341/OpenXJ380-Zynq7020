@@ -3254,6 +3254,22 @@ void kmain(void)
     selftest_report("sched_no_starve_windows", g_starve_full_at, STARVE_MIN_FULL, SELFTEST_GE);
 
     /*
+     * ---- ★ M4-10.1:调度计数器按核分开 ★ ----
+     *
+     * ⚠ 这一条的强度要说清楚:它证明的是"**访问器读的就是 tick 在写的那个字段**"
+     *   —— 字段搬到 `percpu_t` 之后接线没错、也没漏加。
+     *
+     *   它**证明不了**"两个核各写各的":那需要一个真的会在 CPU1 上跑线程的
+     *   调度器,而那是 10.3/10.4 的事。按 §0.5.6b 的硬规矩,10.1 因此**不算
+     *   一个阶段** —— 它的独立判据要到 10.4 才成立(那时这一行会升级成
+     *   "两核的计数都 > 0 且互不相等")。
+     */
+    selftest_report("sched_percpu_switched",
+                    ((g_percpu[0].switched > 0u) && (sched_tick_switched() == g_percpu[0].switched)) ? 1u
+                                                                                                    : 0u,
+                    1u, SELFTEST_EQ);
+
+    /*
      * `invalid_ctx` 必须恒为 0:它不是"发生过多少件坏事"的计数,
      * 而是"调度器有没有挑到过不可切换的上下文"。挑了就是有 bug ——
      * 正常路径上 idle 的 pc==0 只在注册与第一次切走之间成立,

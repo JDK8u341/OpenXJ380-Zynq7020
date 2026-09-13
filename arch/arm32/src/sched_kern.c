@@ -141,6 +141,15 @@ void sched_kern_init(void)
 
     sched_queue_init(&g_runq[pc->cpu_id]);
     g_switch_count = 0u;
+
+    /*
+     * ★ M4-10.1:计数器在**本核**的每核结构里,所以每个核各调一次本函数、
+     *   各清各的。放在这里而不是让 CPU0 代清:代清只能证明"CPU0 觉得
+     *   CPU1 该清过了"(AM3 立过的规矩,`percpu.online` 就是这么来的)。
+     */
+    pc->switched    = 0u;
+    pc->preempted   = 0u;
+    pc->invalid_ctx = 0u;
 }
 
 /* ------------------------------------------------------------------ */
@@ -359,7 +368,7 @@ tcb_t sched_kthread_create(void (*entry)(void *), void *arg, const char *name)
      *
      * ⚠ 源 OS 的 `add_task` 会挑"队列最短的核" —— 那是 M4-10 的事。
      */
-    sched_entity_init(t, sched_queue_avg_vruntime(q, NULL, 0u));
+    sched_entity_init(t, sched_queue_avg_vruntime(q, NULL, 0u), timer_read_ns());
 
     if (!sched_queue_append(q, t)) {
         /* 查重失败说明本模块自己被用错了;回滚而不是留个半成品 */
@@ -683,7 +692,7 @@ void sched_register_boot_idle(void)
     for (i = 0; i < sizeof(g_boot_idle_tcb.name) - 1u && "idle"[i] != '\0'; i++) {
         g_boot_idle_tcb.name[i] = "idle"[i];
     }
-    sched_entity_init(&g_boot_idle_tcb, 0u);
+    sched_entity_init(&g_boot_idle_tcb, 0u, timer_read_ns());
 
     g_boot_idle = &g_boot_idle_tcb;
     sched_set_current(g_boot_idle);
@@ -736,9 +745,36 @@ tcb_t sched_boot_idle(void)
 /* M4-9:tick 里的调度决策 —— 真的搬帧                                  */
 /* ------------------------------------------------------------------ */
 
-static u32 g_tick_switched;   /* 真的完成了切换(搬了帧)的次数 */
-static u32 g_tick_preempted;  /* 其中"被换下的是真实线程"的次数 */
-static u32 g_tick_invalid_ctx;
+/*
+ * ★ M4-10.1:三个计数器搬进 `percpu_t` ★
+ *
+ * 在此之前它们是这里的**全局变量**。单核能跑,多核就是"两核往同一个计数里加"——
+ * 而受害的是**判据**:M4-10 的 A/B 要问"CPU1 到底切过没有",读一个两核之和
+ * 是答不出来的。语义与源 OS 的每核计数一致。
+ *
+ * (下面这三个访问器取的是**调用者所在核**的值。kmain 在 CPU0 上读,
+ *  所以既有的自检判据语义不变。)
+ */
+u32 sched_tick_switched(void)
+{
+    percpu_t *pc = percpu_self();
+
+    return (pc == NULL) ? 0u : pc->switched;
+}
+
+u32 sched_tick_preempted(void)
+{
+    percpu_t *pc = percpu_self();
+
+    return (pc == NULL) ? 0u : pc->preempted;
+}
+
+u32 sched_tick_invalid_ctx(void)
+{
+    percpu_t *pc = percpu_self();
+
+    return (pc == NULL) ? 0u : pc->invalid_ctx;
+}
 
 /*
  * ← `timer_handle()` `scheduler.cpp:381-458`。逐段对应:
@@ -879,7 +915,7 @@ arm_exc_frame_t *sched_tick(arm_exc_frame_t *frame)
          * 什么都不用回滚(见上面"结构差异 1")。
          */
         pc->scheduler_ticks = 0u;
-        g_tick_invalid_ctx++;
+        pc->invalid_ctx++;
         return frame;
     }
 
@@ -897,7 +933,7 @@ arm_exc_frame_t *sched_tick(arm_exc_frame_t *frame)
      */
     nf = sched_frame_for(next);
     if (nf == NULL) {
-        g_tick_invalid_ctx++;
+        pc->invalid_ctx++;
         pc->scheduler_ticks = 0u;
         return frame;
     }
@@ -953,9 +989,9 @@ arm_exc_frame_t *sched_tick(arm_exc_frame_t *frame)
     sched_set_current(next);
     pc->scheduler_ticks = 0u;
     g_switch_count++;
-    g_tick_switched++;
+    pc->switched++;
     if (cur->task_level != TASK_IDLE_LEVEL) {
-        g_tick_preempted++;
+        pc->preempted++;
     }
 
     /*
@@ -980,17 +1016,3 @@ arm_exc_frame_t *sched_tick(arm_exc_frame_t *frame)
     return nf;
 }
 
-u32 sched_tick_switched(void)
-{
-    return g_tick_switched;
-}
-
-u32 sched_tick_preempted(void)
-{
-    return g_tick_preempted;
-}
-
-u32 sched_tick_invalid_ctx(void)
-{
-    return g_tick_invalid_ctx;
-}

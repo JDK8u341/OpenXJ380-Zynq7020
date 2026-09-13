@@ -121,8 +121,18 @@ void sched_apply_wakeup_credit(tcb_t t, u64 base_vruntime);
  */
 bool sched_wake_if_due(tcb_t t, u64 now, u64 base_vruntime);
 
-/* 新线程的初始调度状态。源 OS 在 `init_task_eevdf_entity()` 里做同名的事 */
-void sched_entity_init(tcb_t t, u64 now);
+/*
+ * 新线程的初始调度状态 ← `init_task_eevdf_entity()` `scheduler.cpp:289-297`
+ *
+ * `base_vruntime` 是**目标队列的平均 vruntime**(源 OS 在 `add_task` 里传
+ * `queue_average_vruntime(...)`),`now` 只用来记 `eevdf_last_start`。
+ *
+ * ★ 源 OS 会把 `base_vruntime` **减去一个 `EEVDF_WAKEUP_CREDIT`** 再作为起点:
+ *     vruntime = base > CREDIT ? base - CREDIT : 0
+ *   ARM 侧 M4-8 漏了这个减法(把参数当成了"当前时刻"),M4-10 开工调研时
+ *   查出来并改正 —— 记在退化清单 **D15**。宿主单测逐值钉住它。
+ */
+void sched_entity_init(tcb_t t, u64 base_vruntime, u64 now);
 
 /* ← `queue_average_vruntime()` `scheduler.cpp:256`
  *

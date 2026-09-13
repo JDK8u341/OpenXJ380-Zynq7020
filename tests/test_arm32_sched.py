@@ -138,7 +138,7 @@ static u32 sim_run(u32 k, u64 slice_ns, sim_stat_t *st)
         memset(&sim_tcb[i], 0, sizeof(sim_tcb[i]));
         sim_tcb[i].task_level = TASK_KERNEL_LEVEL;
         sim_tcb[i].status     = RUNNING;
-        sched_entity_init(&sim_tcb[i], 0u);
+        sched_entity_init(&sim_tcb[i], 0u, 0u);
         sim_tcb[i].eevdf_slice = slice_ns;
         st[i].ticks_run        = 0u;
         st[i].miss             = 0u;
@@ -394,17 +394,40 @@ int main(void)
     CHECK(sched_queue_avg_vruntime(&q, &ta, 777u) == 777u);  /* 空 -> fallback */
     CHECK(sched_queue_avg_vruntime(NULL, NULL, 42u) == 42u);
 
-    /* ---- 10. sched_entity_init:新线程的起点不是 0 ---- */
+    /* ---- 10. sched_entity_init ← `init_task_eevdf_entity` 逐值对齐(D15)---- */
+    /*
+     * ★ 这一节在 M4-10.1 之前是**钉错了**:它断言 `vruntime == base`,
+     *   而源 OS 是 `vruntime = base - EEVDF_WAKEUP_CREDIT`(`scheduler.cpp:294`)。
+     *   宿主单测当时"通过"只是因为判据跟着实现一起写错了 ——
+     *   这正是本项目的规程要防的那类事:判据必须回到**源 OS**去核对,
+     *   而不是回到"我以前是怎么写的"。
+     */
     mk(&ta, TASK_KERNEL_LEVEL, 0u, 0u, 0u);
     ta.eevdf_deadline = 12345u;
-    sched_entity_init(&ta, 7000000ull);
-    CHECK(ta.eevdf_vruntime == 7000000ull);
-    CHECK(ta.eevdf_slice == SCHED_BASE_SLICE_NS);
-    CHECK(ta.eevdf_deadline == 7000000ull + SCHED_BASE_SLICE_NS);
-    CHECK(ta.eevdf_last_start == 7000000ull);
+    sched_entity_init(&ta, 7000000ull, 2222ull);
+    CHECK(ta.eevdf_vruntime == 7000000ull - SCHED_WAKEUP_CREDIT); /* ★ 减掉一个补偿 ★ */
+    CHECK(ta.eevdf_slice == SCHED_BASE_SLICE_NS);                 /* 没设过 ⇒ 回落基础片长 */
+    CHECK(ta.eevdf_deadline == ta.eevdf_vruntime + SCHED_BASE_SLICE_NS);
+    CHECK(ta.eevdf_last_start == 2222ull); /* now 只记诊断量,不参与起点 */
     CHECK(ta.runtime_ticks == 0u);
     CHECK(ta.sched_next == NULL);
-    sched_entity_init(NULL, 1u); /* 不崩即可 */
+
+    /* base <= credit 时钳到 0,不是下溢(源 OS 的三元表达式) */
+    sched_entity_init(&ta, 0u, 1ull);
+    CHECK(ta.eevdf_vruntime == 0u);
+    sched_entity_init(&ta, SCHED_WAKEUP_CREDIT, 1ull);
+    CHECK(ta.eevdf_vruntime == 0u); /* 相等也钳到 0(是 >,不是 >=)*/
+    sched_entity_init(&ta, SCHED_WAKEUP_CREDIT + 1ull, 1ull);
+    CHECK(ta.eevdf_vruntime == 1u);
+
+    /* 片长已经设成下限之上时按它算 deadline;低于下限则回落 */
+    mk(&ta, TASK_KERNEL_LEVEL, 0u, 0u, 0u);
+    ta.eevdf_slice = 9000000ull; /* 9ms */
+    sched_entity_init(&ta, 100000000ull, 0ull);
+    CHECK(ta.eevdf_slice == 9000000ull);
+    CHECK(ta.eevdf_deadline == ta.eevdf_vruntime + 9000000ull);
+
+    sched_entity_init(NULL, 1u, 1u); /* 不崩即可 */
 
     /* ================================================================ */
     /* 11. 可调度性判据(M4-9)                                           */

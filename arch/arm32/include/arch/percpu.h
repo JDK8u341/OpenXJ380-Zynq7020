@@ -135,6 +135,25 @@ typedef struct
      */
     u32 cur_vfp_d; /* → 当前线程 TCB 里的 vfp[ARM_VFP_D_REGS * 2],0 = 不处理 */
     u32 cur_vfp_f; /* → 同一 TCB 里的 fpscr */
+
+    /*
+     * ---- ★ M4-10.1:调度计数器按核分开 ★ ----
+     *
+     * ⚠ 在此之前这三个量是 `sched_kern.c` 里的**全局变量**。单核时无所谓,
+     *   一旦两个核都参与调度,它们就变成"两核互相覆盖的同一个计数器" ——
+     *   而症状是**判据失真**:A/B 要读"本核切换了几次",读到的是两核之和,
+     *   于是"CPU1 一次都没切"这种结论根本看不出来。
+     *
+     * 语义与源 OS 的每核计数一致;`percpu_t.ticks`(本核 1kHz 中断次数)
+     * 已经在 M4-6 之后就按核分开了,这三个是同一类东西的补齐。
+     *
+     * ⚠ 加在**最后**:汇编只用到前面那几个固定偏移
+     *   (`ARM_PERCPU_OFF_CURRENT_TASK` / `_CPU_ID` / `_CUR_VFP_D` / `_CUR_VFP_F`),
+     *   加在尾部就不会动到它们。
+     */
+    u32 switched;    /* 本核**真的完成**的切换次数(= 搬帧次数)*/
+    u32 preempted;   /* 其中"被换下的是真实线程"的次数(真正意义上的抢占)*/
+    u32 invalid_ctx; /* 挑到了别人、但目标上下文不可切换而放弃的次数 */
 } percpu_t;
 
 /* 把 current_task 取成 tcb_t。集中在一处,避免散落的强制转换 */
@@ -168,8 +187,20 @@ _Static_assert(offsetof_arm(percpu_t, cur_vfp_f) == ARM_PERCPU_OFF_CUR_VFP_F,
  */
 _Static_assert(offsetof_arm(percpu_t, scheduler_ticks) == 48u,
                "scheduler_ticks 应当 8 字节对齐到 48");
-_Static_assert(sizeof(percpu_t) == 64u,
-               "sizeof(percpu_t) 不是 64 —— 多半是有人加了指针/uintptr_t 字段,"
+/*
+ * ★ M4-10.1:sizeof 64 -> 80 ★
+ *
+ * 尾部加了三个 u32(switched / preempted / invalid_ctx):
+ *   ... cur_vfp_f 结束在 64 -> 64/68/72 三个字段 -> 76,再按 u64 带来的
+ *   8 字节对齐补齐到 **80**(尾部 4 字节是填充,不是字段)。
+ *
+ * 这条断言仍然在钉同一条不变式:结构体里**不能出现指针宽度的字段**,
+ * 否则宿主与目标的偏移就分叉,而汇编正按固定偏移访问它。
+ */
+_Static_assert(offsetof_arm(percpu_t, switched) == 64u, "switched 应当紧跟在 cur_vfp_f 之后");
+_Static_assert(offsetof_arm(percpu_t, invalid_ctx) == 72u, "三个计数器应当连排");
+_Static_assert(sizeof(percpu_t) == 80u,
+               "sizeof(percpu_t) 不是 80 —— 多半是有人加了指针/uintptr_t 字段,"
                "那会让宿主与目标的布局分叉");
 
 extern percpu_t g_percpu[PERCPU_MAX_CPUS];

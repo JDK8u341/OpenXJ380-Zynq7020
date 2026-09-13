@@ -204,9 +204,22 @@ int main(void)
          *   只要有人往里塞指针或 uintptr_t,宿主上这个数就会变大 ——
          *   而"宿主验的偏移就是目标偏移"这条前提随即失效。
          */
-        CHECK(sizeof(percpu_t) == 64u);
+        CHECK(sizeof(percpu_t) == 80u);
         CHECK(offsetof_arm(percpu_t, scheduler_ticks) == 48u);
         CHECK(sizeof(((percpu_t *)0)->scheduler_ticks) == 8u);
+
+        /*
+         * ★ M4-10.1:三个调度计数器按核分开(原来是 sched_kern.c 里的全局量)★
+         *
+         * 它们加在**结构体尾部**,所以汇编用的那四个固定偏移一个都没动 ——
+         * 这正是"加字段加在最后"的理由,这里把结果钉住。
+         */
+        CHECK(offsetof_arm(percpu_t, switched) == 64u);
+        CHECK(offsetof_arm(percpu_t, preempted) == 68u);
+        CHECK(offsetof_arm(percpu_t, invalid_ctx) == 72u);
+        CHECK(sizeof(((percpu_t *)0)->switched) == 4u);
+        /* 尾部 4 字节是 u64 带来的填充,不是字段:80 = 76 向上取到 8 的倍数 */
+        CHECK(sizeof(percpu_t) == 80u);
 
         /*
          * M4-9.5:浮点现场的两个指针也必须是 u32 地址(而且汇编按固定偏移
