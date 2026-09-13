@@ -28,6 +28,7 @@
 #include <arch/mmu.h>
 #include <arch/platform.h>
 #include <arch/selftest.h>
+#include <arch/shell.h>
 #include <arch/timer.h>
 #include <arch/types.h>
 #include <arch/uart_ps.h>
@@ -632,6 +633,23 @@ void kmain(void)
     selftest_report("uart_present", uart_present ? 1u : 0u, 1u, SELFTEST_EQ);
     selftest_report("uart_clock_source", clock_source, 1u, SELFTEST_EQ);
     selftest_report("uart_baud_ppm", baud_result.error_ppm, 50u, SELFTEST_LE);
+    /*
+     * 收发通路自检。
+     *
+     * 这一项**专为命令通道而加**:命令通道靠 RX,而"收不到数据"有两类
+     * 完全不同的原因 —— 驱动/寄存器配置有问题,或者外部线缆/对端有问题。
+     * 现象一模一样,排查方向却相反。
+     *
+     * 内部环回把发送端在芯片内直接接到接收端,不经过外部引脚,
+     * 于是能把这两类**分开**:环回通说明 UART 与驱动都好,
+     * 收不到就是外部的事;环回不通则与线缆无关。
+     *
+     * ⚠ 必须在控制台横幅打完、且没有别的东西在用串口时调用 ——
+     *   它会临时把 MR 切成环回模式再切回来。
+     */
+    selftest_report("uart_loopback",
+                    uart_present ? (uart_loopback_selftest(PLAT_CONSOLE_UART_BASE) ? 1u : 0u) : 0u, 1u,
+                    SELFTEST_EQ);
 
     selftest_report("mmu_stage", HB[HB_SLOT_MMUSTAGE], HB_MMU_STAGE_ON, SELFTEST_EQ);
     selftest_report("mmu_enabled", mmu_is_enabled() ? 1u : 0u, 1u, SELFTEST_EQ);
@@ -667,6 +685,10 @@ void kmain(void)
 
     HB[HB_SLOT_SELFTEST_FAILED] = selftest_summary();
     console_puts("\n");
+    /* 自检之后才开命令通道:在此之前串口还在标定,回显会乱 */
+    shell_init();
+    shell_banner();
+
 
     /* ---- 11. 主循环 ---- */
     /*
@@ -741,6 +763,16 @@ void kmain(void)
          * 用来验证异常诊断路径。详见 arch/fault_test.h。
          */
         fault_test_poll();
+
+        /*
+         * 串口命令通道。**非阻塞** —— 没有输入就立刻返回,
+         * 所以跑马灯与周期状态行完全不受影响。
+         *
+         * 放在主循环末尾是有意的:命令可能很慢(比如 dump 要打十几行),
+         * 放前面会让这一轮的 LED 更新被推迟。放末尾则最坏情况只是
+         * 下一轮稍微晚一点,节奏仍然由全局定时器决定。
+         */
+        shell_poll();
     }
 
     /* 不会到这里 */

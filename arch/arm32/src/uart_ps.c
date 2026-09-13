@@ -28,6 +28,25 @@
 /* 模式寄存器:8 位数据 / 无校验 / 1 停止位 */
 #define UART_MR_PARITY_NONE 0x00000020u
 
+/*
+ * MR 的位布局(取自 AMD/Xilinx 随这颗芯片出货的 xuartps_hw.h,**不是**通用
+ * Cadence 手册 —— 两者在通道模式的位置上不一致,而写错不会报错):
+ *
+ *   bit0     CLKSEL
+ *   bit2:1   CHARLEN     00 = 8 位
+ *   bit5:3   PARITY      0b100 = 无校验
+ *   bit7:6   STOPMODE    00 = 1 位
+ *   bit9:8   CHMODE      00 正常 / 01 回声 / 10 本地环回 / 11 远端环回
+ *
+ * ⚠ CHMODE 在 **bits[9:8]**。通用 Cadence 手册把它写作 [7:6],
+ *   我一开始就是按 [7:6] 写的 —— 结果 0x80 落到了 STOPMODE[1] 上,
+ *   把模式悄悄改成"2 个停止位",环回测试自然永远失败,
+ *   而寄存器读回来看着完全正常(MR=0xA0,不像有任何问题)。
+ *   这个错误把排查方向指向了"线缆没接好",浪费了一轮。
+ */
+#define UART_MR_CHM_MASK           0x00000300u
+#define UART_MR_CHM_LOCAL_LOOPBACK 0x00000200u
+
 /* 通道状态位 */
 #define UART_SR_RXEMPTY 0x00000002u
 #define UART_SR_TXEMPTY 0x00000008u
@@ -204,6 +223,77 @@ bool uart_rx_ready(uintptr_t base)
 char uart_getc(uintptr_t base)
 {
     return (char)(mmio_read32(base + UART_RX_FIFO) & 0xFFu);
+}
+
+/*
+ * 收发通路自检:用 UART 自己的**内部环回**判定 RX 路径通不通。
+ *
+ * ====================================================================
+ * 为什么值得单独做一个自检
+ * ====================================================================
+ *
+ * "板上收不到数据"有两类完全不同的原因,而它们在现象上一模一样:
+ *   (a) 驱动/寄存器配置有问题 —— 该开没开、读错了寄存器;
+ *   (b) 外部通路有问题 —— 线序、对端没在发、MIO 引脚没接对。
+ *
+ * 光看"没回显"分不出这两类,而排查方向完全相反。
+ *
+ * Cadence UART 的 MR[7:6] 是通道模式(CHM),写成 0b10 就是**本地环回**:
+ * 发送端在芯片内部直接接到接收端,完全不经过外部引脚。于是:
+ *
+ *   环回能收到 -> UART 的收发逻辑与驱动全部正常,问题在 (b) 外部通路;
+ *   环回收不到 -> 问题在 (a),与线缆无关。
+ *
+ * 这一步把"要不要去查线"从一个猜测变成一个有结论的问题。
+ *
+ * ⚠ 自检会临时改 MR 再改回来。调用时应当确保没有别的代码正在用这个串口
+ *   (启动阶段调用即可)。
+ */
+bool uart_loopback_selftest(uintptr_t base)
+{
+    const char probe = 'U';
+    u32        saved_mr;
+    u32        spins;
+    char       got;
+
+    if (!uart_probe(base)) {
+        return false;
+    }
+
+    saved_mr = mmio_read32(base + UART_MR);
+
+    /* CHM = 0b10 (本地环回);其余位保持原样,尤其是 8N1 那几位 */
+    mmio_write32(base + UART_MR, (saved_mr & ~UART_MR_CHM_MASK) | UART_MR_CHM_LOCAL_LOOPBACK);
+
+    /* 清掉 FIFO 里可能残留的东西,避免把旧数据当成环回结果 */
+    mmio_write32(base + UART_CR, UART_CR_TXRST | UART_CR_RXRST);
+    mmio_write32(base + UART_CR, UART_CR_TXEN | UART_CR_RXEN);
+
+    /* 发一个字节 */
+    spins = UART_POLL_LIMIT;
+    while ((mmio_read32(base + UART_SR) & UART_SR_TXFULL) != 0) {
+        if (--spins == 0) {
+            mmio_write32(base + UART_MR, saved_mr);
+            return false;
+        }
+    }
+    mmio_write32(base + UART_TX_FIFO, (u32)probe);
+
+    /* 等它从内部绕回来。有超时 —— 否则通路断了就是死循环 */
+    spins = UART_POLL_LIMIT;
+    while ((mmio_read32(base + UART_SR) & UART_SR_RXEMPTY) != 0) {
+        if (--spins == 0) {
+            mmio_write32(base + UART_MR, saved_mr);
+            return false;
+        }
+    }
+
+    got = (char)(mmio_read32(base + UART_RX_FIFO) & 0xFFu);
+
+    /* 恢复通道模式。这一步必须做,否则串口就再也发不出去了 */
+    mmio_write32(base + UART_MR, saved_mr);
+
+    return got == probe;
 }
 
 /* ------------------------------------------------------------------ */
