@@ -151,3 +151,48 @@ void mmu_enable(void)
      */
     HB[HB_SLOT_MMUSTAGE] = HB_MMU_STAGE_ON;
 }
+
+/*
+ * 次级核的 MMU 使能(AM3-3)。
+ *
+ * 与 mmu_enable() 的三点区别,每一点都有具体理由,不是省事:
+ *
+ *   1. **不重建页表**。CPU0 已经建好,CPU1 重来一遍只会与它竞争写同一块
+ *      内存,而且完全没有必要 —— 恒等映射对两个核是一样的。
+ *
+ *   2. **不写心跳阶段号**。HB_SLOT_MMUSTAGE 记录的是 **CPU0 的启动进度**。
+ *      CPU1 写进去会把那份记录覆盖掉,而"挂在哪一步"正是心跳存在的意义:
+ *      内核若在开 MMU 时挂死,串口什么都来不及打,只有这个槽能说话。
+ *
+ *   3. **不做表自检**。CPU0 已经检过;而且 CPU1 此时 MMU 还关着,
+ *      自检失败也没有一条安全的报错路径可走。
+ *
+ * 注意这里只置 SCTLR.M(地址转换),**不置 C/I 位** ——
+ * 缓存由 cache_enable_l1() 单独负责,与 CPU0 的流程保持一致。
+ *
+ * ⚠ 必须在 CPU0 跑完 mmu_enable() 之后调用,否则读到的是一张还没填的表。
+ *   这个顺序由 smp.c 的调用时机保证。
+ */
+void mmu_enable_secondary(void)
+{
+    u32 sctlr;
+
+    arch_write_ttbr0((u32)(uintptr_t)g_mmu_l1_table | TTBR0_ATTR_XILINX);
+    arch_write_dacr(MMU_DACR_ALL(MMU_DACR_CLIENT));
+
+    /*
+     * TLB 与 I-cache 的失效是**每核**的:CPU1 自己那份里可能残留了
+     * MMU 关闭期间形成的表项,不清掉会继续用过期映射。
+     */
+    arch_tlb_invalidate_all();
+    arch_icache_invalidate_all();
+    arch_dsb();
+    arch_isb();
+
+    sctlr = arch_read_sctlr();
+    sctlr |= SCTLR_M;
+    arch_write_sctlr(sctlr);
+
+    arch_dsb();
+    arch_isb();
+}

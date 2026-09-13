@@ -26,12 +26,31 @@
 #include <arch/irq.h>
 #include <arch/led.h>
 #include <arch/mmu.h>
+#include <arch/percpu.h>
 #include <arch/platform.h>
 #include <arch/selftest.h>
 #include <arch/shell.h>
+#include <arch/smp.h>
 #include <arch/timer.h>
 #include <arch/types.h>
 #include <arch/uart_ps.h>
+
+/*
+ * CPU0 栈区顶部的链接符号(boot/kernel.ld)。
+ * start.S 用同一个符号建 CPU0 的栈;这里读它是为了在 percpu 表里
+ * 留下一条可核对的记录 —— 两个核的栈区必须不同。
+ */
+extern char __stack_top[];
+
+/*
+ * 等 CPU1 上线的上限。
+ *
+ * 取 200ms:CPU1 要做的事(TPIDRPRW、MMU、SCU、L1)在 666MHz 上是
+ * 微秒级的,这个值宽松了三个数量级。超过就不该再等 ——
+ * "无限等"会把一个可诊断的降级变成整机挂死,本项目在 UART 轮询上
+ * 已经踩过一次同样的坑。
+ */
+#define CPU1_BOOT_TIMEOUT_US 200000u
 
 /*
  * 心跳槽位定义在 arch/heartbeat.h —— 它是跨模块契约:
@@ -105,7 +124,6 @@ static void tick_handler(u32 intid, void *arg)
 
     g_tick_seen++;
 }
-
 
 static void fail_stop(void)
 {
@@ -634,6 +652,59 @@ void kmain(void)
     }
     console_puts("\n");
 
+    /* ---- 9.5 第二个核(AM3-1/2/3) ---- */
+    /*
+     * 位置:MMU 与缓存都已就绪之后。
+     *
+     * 为什么必须在这个位置:CPU1 要复用的正是 CPU0 刚建好的那份页表
+     * (mmu_enable_secondary() 只写它自己的 TTBR0,不重建表)。
+     * 放早了读到的是空表,放晚了无非多等一会儿。
+     *
+     * 顺序也是硬的:先 per-CPU 表就绪 -> 再放 CPU1 -> 再等它报到。
+     * 反过来的话 CPU1 会在 percpu 表还没准备好时就去读自己的结构体。
+     */
+    {
+        bool cpu1_ok;
+
+        percpu_table_reset();
+
+        /*
+         * CPU0 自己的表项。传 __stack_top 让记录完整 ——
+         * 这条信息之后会被打印出来,用于确认两个核的栈区确实不同。
+         */
+        /*
+         * CPU0 这里可以直接 publish:它的缓存早就开了(见上面缓存那一节),
+         * 所以这次写入走 SCU 一致性路径,CPU1 起来后看到的是干净的值。
+         */
+        if (percpu_init_self((uintptr_t)__stack_top) != NULL) {
+            percpu_publish_self();
+        }
+
+        HB[HB_SLOT_CPU1_STAGE]  = HB_CPU1_STAGE_IDLE;
+        HB[HB_SLOT_CPU1_ONLINE] = 0u;
+
+        console_puts(" SMP: releasing CPU1 (write 0xFFFFFFF0 + SEV)...\n");
+
+        smp_release_cpu1();
+        cpu1_ok = smp_wait_online(1u, CPU1_BOOT_TIMEOUT_US);
+
+        if (cpu1_ok) {
+            console_printf(" SMP         : CPU1 online  id=%u mpidr=0x%08X stack=0x%08X\n",
+                           g_percpu[1].cpu_id, g_percpu[1].mpidr, (u32)g_percpu[1].stack_top);
+        } else {
+            /*
+             * 不等成功也要如实报出来,而且**不能就此停机** ——
+             * 单核状态下其它功能都是好的,把整机拦在这里并不能多查出什么。
+             * 心跳里的 stage 会告诉 JTAG 它停在哪一步。
+             */
+            console_printf(" SMP WARN    : CPU1 did not come online in %u us (stage=%u)\n",
+                           CPU1_BOOT_TIMEOUT_US, HB[HB_SLOT_CPU1_STAGE]);
+        }
+
+        HB[HB_SLOT_CPU1_ONLINE] = cpu1_ok ? 1u : 0u;
+        HB[HB_SLOT_CPU1_LOOPS]  = g_percpu[1].loops;
+    }
+
     /* ---- 10. 启动自检总账 ---- */
     /*
      * 位置:所有自检都跑完之后、主循环之前。
@@ -691,12 +762,53 @@ void kmain(void)
                     SELFTEST_EQ);
     selftest_report("irq_spurious", irq_get_stats()->spurious_count, 0u, SELFTEST_EQ);
 
+    /*
+     * ---- 第二个核(AM3) ----
+     *
+     * 这几项刻意分开报,而不是合成一个 "smp_ok":
+     * CPU1 起不来有若干种截然不同的原因(没被唤醒 / 卡在 MMU / 卡在缓存 /
+     * 起来了但没置 online),而心跳里的 stage 槽正好区分它们。
+     * 合成一项会把这条线索丢掉。
+     */
+    selftest_report("smp_cpu1_online", g_percpu[1].online, 1u, SELFTEST_EQ);
+    selftest_report("smp_cpu1_stage", HB[HB_SLOT_CPU1_STAGE], HB_CPU1_STAGE_ONLINE, SELFTEST_EQ);
+    /*
+     * ⚠ 这里查 MPIDR,不查 cpu_id。
+     *
+     * 破坏性 A/B 抓出来的:cpu_id 由 CPU0 在放 CPU1 起来**之前**就填好了,
+     * 所以即使 CPU1 根本没被唤醒它也是 1 —— 这一项永远不会失败,
+     * 等于没判。MPIDR 只有 CPU1 自己能写进去,才是它真的跑过的证据。
+     *
+     * 0x80000001:Cortex-A9 的 MPIDR,bit31=0b1 表示多核系统,
+     * bits[1:0] = 核号,所以 CPU1 就是 0x80000001。
+     */
+    selftest_report("smp_cpu1_mpidr", g_percpu[1].mpidr, 0x80000001u, SELFTEST_EQ);
+
+    /*
+     * loops >= 1 而不是 "> 0 就通过":判据写成 1/0 是为了让它和别的项
+     * 一样是等值判定,避免"永远成立"的阈值(那种判据等于没判)。
+     */
+    selftest_report("smp_cpu1_loops", (g_percpu[1].loops >= 1u) ? 1u : 0u, 1u, SELFTEST_EQ);
+
+    /*
+     * 两个核的栈区必须不同。
+     *
+     * 这一项防的是"链接脚本改错了但两个核都能跑"的情况 ——
+     * 共享栈区不会立刻崩,只会在负载上来之后随机踩栈,
+     * 那时再回头怀疑到栈上要花很久。
+     */
+    selftest_report("smp_distinct_stacks",
+                    (g_percpu[0].stack_top != 0u && g_percpu[1].stack_top != 0u &&
+                     g_percpu[0].stack_top != g_percpu[1].stack_top)
+                        ? 1u
+                        : 0u,
+                    1u, SELFTEST_EQ);
+
     HB[HB_SLOT_SELFTEST_FAILED] = selftest_summary();
     console_puts("\n");
     /* 自检之后才开命令通道:在此之前串口还在标定,回显会乱 */
     shell_init();
     shell_banner();
-
 
     /* ---- 11. 主循环 ---- */
     /*
@@ -734,6 +846,17 @@ void kmain(void)
             HB[HB_SLOT_LED]  = bar ^ sw;
             HB[HB_SLOT_SW]   = sw;
             HB[HB_SLOT_GT]   = gt;
+
+            /*
+             * 第二个核的计数同步到心跳。
+             *
+             * ⚠ 这里只是**搬运** CPU1 自己维护的计数,
+             *   不是代它生成。loops 由 CPU1 的主循环自增,
+             *   所以这个值在变化本身就证明 CPU1 真的在独立推进 ——
+             *   如果 CPU0 代写,数字照样会变,但那什么也证明不了。
+             */
+            HB[HB_SLOT_CPU1_LOOPS]  = g_percpu[1].loops;
+            HB[HB_SLOT_CPU1_ONLINE] = g_percpu[1].online;
         }
 
         if (uart_present) {

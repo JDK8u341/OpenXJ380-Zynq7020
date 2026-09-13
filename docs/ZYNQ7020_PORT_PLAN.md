@@ -879,10 +879,42 @@ PL 侧继续用 `AXI_GPIO_1_SOFT`，保住了 AXI GPIO 流水灯。
 新 XSA 已修好，所以写这些驱动时不会再重现"寄存器都对但收不到数据"这类现象；
 但**每次换 XSA 都要先确认这条校验通过**。
 
-#### AM3（双核）—— 未开始
+#### AM3（双核）—— 完成 3/5
 
 | 子阶段 | 内容 | 状态 |
 |---|---|---|
+| AM3-0 | 前置于此的陆基已在 M1/M2-5 顺手完成 | ✅ SCU 使能、ACTLR 的 SMP 位与维护广播、L1+L2 缓存已开并验证；`spin_t`/`ldrex`/`strex` 原语已写但**零调用者** |
+| AM3-1 | 每 CPU 数据基础设施（`TPIDRPRW`）| ✅ `percpu.c`（纯逻辑，宿主可测）+ `percpu_hw.c`（CP15）；`g_percpu[1].mpidr = 0x80000001` 稳定留住 |
+| AM3-2 | 引导 CPU1 | ✅ 写 `0xFFFFFFF0` + `SEV`；**不需要 OCM 跳板**（见下方偏差）|
+| AM3-3 | CPU1 自己的栈/VBAR/TTBR0/DACR/缓存 | ✅ 栈区在链接脚本里按核分开；`mmu_enable_secondary()` 复用 CPU0 的页表但不重建、不写心跳阶段号 |
+| AM3-4 | per-CPU 中断表（**PPI 每核银行化**，见 §2.6）| ⬜ |
+| AM3-5 | spinlock + SGI 做 IPI；两核各自 1 kHz tick | ⬜ |
+
+板上实测：`verify_board.py --load` **22 passed, 0 failed**（新增 5 项 SMP 检查）。
+破坏性 A/B：不释放 CPU1 时这 5 项**全部失败**（17 passed / 5 failed）。
+CPU1 的 `loops` 在 700ms 内涨约 2100 万次（约 7300 万次/秒），确证它在独立满速运行。
+
+**与计划原文的两处偏差**：
+
+1. **不需要 OCM 跳板**。原文写"OCM 跳板 + `sev`"是照搬 x86"AP 需要一个低地址可达的
+   实模式入口"的思路。ARM 的 `0xFFFFFFF0` 可以放**任意 32 位地址**，而内核链接在
+   物理 `0x00100000`、CPU1 起来时 MMU 关着 —— 物理地址本来就直接可达。
+   直接指向 `start.S` 里的 `cpu1_entry` 即可。（原文的顾虑不成立。）
+2. **上板前必须先探查 CPU1 的实际状态**。我们是 JTAG 直载、不跑 BootROM，
+   所以"SEV 协议能不能用"不是想当然的。实测确认 CPU1 停在 BootROM 的 WFE
+   循环里（`PC=0xffffff34`）、`0xFFFFFFF0` 里是安全网地址、`A9_CPU_RST_CTRL=0`
+   ——协议可以直接用。这一步花了几分钟，但省掉了"写完发现起不来再回头怀疑协议"。
+
+**★ 抓到一个真正的 SMP 一致性 bug ★**：CPU1 在**缓存使能之前**写共享内存，
+其写入不参与一致性，会被 CPU0 早先留下的脏行覆盖。症状极隐蔽 ——
+同一结构体里 CPU0 写的字段和 CPU1 开缓存后写的字段全都正常，**只丢一个 `mpidr`**。
+修法是两条缺一不可的规矩：CPU1 在缓存使能前**不得写任何共享内存**；
+CPU0 在 SEV 之前对要交接的数据做 `cache_clean_invalidate_range()`。
+完整记录见 `arch/arm32/README.md` 第 9 节。
+
+**A/B 顺带抓出一个假检查**：`smp_cpu1_id` 查的字段由 CPU0 预先填好，
+所以"CPU1 没起来"时它照样通过 —— 永远不会失败、等于没判。已换成只有 CPU1
+自己能写的 `smp_cpu1_mpidr`。**这条说明"检查项必须做 A/B"不是形式主义。**
 | AM3-0 | 前置于此的陆基已在 M1/M2-5 顺手完成 | ✅ SCU 使能、ACTLR 的 SMP 位与维护广播、L1+L2 缓存已开并验证；`spin_t`/`ldrex`/`strex` 原语已写但**零调用者** |
 | AM3-1 | 每 CPU 数据基础设施（`TPIDRPRW`，单核可验）| ⬜ |
 | AM3-2 | OCM 跳板 + `sev` 引导 CPU1 | ⬜ |

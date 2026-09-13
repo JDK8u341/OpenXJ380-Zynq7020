@@ -21,7 +21,22 @@ STACK_SIZE_IRQ = 0x2000;   /*  8 KB */
 STACK_SIZE_FIQ = 0x1000;   /*  4 KB */
 STACK_SIZE_ABT = 0x1000;   /*  4 KB */
 STACK_SIZE_UND = 0x1000;   /*  4 KB */
+STACK_SIZE_SVC = 0x8000;   /* 32 KB */
 STACK_TOTAL    = STACK_SIZE_IRQ + STACK_SIZE_FIQ + STACK_SIZE_ABT + STACK_SIZE_UND;
+
+/*
+ * 每个核一整块栈区(各异常模式栈 + SVC 栈)。
+ *
+ * 为什么要按核分开而不是共享一块:两个核同时在跑,共享栈区意味着
+ * 任何一个核压栈都可能踩到另一个核正在用的栈帧,而症状取决于时序,
+ * 是最难复现的一类问题。
+ *
+ * ⚠ CPU_STACK_COUNT 必须与 include/arch/percpu.h 的 PERCPU_MAX_CPUS 一致。
+ *   链接脚本表达不了这个关系,改了核数记得两边一起改;
+ *   percpu.c 里有对应的静态断言管住 C 侧。
+ */
+CPU_STACK_BYTES = STACK_TOTAL + STACK_SIZE_SVC;
+CPU_STACK_COUNT = 2;
 
 SECTIONS
 {
@@ -97,18 +112,19 @@ SECTIONS
            "一级页表大小必须是 4096 项 × 4 字节 = 16KB")
 
     /*
-     * 栈区:SVC 栈 + 四个异常模式栈。
-     * start.S 从 __stack_top 向下依次分配各模式栈,
-     * 断言保证分配总量不超过预留区。
+     * 栈区:每个核一块,每块 = SVC 栈 + 四个异常模式栈。
+     * start.S 从各核栈区顶部(__stack_top / __stack1_top)向下依次分配。
      */
     . = ALIGN(8);
     __stack_bottom = .;
-    . += STACK_TOTAL;
-    . += 0x8000;                /* SVC 栈 32 KB */
-    __stack_top = .;
+    . += CPU_STACK_BYTES * CPU_STACK_COUNT;
+    __stack_top  = __stack_bottom + CPU_STACK_BYTES;                       /* CPU0 */
+    __stack1_top = __stack_bottom + CPU_STACK_BYTES * 2;                   /* CPU1 */
 
-    ASSERT(__stack_top - __stack_bottom >= STACK_TOTAL + 0x8000,
-           "栈区预留不足:请检查 STACK_SIZE_* 与预留量的关系")
+    ASSERT(__stack_top - __stack_bottom == CPU_STACK_BYTES,
+           "CPU0 栈区大小不对")
+    ASSERT(__stack1_top - __stack_bottom == CPU_STACK_BYTES * CPU_STACK_COUNT,
+           "CPU1 栈区大小不对:检查 CPU_STACK_BYTES / CPU_STACK_COUNT")
 
     _kernel_end = .;
 

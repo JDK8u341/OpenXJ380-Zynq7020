@@ -121,6 +121,33 @@
  */
 #define HB_SLOT_SELFTEST_FAILED 23u
 
+/*
+ * ---- 第二个核(AM3) ----
+ *
+ * CPU1 的启动与 CPU0 的 MMU 阶段是同一类问题:**中途可能再也回不来**,
+ * 而那时串口一个字都打不出来。所以这里也留一个阶段号,由 CPU1 自己写 ——
+ * 挂死时读回的就是它最后成功进入的阶段。
+ *
+ * ⚠ 这几个槽必须由 CPU1 **自己**写。由 CPU0 代写只能说明
+ *   "CPU0 觉得 CPU1 该起来了",证明不了 CPU1 真的跑到了那一步 ——
+ *   而"第二个核到底起没起来"正是这一阶段唯一要回答的问题。
+ */
+#define HB_SLOT_CPU1_STAGE  24u /* CPU1 启动阶段,见 HB_CPU1_STAGE_* */
+#define HB_SLOT_CPU1_ONLINE 25u /* CPU1 自报上线标志 */
+#define HB_SLOT_CPU1_ID     26u /* CPU1 通过 TPIDRPRW 读回的自己的核号 */
+#define HB_SLOT_CPU1_LOOPS  27u /* CPU1 主循环计数(证明它在独立推进) */
+#define HB_SLOT_CPU1_MPIDR  28u /* CPU1 读到的 MPIDR 原始值 */
+
+/* CPU1 阶段的取值。0 表示还没开始 */
+#define HB_CPU1_STAGE_IDLE      0u    /* 尚未被唤醒 */
+#define HB_CPU1_STAGE_ENTERED   1u    /* 已进入 cpu1_main */
+#define HB_CPU1_STAGE_PERCPU    2u    /* TPIDRPRW 已就位 */
+#define HB_CPU1_STAGE_MMU       3u    /* 本核 MMU 已开 */
+#define HB_CPU1_STAGE_COHERENT  4u    /* SCU + ACTLR 已配 */
+#define HB_CPU1_STAGE_CACHE     5u    /* 本核 L1 已开 */
+#define HB_CPU1_STAGE_ONLINE    6u    /* 已置 online,进入主循环 */
+#define HB_CPU1_STAGE_FAILED    0xEEu /* 中途失败 */
+
 /* MMU 阶段的取值。0 表示还没开始 */
 #define HB_MMU_STAGE_IDLE       0u /* 尚未开始 */
 #define HB_MMU_STAGE_BUILT      1u /* 页表已填好 */
@@ -130,7 +157,7 @@
 #define HB_MMU_STAGE_FAILED     0xEEu /* 自检未通过,主动放弃开 MMU */
 
 /* 已定义的槽位数。越界写会踩到后面的故障注入选择器 */
-#define HB_SLOT_COUNT     24u
+#define HB_SLOT_COUNT     29u
 
 /* 心跳区预留的槽位容量(见 platform.h 的 PLAT_HEARTBEAT_REGION_SLOTS) */
 #define HB_SLOT_CAPACITY  PLAT_HEARTBEAT_REGION_SLOTS

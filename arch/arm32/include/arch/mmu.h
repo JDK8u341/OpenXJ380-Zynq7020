@@ -451,4 +451,11 @@ bool mmu_is_enabled(void);
  */
 void mmu_enable(void);
 
+/*
+ * 次级核的 MMU 使能:复用 CPU0 建好的页表,不重建、不写心跳阶段号
+ * (那个槽记录的是 CPU0 的启动进度,CPU1 覆盖它会让"挂在哪一步"失去意义)。
+ * 必须在 CPU0 完成 mmu_enable() 之后调用。
+ */
+void mmu_enable_secondary(void);
+
 

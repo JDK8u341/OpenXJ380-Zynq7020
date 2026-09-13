@@ -1112,7 +1112,104 @@ FAIL:有 38 个 MIO16-53 不是 LVCMOS18(bank 1 应为 1.8V):
    vendor 写 `LVCMOS 1.8V`，我们的 XSA 写 `LVCMOS 3.3V`。
    **教训：把 vendor 的参考工程当作"这块板的期望配置基准"，比只看自己导出的 XSA 可靠得多。**
 
-### 9. 其它待办（AM3 及以后）
+### 9. 双核（AM3-1/2/3，已在板上跑起来）
+
+**已完成**：每 CPU 数据、放 CPU1 起来、CPU1 建立自己的栈/VBAR/MMU/缓存并自报上线。
+**未完成**：per-CPU 中断（PPI 银行化）、spinlock 与 SGI IPI（AM3-4/5）。
+
+#### 与 x86 的对应关系
+
+| x86_64 | Cortex-A9 / Zynq |
+|---|---|
+| `INIT-SIPI-SIPI` | 写 `0xFFFFFFF0` + **`SEV`**（UG585 §6.1.10）|
+| AP 从实模式低地址起步 | CPU1 从**任意物理地址**起步,**但必须是 ARM-32 指令** |
+| `swapgs` + `KERNEL_GS_BASE` | **`TPIDRPRW`**（每核 banked,特权态专用）|
+| 每核 GDT/IDT | 每核 `VBAR` / `TTBR0` / `ACTLR` |
+| APIC per-CPU 寄存器 | GIC 的 PPI 在 distributor 里**按核银行化** |
+
+#### 上板前先确认了 CPU1 的实际状态
+
+我们用 JTAG 直载、**不跑 BootROM**,所以"SEV 协议能不能直接用"是个必须先验证的前提。
+实测（`tmp-test/jtag/probe_cpu1.tcl`）：
+
+```
+A9_CPU_RST_CTRL = 0x00000000      CPU1 没被按在复位里,时钟在跑
+0xFFFFFFF0      = 0xFFFFFF2C      BootROM 预置的"安全网"地址还在
+CPU1: PC=0xffffff34  LR=0xffffff2c  -> 正停在 BootROM 的 WFE 等待循环
+CPU0: PC=0x00103818                 -> 跑着我们的内核
+```
+
+**结论:协议可以直接用。**
+
+#### 计划的一处简化：不需要 OCM 跳板
+
+计划原文写的是"OCM 跳板 + `sev`",那是照搬 x86"AP 需要一个低地址可达的实模式入口"的思路。
+ARM 不需要:`0xFFFFFFF0` 可以放**任意 32 位地址**,而内核链接在物理 `0x00100000`、
+CPU1 起来时 MMU 关着 —— 物理地址本来就直接可达。所以 `cpu1_entry` 直接在 `start.S` 里,
+跳板纯属多余。
+
+#### ★ 抓到一个真正的 SMP 一致性 bug ★
+
+CPU1 起来后各项检查都过,但**它表项里的 `mpidr` 是 0**（应为 `0x80000001`），
+而 CPU1 自己写心跳时那个值是**对的**。对照哪些字段活下来很说明问题：
+
+| 字段 | 最终值 | 谁写的 |
+|---|---|---|
+| `cpu_id` / `last_intid` / `stack_top` | ✓ 正确 | **CPU0**（释放 CPU1 之前）|
+| `online` / `loops` | ✓ 正确 | **CPU1**（缓存使能**之后**）|
+| `mpidr` | ✗ 变回 0 | **CPU1**（缓存使能**之前**）|
+
+**机制**：CPU0 的 `percpu_table_reset()` 把整行读进自己的 L1 并置脏。CPU1 起来时
+**缓存是关的** —— 它的写入直通 DDR，**不会让 CPU0 的缓存副本失效**。随后 CPU0
+那条脏行被换出，把 CPU1 早先写的 `mpidr` 覆盖回 0；而 `online`/`loops` 是 CPU1
+**开了缓存之后**写的，走 SCU 一致性路径，所以没事。
+
+**这就是典型的"能跑但会随机坏"** —— 不修的话以后会以内存随机错乱的形式冒出来，
+而那时几乎不可能联想到启动阶段这一次写入。
+
+**修法（两处，缺一不可）**：
+1. `percpu_init_self()` **只写 CP15（TPIDRPRW），不写任何共享内存** ——
+   新增 `percpu_publish_self()` 负责写身份字段，**只能在缓存使能之后调用**；
+2. `smp_release_cpu1()` 在 SEV 之前对 percpu 表做
+   `cache_clean_invalidate_range()`，把 CPU0 的脏行清出去。
+
+修完 `mpidr = 0x80000001` 稳定留住。
+
+#### 验收
+
+| 判据 | A（放 CPU1）| B（不放，破坏性 A/B）|
+|---|---|---|
+| `smp_cpu1_online` | 1 PASS | 0 **FAIL** |
+| `smp_cpu1_stage` | 6 PASS | 0 **FAIL** |
+| `smp_cpu1_mpidr` | 0x80000001 PASS | 0 **FAIL** |
+| `smp_cpu1_loops` | 1 PASS | 0 **FAIL** |
+| `smp_distinct_stacks` | 1 PASS | 0 **FAIL** |
+| 总计 | **22 passed, 0 failed** | 17 passed, **5 failed** |
+
+**CPU1 确实在独立满速运行**：JTAG 直接读 percpu 表，`loops` 在 700ms 内
+从 1698044652 涨到 1906881904（约 **7300 万次/秒**，符合 666MHz 上紧凑循环的量级）。
+两核栈分别是 `0x0013D000`（`__stack_top`）与 `0x0014A000`（`__stack1_top`），
+相差 `0xD000` 正好是一整块。
+
+**A/B 顺带抓出一个假检查**：`smp_cpu1_id` 查的是 `cpu_id`，而那是 **CPU0 在放 CPU1
+起来之前就填好的** —— B 侧它照样 PASS，即永远不会失败、等于没判。已换成
+`smp_cpu1_mpidr`（只有 CPU1 自己能写），B 侧确认失败。
+
+#### 上板前的静态核对（Thumb 会直接跑飞）
+
+UG585 明确"CPU1 的首次跳转只支持 ARM-32 指令集"。所以链接后必须核对：
+
+```
+001000b0 <cpu1_entry>:           <- 4 字节编码 = ARM,不是 Thumb
+  1000b0: e10f0000  mrs  r0, CPSR
+  1000c0: e59f0024  ldr  r0, [pc, #36]   -> 0x1000ec
+字面量池: 0x1000e0 = 0x0013D000 (__stack_top,  _start 用)
+          0x1000ec = 0x0014A000 (__stack1_top, cpu1_entry 用)
+```
+
+两个入口各取各的栈符号 —— 取错就变成两核共用一块栈，而那种错不会立刻崩。
+
+### 10. 其它待办（AM3 及以后）
 
 - 缓存维护与 Cortex-A9/PL310 勘误 —— **L1 与 L2 均已使能**；
   588369 已规避，727915 未触及相关路径，775420 尚未处理
