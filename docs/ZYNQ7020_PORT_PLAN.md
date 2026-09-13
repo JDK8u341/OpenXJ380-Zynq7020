@@ -6,46 +6,45 @@
 
 ---
 
-## 0.5 工作交接：当前状态与续接点（压缩上下文前写入）
+## 0.5 工作交接：当前状态与续接点
 
-> **这一节是给"下一次续接"看的，不是给读者看的。** 它记录到哪个提交、板子现在是什么状态、
+> **这一节是给"下一次续接"看的。** 它记录到哪个提交、板子现在什么状态、
 > 下一步从哪一行开始、以及那些**重新推导一遍会很贵**的结论。
 
 ### 0.5.1 一句话状态
 
-**M0–M3 全部完成并板上验证；AM3 五个子阶段实现完成；
-M4-1/2/3/4/5 全部完成并板上验证（当前 **41 passed / 0 failed**）。
-M4-5 的 guard page 已经拿到**第三级证据**（破坏性 A/B 成立）。
-**M4-6 / M4-7 都已全部完成**（`ff60c7b` `bfcadd6`，板级 **49 passed / 0 failed**）。
-**下一步是 M4-8：就绪队列 + 调度策略 + idle（WFI）**，之后 M4-9 的 tick 抢占
-才是真正需要"连 CPSR 一起换"的地方（协作式切换刻意不动 CPSR，理由见 context.S）。
+**M0–M4-8 全部完成并板上验证；M4-9 做到第一步。当前板级自检 55 passed / 0 failed。**
+
+M4-9 分两步：**协议与决策层已上板**（提交 `d8c49a2`），
+**"搬帧"还没做** —— 那一步才让抢占真正发生。续接点见 §0.5.7。
 
 ### 0.5.2 分支与提交
 
-分支 `feat/zynq7020-arm-port`（**不要推 main**，用户最后会自己 fork + PR）。
+分支 `feat/zynq7020-arm-port`（**不要推 main**，用户最后自己 fork + PR）。
 
 | 阶段 | 提交 | 板上证据 |
 |---|---|---|
-| M0 工具链骨架 | `9db665c` | 能出 ELF 并 JTAG 加载 |
-| M1 心跳 + 异常 + 串口 | `378a0a4` `6c45328` `f05119d` `bb5a0da` `8c15a77`（标签 `m1-verified`）| 自检全过；故障注入逐类复验 |
-| M2-1..M2-4 页表 + MMU | `cca786b` `ff7db50` `06ad713` `9fbc85b` | 恒等映射开起来，属性细化 |
-| M2-5 缓存 | `db0a6a4` `18237ce` `1997dfb` `90f579a` `f4603d5` | L2 受控 A/B：on=11212 off=15989 on-again=11213 |
-| M3-1..M3-5 设备描述层 | `688311d` `8788af5` `bb508f0` `9af869e` `17e26c0` | 两次破坏性 A/B（改覆盖表 → LED 全灭）|
+| M0–M3 工具链/串口/MMU/描述层 | `9db665c` … `17e26c0` | 两次破坏性 A/B（LED 全灭）|
 | M3-6 自检报告 | `b627c44` | `verify_board.py --load` 一条命令判过 |
-| M3-7 串口 RX 命令通道 | `9a713f3` | 环回自检 |
-| XSA 电压修复 + RX 打通 | `a04783e` `a37e079` `9ad839c` `4fa0edf` `73185f7` | `shell_test.py --load` 10/10；17 passed / 0 failed |
+| M3-7 串口 RX + XSA 电压修复 | `9a713f3` `9ad839c` `4fa0edf` `73185f7` | `shell_test.py --load` 10/10 |
 | AM3 双核 | `8c85301` `8ba193a` | 26 passed / 0 failed；A/B：不放 CPU1 → 5 项全 FAIL |
-| M4-1 krlibc | `2103ab3` | 宿主 2 passed；errno 与源 OS 逐值比对 |
-| M4-2 页分配器 | `6642292` | 29 passed / 0 failed（顺带炸出 FPU 雷）|
-| M4-3 内核堆 | `273c2cc` | 32 passed / 0 failed |
-| M4-4 细粒度映射 | `fb0c3d9` `051d712` `65b2061` `8bde8aa` | 35 passed / 0 failed |
-| M4-5 内核栈池 + guard page | `d78798a` `47820fb` | **42 passed / 0 failed**；`guard_trip.py` 的**两组** A/B 都成立：不映射（FS 0x07）+ AP=0b000（FS 0x0F，顺带证明 M2-4 的 DACR=client 真的在生效）|
-| M4-6 第一步:调研源 OS | `1bef1ed` `5e7826c` + §4.7 | 产出三份清单 + 硬约束；抽查复核过（全库确实只有 2 条 static_assert、`include/cpu/gdt.h` 确实不存在）|
-| M4-6 寄存器帧 | `451e252` | 43 passed / 0 failed（新增 `exc_frame_layout`）；实测改正 pc 偏移（SVC 与 Data Abort 各偏 4）|
-| M4-6 PCB/TCB 结构体 | `66e2c26` | **44 passed / 0 failed**（新增 `tcb_ctx_layout`）；板上实测 `sizeof=512 align_ok=1`；汇编边界收窄为"指向 ctx 的指针" |
-| M4-7 第一步:帧落到任务栈 | `ff60c7b` | **46 passed / 0 failed**；`exc_frame_on_task_stack=1`、`irq_frame_violations=0`；逼出两个只有上板才暴露的 bug（见 §4.7.7d）|
-| M4-7 后半段:协作式切换 | `bfcadd6` | **49 passed / 0 failed**；两个上下文来回切（`ctx_a`/`ctx_b`/`stack_isolated` 全 PASS）；破坏性 A/B：关掉换栈 → b_sp 压在 kmain 的栈上，被检出 |
-| ~~M4-7~~ | — | ✅ **已完成** |
+| M4-1 krlibc | `2103ab3` | 宿主；errno 与源 OS 逐值比对 |
+| M4-2 页分配器 | `6642292` | 29/0（顺带炸出 FPU 雷）|
+| M4-3 内核堆 | `273c2cc` | 32/0 |
+| M4-4 细粒度映射 | `fb0c3d9` `051d712` `65b2061` `8bde8aa` | 35/0 |
+| M4-5 栈池 + guard page | `d78798a` `47820fb` | **42/0**；两组 guard A/B 成立 |
+| M4-6 调研（三份清单）| `1bef1ed` `5e7826c` + §4.7 | 产出见 §4.7 |
+| M4-6 寄存器帧 | `451e252` | 43/0；实测改正 pc 偏移 |
+| M4-6 PCB/TCB 结构体 | `66e2c26` | **44/0**；`sizeof(tcb)=512` |
+| M4-7 帧落到任务栈 | `ff60c7b` | **46/0**；逼出两个只有上板才暴露的 bug |
+| M4-7 协作式切换 | `bfcadd6` | **49/0**；两组 A/B |
+| M4-8.1 spin_t 契约 | `1566f47` | 49/0（`smp_lock_counter=40000`）|
+| M4-8.2 纯逻辑调度器 | `8de4875` | 宿主穷尽测 |
+| M4-8.3 内核侧调度器（未接）| `7a2bfaa` | ⚠ **这一步违反了下一条硬规矩**，见 §0.5.6b |
+| 硬规矩入计划 | `5c06771` | — |
+| M4-8.3 接进内核 | `6c4c8d7` | **52/0** |
+| M4-8 按源 OS 修正三处 | `abde043` | **54/0** |
+| M4-9 协议 + 决策层 | `d8c49a2` | **55/0** |
 
 ### 0.5.3 构建与验证命令（照抄即可）
 
@@ -53,152 +52,215 @@ M4-5 的 guard page 已经拿到**第三级证据**（破坏性 A/B 成立）。
 $py    = "C:\Users\VeryS\.conda\envs\rxgb\python.exe"
 $ninja = "C:\Users\VeryS\AppData\Local\Programs\CLion\bin\ninja\win\x64\ninja.exe"
 
-# 构建(新增 .c 文件后必须先重跑 gen_ninja.py,否则链接期 undefined reference)
+# 构建(新增 .c 后必须先重跑 gen_ninja.py)
 & $py tools/gen_ninja.py --out build-arm.ninja --arch arm32
-& $ninja -f build-arm.ninja arm32
+& $ninja -f build-arm.ninja arm32            # 产物 out/kernel-arm.elf
 
-# 宿主单测(基线:9 failed / 69 passed;那 9 项是预先存在的,与本移植无关)
+# 宿主单测(基线:9 failed / 73 passed;那 9 项预先存在,与本移植无关)
 & $py -m pytest tests/ -q
 
 # 上板:全部自检 + 退出码即判定
 & $py tmp-test\verify_board.py --load
 
-# 上板:命令通道端到端
+# 上板:串口命令通道 / guard A/B / FSR 译码回归 / 异常 LR 偏移测量
 & $py tmp-test\shell_test.py --load
-
-# 上板:guard page 的破坏性 A/B(会故意让内核停在 Data Abort 现场,这是预期)
 & $py tmp-test\guard_trip.py --load
-
-# 上板:FSR 译码回归(改过译码表就要跑,要重新加载三次)
 & $py tmp-test\fsr_decode_check.py
-
-# 只加载不判定的原始串口捕获(诊断用)
-& "C:\AMDDesignTools\2025.2\Vitis\bin\xsdb.bat" tmp-test\jtag\run_kernel_uart.tcl
+& $py tmp-test\exc_frame_probe.py [2|5]
 ```
 
-**工具链**:Vitis GNU `arm-none-eabi-gcc` 13.3.0(`C:\AMDDesignTools\2025.2\gnu\aarch32\nt\gcc-arm-none-eabi\bin`)。
-硬浮点 `-mfpu=vfpv3 -mfloat-abi=hard`、`-mcpu=cortex-a9 -marm`、`-nostdlib`、需 `-lgcc`。
+**诊断常用**:抓原始串口（`verify_board` 只打印表格，看不到 `Sched` / `Exc` 那些行）：
 
-**宿主 gcc/cc 是坏的**(MinGW `cc1.exe` 静默退出 1),测试会自动回退到 clang。
+```python
+import sys, subprocess, time
+from pathlib import Path
+sys.path.insert(0, str(Path("tmp-test").resolve()))
+from guard_trip import SerialLog, LOAD_TCL, PORT, BAUD, XSDB, ROOT
+log = SerialLog(PORT, BAUD); time.sleep(0.4)
+subprocess.run([XSDB, str(LOAD_TCL)], cwd=str(ROOT), capture_output=True, text=True, timeout=600)
+text = ""; d = time.time() + 18
+while time.time() < d: text += log.since(); time.sleep(0.1)
+log.close(); Path("tmp-test/out/boot.txt").write_text(text, encoding="utf-8")
+for l in text.splitlines():
+    if any(k in l for k in ("Sched","Exc","Switch","CHECK","FAIL")): print(" ", l.strip())
+```
 
-### 0.5.4 硬件事实(不要重新推导)
+**工具链**:Vitis GNU `arm-none-eabi-gcc` 13.3.0；硬浮点 `-mfpu=vfpv3 -mfloat-abi=hard`、
+`-mcpu=cortex-a9 -marm`、`-nostdlib`、需 `-lgcc`。
+**宿主 gcc/cc 是坏的**（MinGW `cc1.exe` 静默退出 1），测试会自动回退到 clang。
 
-- 控制台 = **UART1 @ `0xE0001000`,MIO48(TX)/MIO49(RX)**,9600 8N1
-- USB 线一根经 SL2.1S hub:JTAG + PS 串口(CH9102F→**COM4**) + PL 串口(CH340E→**COM7**)
-- PL LED = 双通道 AXI GPIO @ `0x41200000`(无中断)
-- 心跳区 OCM `0x00020000`,magic `0x4F583338`;故障注入选择器 `0x00020080`
-- DDR `0x00100000` + `0x3FF00000`;内核物理加载 `0x00100000`
-- 内核堆 32MB、内核栈池 32 槽 x 1MB(+每槽 1 页 guard),都是启动时向 palloc
-  一次性要的连续区,地址不固定(串口上会打出来)
-- **MIO bank1 实际 1.8V**(核心板 `VCCIO_BANK1→VCC1P8`),bank0 3.3V。
-  当前 XSA 已修正,加载器在 `ps7_init` 后有**硬校验**(`tmp-test/zynq/ps7_mio_bank1_check.tcl`)
-- 板子当前是**交叉组合**:PS 配置取自 `opjtmp.xsa`,PL 比特流取自 `AXI_GPIO_1_SOFT`
+### 0.5.4 硬件事实（不要重新推导）
 
-### 0.5.5 ★ 已经踩过的坑(每条都有板上证据,不要重踩)★
+- 控制台 = **UART1 @ `0xE0001000`，MIO48(TX)/MIO49(RX)**，9600 8N1；USB 线一根经 SL2.1S hub：
+  JTAG + PS 串口（CH9102F → **COM4**）+ PL 串口（CH340E → COM7）
+- PL LED = 双通道 AXI GPIO @ `0x41200000`（无中断）
+- 心跳区 OCM `0x00020000`，magic `0x4F583338`；**32 个槽已满**，故障注入选择器 `0x00020080`
+- DDR `0x00100000` + `0x3FF00000`；内核物理加载 `0x00100000`
+- **MIO bank1 实际 1.8V**、bank0 3.3V；当前 XSA 已修正，加载器在 `ps7_init` 后有硬校验
+- 板子当前是**交叉组合**：PS 配置取自 `opjtmp.xsa`，PL 比特流取自 `AXI_GPIO_1_SOFT`
+- 栈区（`kernel.ld` 符号）：`__stack_bottom` … `__stack_svc_top`(= `__stack_top - 0x5000`)
+  … `__stack_top`。**SVC 栈 = `[__stack_svc_bottom, __stack_svc_top)`，IRQ 栈紧邻其上**，
+  两段不相交 —— M4-7 的判据就是靠这一点做二值判定
+- 启动时串口额外打印的行（诊断用）：`Page alloc` / `Kernel heap` / `Kernel stack` /
+  `Ap guard` / `Exc frame` / `Tcb ctx` / `Exc stack` / `Switch` / `Sched` / `Sched tick`
+
+### 0.5.5 ★ 已经踩过的坑（每条都有板上证据，不要重踩）★
 
 | # | 坑 | 结论 |
 |---|---|---|
-| 1 | **内核从来没使能 FPU** | `-mfloat-abi=hard` 下 GCC 会用 VFP 做块拷贝,而 CPACR/FPEXC 从未设置 → Undefined Instruction。已修:`boot/start.S` 的 `enable_fpu`,**两个寄存器都要动**,且 **CPACR/FPEXC 是每核的**,CPU0/CPU1 各调一次 |
-| 2 | **MIO bank 电压配错** | XSA 把 bank1 声明成 3.3V 而板子是 1.8V → LVCMOS33 的 VIH≈2.0V 而 CH9102F 只驱动到 1.8V → **引脚恒读低、没有下降沿**,表现与"线断了"完全不可区分。修法:`MIO_PIN` 的 `[11:9]` 从 3 改成 1 |
-| 3 | **环回自检的 TXRST 冲掉待发输出** | `uart_putc` 只等 TXFULL 就返回,不等字节发出;`CR=TXRST` 会丢掉几十字节已排队的报告文本。改成先 `uart_wait_tx_empty()` 且只写 RXRST |
-| 4 | **环回自检吃掉一行报告** | 本地环回**不切断 TX 引脚输出**,探针字节漏到线上会把行首 `CHECK` 污染成 `UCHECK`,解析脚本按 `^CHECK` 匹配就会整行漏读。自检已挪到横幅之前 |
-| 5 | **SMP:CPU1 在缓存使能前写共享内存** | CPU0 的脏行会把 CPU1 早先写的值覆盖回去 —— 症状极隐蔽,**同一结构体里只丢一个字段**。规矩:**CPU1 开缓存前不得写任何共享内存**;CPU0 在 SEV 前对交接数据做 `cache_clean_invalidate_range()` |
-| 6 | **SGI 不排队** | GIC 的 SGI 边沿触发且不排队,同一 INTID 在目标核未应答时再发会被**直接丢弃**(实测连发 16 只到 5)。验证要"发一个等一个" |
-| 7 | **`tick_handler` 的全局状态被两核竞争** | 该处理函数两核共用,而 `g_tick_seen` 等是 CPU0 诊断状态。CPU1 的 tick 会覆盖它 → `irq_ticks_eq_irq` 误报。已加 CPU0 守卫 |
-| 8 | **段与小页的属性位布局不同,不能搬运** | S 位在段里是 bit16,在小页里 **bit16 属于物理地址** → 拆段后每页物理地址凭空多 0x10000。接口必须收**参数**,用两个构造函数分别构造 |
-| 9 | **指针与物理地址不能混用** | 描述符存 32 位 PA 而宿主指针是 64 位,截断再转回得到野地址(宿主上访问违例)。结构体里必须是两个字段 |
-| 10 | **宿主 `sizeof` 与目标不同** | 宿主 64 位下 `sizeof(heap_block_t)` 是 40 而我硬编码 24 → **宿主测试测的是另一套布局,等于白测**。头大小必须由 `sizeof` 推导 + 静态断言 |
-| 11 | **堆不能按需向 palloc 增长** | `heap_extend` 要求增长区紧邻,而 `palloc_alloc_pages()` **不保证相邻**。改为启动时一次性要 32MB 连续区 |
-| 12 | **测试区间必须与 L1 段对齐** | `palloc` 只保证 4KB 对齐;若测试假设"拆一次覆盖整段",区间跨段时后半段仍是段映射 → 逐页核对读到 `VMAP_RESULT_SECTION` |
-| 13 | **`largest_free` 是派生量** | 忘了在 alloc/free 时重算,自检的"统计与实际一致"立刻报错。它是静默失真(没有调用方读它做决定)|
-| 14 | **`DFSR` 不能用 `fsr & 0x1F` 取状态** | **DFSR 的 bits[7:4] 是 Domain**,正好压在 `FS[3:0]` 上面;`FS[4]` 在 **bit10**。本内核 domain=15,于是每个状态码凭空 +0x10:真值 `0x07`(translation fault, level 2)读成 `0x17`→"保留/未知"。以前只触发过 L1 **fault 项**的故障(域位为 0)和取指路径(IFSR **没有** Domain 字段),所以一直没暴露 —— guard page 的 L1 项是页表描述符、domain=15 才炸出来。取法是 `(fsr & 0xF) \| ((fsr >> 10) & 0x10)` |
-| 15 | **`vmap_map` 前必须先 `unmap`** | 拆段会把**整段 256 页**都填成恒等映射,而 `vmap_map` 对已存在的 4KB 映射一律拒绝(刻意不静默覆盖)。所以"把一个页变成我要的映射"是 **split → unmap → map** 三步,漏了中间的 unmap 的症状是**第一页成功、从第二页起全部 `ALREADY`** |
-| 16 | **栈的 guard 页要在栈的下面** | 栈向下长,guard 必须在低地址一侧。槽布局是 `[guard][栈页...]`;写成 `[栈页...][guard]` 会让"槽 i 的 guard"与"槽 i-1 的栈顶页"重叠 |
+| 1 | **内核从来没使能 FPU** | `boot/start.S` 的 `enable_fpu`，**CPACR 与 FPEXC 两个都要动**，且是**每核**的 |
+| 2 | **MIO bank 电压配错** | XSA 声明 3.3V 而板子 1.8V ⇒ 引脚恒读低、没有下降沿，与"线断了"无法区分 |
+| 3 | **环回自检的 TXRST 冲掉待发输出** | 先 `uart_wait_tx_empty()`，且只写 RXRST |
+| 4 | **环回自检吃掉一行报告** | 探针字节污染行首 `CHECK`；自检必须在横幅之前 |
+| 5 | **SMP：CPU1 在缓存使能前写共享内存** | CPU0 的脏行会覆盖回去，**同一结构体只丢一个字段** |
+| 6 | **SGI 不排队** | 连发 16 只到 5；验证要"发一个等一个" |
+| 7 | **`tick_handler` 全局状态被两核竞争** | 加 CPU0 守卫 |
+| 8 | **段与小页的属性位布局不同，不能搬运** | 拆段后每页物理地址凭空多 `0x10000` |
+| 9 | **指针与物理地址不能混用** | 结构体里必须是两个字段 |
+| 10 | **宿主 `sizeof` 与目标不同** | 头大小必须由 `sizeof` 推导 + 静态断言 |
+| 11 | **堆不能按需向 palloc 增长** | `palloc_alloc_pages` 不保证相邻 |
+| 12 | **测试区间必须与 L1 段对齐** | 否则后半段仍是段映射 |
+| 13 | **`largest_free` 是派生量** | 忘了重算就静默失真。**不要存派生量**（M4-8 的 `sched_head`/`sched_count` 因此被去掉）|
+| 14 | **`DFSR` 不能用 `fsr & 0x1F`** | **Domain 在 bits[7:4]**，`FS[4]` 在 bit10；本内核 domain=15 ⇒ 每个状态码凭空 +0x10 |
+| 15 | **`vmap_map` 前必须先 `unmap`** | 拆段会填满整段 256 页；漏掉 unmap 的症状是"第一页成功、从第二页起全 ALREADY" |
+| 16 | **栈的 guard 页要在栈的下面** | 槽布局是 `[guard][栈页…]` |
+| 17 | ★ **`srsdb` 存的是原始 LR，它不是返回地址** ★ | 返回地址 = LR − 逐异常类型的偏移。漏掉修正 ⇒ **每条中断跳过一条指令** ⇒ 随机 Data Abort，**每次 DFAR 都不一样**（实测 `0x00` 与 `0x0010AA26`）|
+| 18 | ★ **处理函数跑在 SVC 模式后，`bl` 会踩掉 LR_svc** ★ | 异常来自 SVC 时硬件把返回地址放进 LR_irq，**LR_svc 还是被中断函数的活返回地址**。不先存它 ⇒ 被中断函数 `bx lr` 飞到垃圾地址 ⇒ **整个 PS 挂住、连 JTAG 的 DAP 都读不到，只能断电**。⇒ 帧里必须有 `svc_lr` |
+| 19 | **`cpsid if, #mode` 在目标模式等于当前模式时是 UNPREDICTABLE** | SVC 向量正是这种情况；用 `msr cpsr_c, #imm` |
+| 20 | **异常帧必须 8 字节对齐** | 帧建好要 `bl` 到 C；少 4 字节不是编译错误，是 C 里某条 VFP 指令炸 Undefined |
+| 21 | **`arch_ctx_save(&a)` + `arch_ctx_switch(&a,&b)` 用同一个槽** | 切换器会把当前状态存进 `from`，**覆盖掉 ctx_save 刚设的继续点**；症状是 `ctx_b`/`stack_isolated` 全 PASS、唯独 `ctx_a=FAIL`，看起来像切换器坏了 |
+| 22 | **"不换栈"的对照组会踩坏调用者的栈** | 这是它的**目的**，但必须放在自检报告**之后**跑：第一次放前面，kmain 三个局部变量被踩成代码地址，报告凭空多 3 项 FAIL |
+| 23 | **VFP 区不需要 32 字节对齐** | ARMv7 的 VFP 传输只要求 **4** 字节；16 是 x86 FXSAVE 的要求。写 `aligned(32)` 会与只保证 8 的 `heap_alloc` 冲突 ⇒ 未定义行为 |
 
-### 0.5.6 ★ 验证纪律(这个项目最贵的一课)★
+### 0.5.6 ★ 验证纪律（这个项目最贵的一课）★
 
-**三级证据,自上而下强度递增:**
+**三级证据**：软件自报 < 寄存器/硬件读回 < **破坏性 A/B**（唯一能证明"承重"的）。
 
-1. **软件自报日志** —— 最弱,是代码自己说自己对;
-2. **寄存器/硬件读回** —— 强一些,但仍可能是"某个值被写进去了";
-3. **破坏性 A/B** —— **唯一能证明某个东西是承重的**。做法:改掉它,看行为是否随之改变。
+**两条硬规矩**：
 
-**已做过的 A/B(可作模板)**:M3 描述层(改 PL 覆盖表 → LED 全灭)、L2 缓存(关掉再打开)、
-AM3(不释放 CPU1 → 5 项 SMP 检查全 FAIL)、MIO 电压(来回切 `[11:9]` → 通信通/断/通)。
+- **对照组必须存在，而且必须会动。** 两次想读 MIO49 焊盘电平的实验都是被对照组挡下来的
+  （作为对照的、已知在动的 MIO48 也纹丝不动 ⇒ 实验无效）。
+- **验证代码本身的信息量就是产出的一部分。** 把三位状态压成布尔，代价是整整一轮上板时间。
 
-**两条硬规矩**:
+#### 0.5.6b ★★ 硬规矩：一个"阶段"= 实现 + 它的测试，缺一不算完成 ★★
 
-- **对照组必须存在,而且必须会动。** 两次想读 MIO49 焊盘电平的尝试都是**被对照组挡下来的**
-  (作为对照的、已知在动的 MIO48 也纹丝不动 → 实验无效)。没有对照,两次都会得出错误结论。
-- **验证代码本身的信息量就是产出的一部分。** M4-4 板级验证失败时,第一版把三位状态的
-  `vmap_err_t` 压成了布尔 `split_ok`,于是只知道"失败了",**白白多花一整轮上板时间**。
-  改成打印错误码 + `l1_before/after` 后,两个 bug 一次全部暴露。
+**这条是被违反过之后补上的（提交 `7a2bfaa`）**：`sched_kern.c` 当时编译、链接、
+符号在 ELF 里，宿主与板级回归都是 49/0 —— 但那个模块**一行都没被执行过**。
+我在提交里写的是"纯新增，行为不变"（没错），但很容易被读成"测过了"。
 
-### 0.5.7 续接点:M4-6 第二步(设计 ARM 侧 PCB/TCB 与寄存器帧)
+- 提交信息里**不许用"已完成"描述未测代码**
+- 判据是"**被执行过且行为符合预期**"，不是"编得过"。**编译通过 + 回归全绿 = 零功能证据**
+- 分两步落地的阶段，第一步**不算阶段**，不许在计划里记成已完成
+- 每次提交前问一句：**"这一步新写的代码，哪一行被执行过？"**
 
-**M4-5 已全部完成**(提交 `d78798a` `47820fb`)。它的三级证据(两组 A/B)、
-炸出来的 FSR 译码 bug、以及已知限制都写在 `arch/arm32/README.md` 的「M4-5」一节。
+#### 0.5.6c ★★ 硬规矩：源 OS 优先 —— 连"死结"都可能是自己发明的 ★★
 
-**M4-6 的第一步(调研源 OS)也已完成**,产出在 **§4.7**,不要重新调研。
-那份清单里有几条会直接改变设计的结论,开工前必读:
+M4-8 里我推出一个"纯协作式调度器到不了 idle"的死结，并准备为它设计补救。
+**去查源 OS 之后发现死结是我的发明的问题**（见 §0.5.9）。
+教训：**当你发现自己需要一个源 OS 里不存在的新机制时，先回去读源 OS。**
+"我这里有个特殊情况"十有八九是自己前面的某一步已经走偏了。
 
-1. **x86 有两套寄存器帧,不是一个** —— `registers_t`(`pcb.h:17-44`,调度帧)
-   与 `struct X64_REGS`(`longm.h:9-35`,异常/系统调用帧),同为 192B 但
-   `rbx..rdi` 与 `r8..r15` 段位置**互换**,指针不可互换。
-   ARM 侧同样要区分"异常帧"与"调度帧";现有 `arm_irq_frame_t` 做中断够、做切换不够。
-2. **ARM 的帧必须无条件包含 SP 与 SPSR** —— x86 的 `rsp/ss` 压不压
-   取决于是否跨特权级,ARM 没有这个分支,不要照抄那个条件性形状。
-3. **`save_registers` 的"返回值即新栈指针"协议是接口**
-   (`scheduler.cpp:68-69` 的 `call timer_handle; mov rsp, rax`):
-   C 侧通过返回栈指针**就地改写现场**。ARM 应照抄,不要另发明"汇编查表跳转"。
-4. **`change_proccess` 的动作顺序即接口**(`scheduler.cpp:95-169`),
-   顺序两架构一致,只有每一步的实现分叉。
-5. **不要照搬** GDT/TSS/IDT/syscall MSR/`swapgs`/CR3/`PTE_*`。
-   两条因果:x86 的 TSS 唯一理由是"硬件不知道内核栈在哪",
-   而 **ARMv7-A 的 SP 是按模式 banked 的,硬件自动切**;
-   x86 的 `swapgs` 是因为 `%gs` 基址两态不同,而 **ARM 的 `TPIDRPRW` 是 PL1 专属 banked 的**。
-6. **已知的 ARM 侧接口缺口**:`spin_t` 没有 CPSR 字段、缺
-   `spin_lock_no_irqsave`/`spin_unlock_no_irqstore`/`spin_init`/`barrier`、
-   `percpu_t` 缺 `current_task`/调度队列/`scheduler_ticks`、缺 `arch_read_sp()`。
+### 0.5.7 ★ 续接点：M4-9 第二步（搬帧）★
 
-**M4-5 留给 M4-7 的一笔账**:`kstack_tlb_flush_range` 只失效**本核** TLB。
-现在栈只由 CPU0 用;等任务真跑在 CPU1 上时,CPU1 那边可能还留着启动阶段的
-段表项,**guard 对它是失效的**。届时要 TLBIMVAA 广播或 IPI 让对端自己刷。
+**目标**：让"本该切换"真的发生 —— 抢占。
 
-### 0.5.8 未决项(已知、未解决,不要当成已完成)
+**要做的事**（顺序不能换）：
+
+1. **先修 `ctx.cpsr`**。`sched_kthread_create()` 现在把它设成 `0`，
+   而 **0 在 CPSR 里是"User 模式 + 中断全开"** —— 一旦搬帧，恢复它会把核心拖进用户态。
+   要改成 `ARM_MODE_SVC`（I 位清，允许被抢占）。
+2. **收现场**：`sched_tick` 走到"该切"那一支时，把 current 的现场从帧里收进 `cur->ctx`：
+   ```
+   ctx.r[i] = frame->r[i]           (i = 0..12)
+   ctx.sp   = (u32)frame + ARM_EXC_FRAME_BYTES    ← 被中断时的 SP
+   ctx.lr   = frame->svc_lr
+   ctx.pc   = frame->ret
+   ctx.cpsr = frame->spsr
+   ```
+3. **搭新帧**：在 `next->ctx.sp - ARM_EXC_FRAME_BYTES` 处建帧（**在目标任务的栈上**），
+   填上 `r[]` / `svc_lr = ctx.lr` / `ret = ctx.pc` / `spsr = ctx.cpsr`，返回该指针。
+   `rfeia sp!` 于是：PC ← `ctx.pc`、CPSR ← `ctx.cpsr`、SP ← `ctx.sp`。
+4. **切 current 与 `scheduler_ticks`**，`enable/disable_scheduler` 一类守卫按需加。
+
+**验收（板级二值）**：造**两条不让出的死循环线程**（各自 `for(;;) counter++`），
+跑一段时间后**两个计数都在涨** —— 在此之前它们一个都跑不起来。
+再加一条破坏性 A/B：把 `pc != 0` 的判断去掉 → 应当能观察到"切到 idle 的无效上下文"
+导致的崩坏（这条要到那时再设计，先记着）。
+
+**注意**：`arch_ctx_switch`（协作式）**不再是主路径** —— 源 OS 的切换点只有一个（tick）。
+它保留给 M4-11 的阻塞睡眠与线程退出。
+
+### 0.5.8 未决项（已知、未解决，不要当成已完成）
 
 | 项 | 状态 |
 |---|---|
-| **`irq_spurious` 那次 1285** | 约 14 次启动里出现 1 次,之后 13 次未复现。**判据保留在自检里**,观测账目、已排除项、以及留给复现时的恒等式判据都记在 `arch/arm32/README.md` 第 9 节。**不写成"已解决"** |
-| 启动阶段 ~67ms 的 tick 跳变 | 预先存在,已用受控 A/B 证明与缓存无关,原因未明 |
-| PL310 勘误 775420 | 尚未处理(当前工作用不到) |
-| SXAH 57 位系统调用号 | ARM 侧需要重新编号;代价实际为零(用户态全是 x86-64 ELF,本来就要重编) |
+| **`irq_spurious` 那次 1285** | 约 14 次启动出现 1 次，之后未复现。判据保留在自检里，账目在 `README` 第 9 节 |
+| 启动阶段 ~67ms 的 tick 跳变 | 预先存在，已用受控 A/B 证明与缓存无关，原因未明 |
+| PL310 勘误 775420 | 尚未处理 |
+| SXAH 57 位系统调用号 | ARM 侧需要重新编号；代价实际为零 |
+| **WFI 要不要加** | x86 那边是 `hlt` 且只在 `process_exit` 里；"idle 进 WFI"**不是源 OS 的行为**。要不要给 ARM 加，**需要用户单独拍板** |
+| `spin_t` 的宿主编译器 `#include <stdint.h>` | 无 |
+| `arch/arm32` 不在 `ninja format` 的范围内 | 刻意；见 README（用 clang-format 会打散注释对齐）|
 
-### 0.5.9 与源 OS 的关系:一条必须遵守的规程
+### 0.5.9 ★ 与源 OS 的关系：一条必须遵守的规程（含三个实例）★
 
-**"我觉得这样更省事"不是理由;源 OS 怎么做才是。**
+**"我觉得这样更省事"不是理由；源 OS 怎么做才是。**
 
-D3(FP 上下文)那次的经历值得固定成规程:内核 Undefined Instruction → 查 CPACR →
-修好之后要决定"内核要不要用 VFP" → **查 x86 XJ380 的实际做法** →
-发现它有**每任务 FP 上下文**(512B FXSAVE 区放进 PCB,`scheduler.cpp` 每次切换
-都 `save/restore`),而且编译选项只有 `-mno-80387`(**没有** `-mno-sse`)——
-**源 OS 允许内核用 SIMD** → 所以 ARM 侧照做,`-mgeneral-regs-only` 是**错的**
-(它会让两个架构的契约分叉)。
+**实例 1（D3，FP 上下文）**：内核 Undefined Instruction → 查 CPACR → 修好之后要决定
+"内核要不要用 VFP" → **查 x86**：它有**每任务 FP 上下文**（512B FXSAVE 区进 PCB，
+`scheduler.cpp:121-122` 每次切换都 save/restore），编译选项只有 `-mno-80387`
+（**没有** `-mno-sse`）⇒ **源 OS 允许内核用 SIMD** ⇒ ARM 照做，
+`-mgeneral-regs-only` 是**错的**。
 
-**这条规程在 M4-6 尤其重要**:M4-6 的第一步不是写代码,而是把 x86 的
-`include/task/pcb.h` 与 `kernel/task/pcb.cpp`(90.8 KB)读一遍,产出三份清单
-(架构无关 / 架构相关 / 源 OS 有而我们暂不需要)。
+**实例 2（M4-8 的 idle，三个偏离一次纠正）**：我造了一个真的 `for(;;) wfi()` idle 线程
++ `sched_kern_start()` 交棒，并因此推出"协作式到不了 idle"的死结。查源 OS 后发现：
 
-**兼容性的三类划分**(B5 的输入):
+```c
+// 启动上下文本身就是 idle：用当前 rsp 造一个 TCB，rip 保持 0
+idle_thread->kernel_stack = get_rsp();
+idle_thread->context0.rsp = get_rsp();
+idle_thread->status       = RUNNING;
+get_current_cpu()->current_task = idle_thread;
+// 唯一的切换点在 tick 里（scheduler.cpp:430-470）
+if (best->context0.rip != 0) change_proccess(reg, current, best);
+else                         current->status = RUNNING;   // 什么都不做
+// yield 只是"把时间片置满 + 触发同一个中断"
+```
+
+| 我做的 | 源 OS |
+|---|---|
+| 真的 idle 线程 + 交棒 | **启动上下文就是 idle**，`rip` 保持 0 作"上下文无效"标记，没有交棒 |
+| 协作式 yield 是主路径 | 切换**只在 tick 里**；yield = 置满时间片 + 触发同一入口 |
+| 于是有"到不了 idle"的死结 | idle 永远是 current，**不需要"进去"** |
+
+⇒ 三处偏离已按源 OS 修正（提交 `abde043`）。**根因是把 M4-9 的东西当成了 M4-8 的前提。**
+
+**实例 3（M4-8.2 的策略）**：读 `scheduler.cpp`（594 行）后发现源 OS 的 "EEVDF" 实际是
+**无权重的虚拟期限队列 + 睡醒补偿**：`vruntime_delta()` 是 `(ns*1024)/1024`（**恒等式**）、
+TCB 里**没有权重字段**、没有 lag/eligibility、拾取只有 `deadline_before()` 一句。
+**按规程照抄那个恒等式，不擅自"补全"权重**（否则两边调度行为分叉），并记入退化清单。
+
+**兼容性的三类划分**（B5 的输入）：
 
 | 类别 | 例子 | 要求 |
 |---|---|---|
-| 架构无关 | `device_t` 全部字段;`pcb`/`tcb` 里的 pid/状态/优先级/fd 表/cwd | **逐字段一致** + 两侧静态断言 |
-| 架构相关 | `registers_t`(x86 有 ds/es/err_code;ARM 是 r0-r12/sp/lr/pc/cpsr) | 布局**按设计不同**,只共享名字与角色 |
-| 约定 | `pcb_t`/`tcb_t` 是**指针 typedef**;`regist_device(path, vd)` **按值传结构体** | 必须沿用 |
+| 架构无关 | `device_t` 全部字段；`pcb`/`tcb` 里的 pid/状态/优先级/fd 表/cwd | **逐字段一致** + 两侧静态断言 |
+| 架构相关 | `registers_t`（x86 有 ds/es/err_code；ARM 是 r0-r12/sp/lr/pc/cpsr）| 布局**按设计不同**，只共享名字与角色 |
+| 约定 | `pcb_t`/`tcb_t` 是**指针 typedef**；`regist_device(path, vd)` **按值传结构体** | 必须沿用 |
 
-**ISA 不同 ⇒ `.sys` 模块二进制不可能跨架构运行**,所以"兼容"只能是
+**ISA 不同 ⇒ `.sys` 模块二进制不可能跨架构运行**，所以"兼容"只能是
 **源码级 + 头文件级 + 结构体布局级**。
+
+### 0.5.10 汇编与 C 的边界纪律（M4-6 定下，M4-7/8/9 一直在用）
+
+- **偏移宏只写一份**：`arch/taskctx_asm.h` 只含 `#define`（汇编能直接包含），
+  `arch/taskctx.h` / `tcb.h` / `percpu.h` 用 `_Static_assert` 把 C 结构体钉上去
+  —— **于是汇编那一侧也被保护**。x86 的 `handler.S:29-31` 硬编码三个偏移、
+  **零断言**，是反面教材。
+- **汇编边界上传"指针"而不是"偏移"**：TCB 有指针字段，宿主(8B)与目标(4B)布局不同 ⇒
+  `ARM_TCB_OFF_*` 那组宏**做不下去也做不必要**。切换器收 `&tcb->ctx`。
+- **`percpu_t` 里不许有指针宽度的字段**：否则"在宿主机上验证目标偏移"这条就不成立。
+  新增字段时 `sizeof(percpu_t)` 的断言会立刻报错（现在必须是 56）。
 
 ---
 
@@ -962,9 +1024,9 @@ GPIO 不是设备节点，不需要 `device_t` / VFS / 堆 / 调度器
 | **M0** | 工具链与骨架能编译 | `gen_ninja.py` 加 ARCH 维度、ARM 标志集、新 `linker.ld`；`arch/arm32/` 目录与接口定义。**注**：工具链最终选 **Vitis GNU `arm-none-eabi-gcc` 13.3.0** 而非 clang —— clang 的集成汇编器拒绝 Xilinx BSP 的 `asm_vectors.S`/`boot.S`（`ldrneh` 判为非法指令）且不支持 `-specs=` | ✅ 已完成 |
 | **M1** | 串口最小可启动内核 | Zynq UARTPS 驱动 + MMIO；GIC + Cortex-A9 定时器；异常向量表；JTAG 直载运行。**注**：实际未走"改造 `main.cpp`"的路线，而是新写了 `arch/arm32/src/kmain.c`（见 §4.1 的路线说明） | ✅ 已完成 |
 | **M2** | MMU + 内存管理 | ARMv7 短描述符页表；`PTE_*` 全部重做；1MB 段恒等映射 + 区域表；XN 与 DACR client；**缓存几何/维护原语 + L1+L2 使能**（DMA 前置） | ✅ 已完成 |
-| **M3** | **设备描述层与驱动框架（类 DTS）** | 见 §2.16。描述模型照 DTS（节点 / `compatible` / `reg` / `interrupts` / 属性 / `status`）；**从 `xparameters.h` 生成**描述表；`INTID` 解码收在描述层；驱动 `probe()` 匹配循环；启动时打印全部节点。**验收：把 AXI GPIO 从硬编码改成走 `probe()`** | ← 当前 |
-| **AM3** | **双核（SMP）** —— 原 M3 的后半，从 M3 拆出后移 | OCM 跳板 + `sev` 引导 CPU1；CPU1 自己的栈/VBAR/TTBR0/DACR/SCU/ACTLR/缓存；`TPIDRPRW` 每 CPU 数据；**per-CPU 中断表**（PPI 是每核银行化的）；spinlock + SGI 做 IPI。**验收：两核各自 1 kHz tick、核间计数器竞争结果正确** | |
-| **M4** | 用户态 | SVC 入口 + 寄存器帧映射；ELF32 加载；`R_ARM_*` + `DT_REL`；ARM `crt0.S`；`TPIDRURO` TLS；信号帧；**先跑一个静态链接的 hello XAPI 程序** | |
+| **M3** | **设备描述层与驱动框架（类 DTS）** | 见 §2.16。描述模型照 DTS（节点 / `compatible` / `reg` / `interrupts` / 属性 / `status`）；**从 `xparameters.h` 生成**描述表；`INTID` 解码收在描述层；驱动 `probe()` 匹配循环；启动时打印全部节点。**验收：把 AXI GPIO 从硬编码改成走 `probe()`** | ✅ 已完成 |
+| **AM3** | **双核（SMP）** —— 原 M3 的后半，从 M3 拆出后移 | OCM 跳板 + `sev` 引导 CPU1；CPU1 自己的栈/VBAR/TTBR0/DACR/SCU/ACTLR/缓存；`TPIDRPRW` 每 CPU 数据；**per-CPU 中断表**（PPI 是每核银行化的）；spinlock + SGI 做 IPI。**验收：两核各自 1 kHz tick、核间计数器竞争结果正确** | ✅ 已完成 |
+| **M4** | ~~用户态~~ → **已重新规划为"内存 / 栈 / 调度器"** | 本行是旧规划。现行范围见 §4.5（第一组 M4-1..M4-5 内存与栈、第二组 M4-6..M4-11 调度器）。**用户态被推到 M4 之后**，见 §4.6 的 M4A 系列 | 🔄 进行中（M4-1..M4-8 已完成，M4-9 做到第一步）|
 | **M5** | 存储 + rootfs | SD/SDIO 驱动（ADMA2 + 缓存维护，注册为 `device_t`）；FATFS 打通；镜像流程出 `BOOT.BIN`；挂载 `/system` 并跑 `shell.elf` | |
 | **M6** | 网络 | Cadence GEM 驱动替换 e1000（GEM 描述符环 + PHY/MDIO）；lwIP 胶水去 x86 汇编；`netserver.sys` 零改动接入 | |
 | **M7** | 模块与 ABI 收敛 | 可加载 `.sys` 模块在 32 位空间工作；导出符号范围校验；重建 busybox/musl（若 R7 选前者） | |
@@ -1499,7 +1561,7 @@ D3（FP 上下文）那一次的经历值得作为规程固定下来：
 | ~~M4-6 第一步~~ | ~~调研源 OS 的 PCB/TCB 契约,产出三份清单~~ | ✅ **已完成,见 §4.7** |
 | ~~M4-7~~ | ~~上下文切换（ARM 汇编，per-CPU）~~ | M4-6 | ✅ **已完成**：帧落到任务的栈 + 协作式切换，49 passed / 0 failed |
 | **M4-8** | 就绪队列 + 调度策略 + idle（WFI）| M4-7 |
-| **M4-9** | **tick 抢占**（复用 AM3-5 的每核 1kHz）| M4-8 |
+| **M4-9** | **tick 抢占**（复用 AM3-5 的每核 1kHz）| M4-8 | 🔄 **第一步已完成**（协议 + 决策层，55/0）；**第二步"搬帧"未做**，见 §0.5.7 |
 | **M4-10** | **SMP 调度**：per-CPU 队列 + 负载均衡 + 亲和 | M4-9 |
 | **M4-11** | **可睡眠同步原语** + 内核线程 API | M4-10 |
 
