@@ -429,13 +429,17 @@ Preempt A/B  : skip_frame -> a=0 b=0 switched=2 invalid=0   → 检出
 "两个计数都大于零"这种判据**没有区分能力** —— 没有抢占时先跑的那个会一路跑完
 再挂起，两个计数照样都是正的。（这条判据的设计过程本身就是本项目的一课。）
 
-#### 下一步：**M4-11 可睡眠原语 + 线程退出 API**（结掉 D13/D14）
+#### 下一步：**M4-11 mutex（源 OS 语义）+ 线程退出/回收**（结掉 D13/D14）
+
+> ⚠ 这一节的措辞已按 §4.5 的 **M4-11 调研**改正过两处：D13 说的"可睡眠 mutex"
+> 与 D14 说的"垂死线程释放自己的栈"**都与源 OS 不符**。下面是改正后的版本。
 
 | 项 | 现状 | M4-11 要做的 |
 |---|---|---|
-| **D14 线程没有退出路径** | `thread_finish()` = `sched_park_self()` + 不可达的 `for(;;) arch_wfi()`；6 个调用点；每造一个线程永久占一个栈槽（`kstack_headroom` 已在盯）| 照源 OS `pcb.cpp:501-504`（`process_exit` 之后 `while (true) hlt`）做**真正的线程退出**：从队列摘除 + 释放栈 + 释放 TCB。源 OS 的 `remove_task()`（`scheduler.cpp:562-594`）就是"从 `cpu_id` 指的队列里摘节点"——而那把**全局 `scheduler_lock`** 到那时才有第二个用户（M4-10 刻意没引，见 D12 的收尾说明）|
-| **D13 串口排他用"关调度"** | `console_excl_begin/end` 靠关调度实现互斥（可嵌套 + M4-8.5 起的停摆时长统计）| 可睡眠的 `mutex` 到位后换成它。⚠ 期间**整个系统停摆**，所以它不是通用 printf 锁 |
-| **可睡眠原语** | 现在只有 `sched_sleep_ns` / `sched_wake_task` | `mutex` / `semaphore`：源 OS 的实现在 `kernel/task/mutex.cpp` 与 `ipc.cpp` —— **动手前按 §0.5.9 先读它们** |
+| **D14 线程没有退出路径** | `thread_finish()` = `sched_park_self()` + 不可达的 `for(;;) arch_wfi()`；6 个调用点；每造一个线程永久占一个栈槽（`kstack_headroom` 已在盯）| ★ **两段式，照源 OS**：垂死线程只能"置 `DEATH` + 让出 + `wfi`"（**它在自己的栈上，不能自己释放栈**），释放由**回收线程**做（照 `reaper.cpp:48-61`；条件 `DEATH` + 不在任何核的 `current_task` 上；数据源适配为"遍历两核调度队列"）。同时补上源 OS 那把**全局 `scheduler_lock`**（`remove_task` 与 `add_task` 到这里才真的并发）|
+| **D13 串口排他用"关调度"** | `console_excl_begin/end` 靠关调度实现互斥（可嵌套 + M4-8.5 起的停摆时长统计）| ★ **换成源 OS 的 yield mutex**（`mutex.cpp`）。判据：`sched_off_total_ns` 几乎不再增长 ⇒ 饥饿监视器的 `skipped` 掉到 ~0 |
+| **可睡眠原语** | 现在只有 `sched_sleep_ns` / `sched_wake_task` | ⚠ **源 OS 里没有可睡眠互斥/信号量**（`mutex` 是 yield 型；`ipc` 是进程级且用 `do { sleep_ns(1ms); … } while` 轮询）⇒ ARM 侧**不发明**，M4-11 只做源 OS 有的东西 |
+| **回收线程与对照组的三处交互** | 对照组的 ctx 快照/还原以"窗口内无线程创建/销毁"为**硬件性前提**；清理还会写 `ca->status` | 回收线程一上线就破坏该前提 ⇒ 对照组窗口内**显式暂停回收**（否则还原会按遍历顺序错配，`ca->status` 还会变成 use-after-free）|
 | 附带 | `sched_park_self` 是"自检探针的便利设施"，源 OS 没有这个函数 | 有了线程退出之后它应当被"退出"取代（写在这里免得忘）|
 
 ⚠ **`sched_tick` 不要再加东西**了：M4-10 之后它按核化完成（计费 / 可调度性 /
@@ -2169,6 +2173,105 @@ tcb_t result = best != NULL ? best : (is_current_task_runnable(current) ? curren
 | 10.2 的判据 = "idle 只被切走不被切回" | 判据写成"**切回来之后它还在跑**"（`back=1`：idle 的 `loops` 在涨）| 那句断言**本身就是错的**（`scheduler.cpp:358` 的兜底链会把 idle 切回来，见 ② ）|
 
 这一条在 M4-7 里必须先定下来，不能等到出问题再回头改。
+
+
+#### ★ M4-11 开工前的调研：源 OS 的"锁"与"线程退出"到底长什么样 ★
+
+按 §0.5.6c 先把源 OS 读清楚（`kernel/task/mutex.cpp`、`ipc.cpp`、`pcb.cpp`、
+`reaper.cpp`、`include/mutex.h`）。**结论：计划里关于 D13/D14 的两句都写错了。**
+
+##### ① ★ D13 写错了：源 OS 的 mutex 是 **yield 型**，不是"可睡眠"型 ★
+
+计划（§0.5.7 与退化清单 D13）原话是"**可睡眠的 `mutex` 到位后换成它**"。事实相反 ——
+`mutex.cpp:21-22` 的注释是作者自己写的：
+
+> 当前调度器里的 WAIT 语义并不适合通用互斥，这里采用 **yield 型互斥**：
+> 获取失败时主动让出时间片，但不把线程切到 WAIT，避免线程在未持锁时继续执行。
+
+实现就是"自旋 + 让出"：
+
+```c
+for (;;) {
+    spin_lock(&mutex->lock);                     /* irqsave,保护状态 */
+    if (state == DESTROYED) { unlock; return -EINVAL; }
+    if (owner == current) {                      /* 已持有 */
+        if (rec) { rcc++; unlock; return 0; }    /* 递归锁:计数 */
+        unlock; return -EDEADLK;                 /* 非递归:自己锁自己 */
+    }
+    if (state == UNLOCKED) { state = LOCKED; owner = current; rcc = 1; unlock; return 0; }
+    spin_unlock(&mutex->lock);
+    scheduler_yield();                           /* ★ 不置 WAIT,只让出 ★ */
+    cpu_relax();
+}
+```
+
+其余语义（全部要照抄，且都能在宿主上穷尽测）：
+
+| 调用 | 条件 | 返回 |
+|---|---|---|
+| `mutex_trylock` | 被占用 | `-EBUSY`（**不等待**）|
+| `mutex_unlock` | 调用者不是持有者 / 状态不对 / rcc==0 | `-EPERM` |
+| `mutex_destroy` | 还锁着 | `-EBUSY`；成功则状态置 `DESTROYED` |
+| 任意 | 已 `DESTROYED` | `-EINVAL` |
+| `mutex_is_locked` / `mutex_get_owner` | — | 只读查询，各取一次锁 |
+
+⚠ `mutex_t` 里有个 `wait_queue` 字段，但**从头到尾没人用它**（只在 create/destroy 里
+建与销毁）—— 它是"本来打算做可睡眠互斥、后来改成 yield"的化石。
+ARM 侧**不抄这个死字段**（本项目删过两个这样的死物，D10/D11）。
+
+⇒ 所以 D13 的正确处置是：**把 `console_excl` 从"关调度"换成源 OS 那个 yield mutex**。
+好处不是"不占 CPU"（yield 型照样占），而是：
+- 它是一把**真正的锁**，语义与源 OS 一致（递归/持有者/销毁）；
+- 打印期间**别的上下文还能跑**（只是打印者互斥）—— 这是与"关调度"最大的差别；
+- `sched_off_total_ns()`（M4-8.5 给饥饿监视器加的"停摆时长"）会因此几乎不再增长，
+  于是监视器的 `skipped`（作废窗口）应当掉到 ~0 —— **这是一个可观测的判据**。
+
+##### ② ★ D14 也写错了一半：源 OS 的内核线程退出**不释放任何资源** ★
+
+计划写的是"照 `pcb.cpp:501-504` 做**真正的线程退出**：从队列摘除 + 释放栈 + 释放 TCB"。
+源 OS 实际是**两段式**，而且垂死线程**只做前半段**：
+
+| 谁 | 在哪 | 做什么 |
+|---|---|---|
+| **垂死线程自己** | `kill_thread()` `pcb.cpp:447-458` | 拒绝 `TASK_IDLE_LEVEL`（"Cannot stop kernel thread."）⇒ `status = DEATH`。**`kill_thread0(task)` 那行是注释掉的**（原注释："要用的解耦，但可能要加锁"）|
+| 同上 | `process_exit()` `pcb.cpp:494-505` | 打印 → `kill_thread(current)` → `open_interrupt` → **`while (true) hlt;`**（它就停在自己的栈上）|
+| **别人（回收者）** | `kill_thread0()` `pcb.cpp:462-492` → `remove_task()` | 释放 argv/cwd/用户栈/**内核栈**，最后 `remove_task(task)` 把节点从**它 `cpu_id` 指的队列**里摘掉 |
+| 同上，触发者 | `kill_proc0()` `pcb.cpp:359-423` | 遍历 `pcb->thread_queue`，逐个 `kill_thread0(thread)` 再 `free(thread)`（**TCB 也在这里释放**）|
+| 同上，巡检者 | `reaper_thread()` `reaper.cpp:48-61` | 常驻内核线程：找一个 `status == DEATH` **且不在任何核的 `current_task` 上**的子进程 → `kill_proc(target)` → `scheduler_yield()` |
+
+⇒ 三条结论，ARM 侧必须照做：
+
+1. **垂死线程不能释放自己的栈**（它正在那上面跑）⇒ 本侧 `thread_finish()` 只做
+   "`status = DEATH` → 让出 → `for(;;) arch_wfi()`"；
+2. **释放由回收线程做**（照 `reaper_thread` 的结构），条件照抄源 OS 两条：
+   `status == DEATH` **且不在任何一个核的 `current_task` 上**；
+   ⚠ 这两条顺带关掉一个竞态：选取时 `sched_task_schedulable()` 已经排除 DEATH ⇒
+   "被选中"与"被释放"不会重叠；
+3. **适配点**：源 OS 的 reaper 遍历"`kernel_group` 的子进程"再拆它的线程队列；
+   内核对线程**没有进程组**（D5，M7 才有）⇒ ARM 侧改为**遍历两个核的调度队列**
+   （队列就是"全部线程的名册"，M4-8.4 起就是这个形状）。这是**结构照抄、数据源适配**，
+   不是发明机制。
+
+**它同时把 D12 里那笔欠账还上**：`remove_task()` 与 `add_task()` 真的会并发了
+⇒ 源 OS 那把**全局 `scheduler_lock`**（M4-10 刻意没引，见 D12 的收尾说明）到这里
+才有第二个用户，按源 OS 补上。
+
+##### ③ ★ 两个必须先处理的副作用（否则会把已经验证过的东西弄坏）★
+
+| 副作用 | 为什么会坏 | 处置 |
+|---|---|---|
+| `sched_ctx_snapshot_all/restore_all`（三组对照组的罩子）| 它的**硬件性前提**是"这段窗口里没有线程被创建或销毁"（注释里写着）。回收线程一上线就破坏这个前提 ⇒ **按遍历顺序配对**的还原会错配，把 A 的 ctx 写进 B | 对照组的窗口里**显式暂停回收**（与 `sched_disable` 同一风格的开关）|
+| 对照组清理里的 `ca->status = WAIT` | 如果那些探针已经跑完并被回收，这就是**use-after-free** | 同上：窗口内不回收；窗口外由回收线程处理 |
+
+##### ④ M4-11 的分步（每步都要有能观测的判据）
+
+| 步 | 内容 | 判据 |
+|---|---|---|
+| 11.1 | **`mutex`（源 OS 语义）**：纯状态机放纯逻辑层 + 两个钩子（取当前任务 / 让出），宿主穷尽测；**`console_excl` 换成它（D13 结案）** | 宿主：递归/EDEADLK/EPERM/EBUSY/EINVAL 逐条；板上：饥饿监视器的 `skipped` 掉到 ~0（"不再关调度"的可观测量）|
+| 11.2 | **线程退出 + 回收线程**：`sched_thread_exit()`（DEATH + 让出 + wfi）+ `remove_task` + 全局 `scheduler_lock` + reaper；`thread_finish()` 改走退出 | 板上：`used_slots` **回落**、名册长度不再单调增长、`kstack_headroom` 变大；对照组窗口内暂停回收 |
+| 11.3 | 收尾：`sched_park_self` 退场（源 OS 没有它）；D13/D14 结案；文档 | — |
+| A/B | 关掉回收 ⇒ 线程照常退出但**栈槽不回落**、名册只增不减 | 与前六组同一风格：**预期它坏** |
+
 
 #### ★ 关于"兼容旧 XJ380"：`registers_t` 是唯一无法逐字节对齐的地方 ★
 
