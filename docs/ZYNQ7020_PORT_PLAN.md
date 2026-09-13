@@ -16,10 +16,11 @@
 **M0–M3 全部完成并板上验证；AM3 五个子阶段实现完成；
 M4-1/2/3/4/5 全部完成并板上验证（当前 **41 passed / 0 failed**）。
 M4-5 的 guard page 已经拿到**第三级证据**（破坏性 A/B 成立）。
-**M4-6 已全部完成**：调研（§4.7 三份清单）+ 寄存器帧（`451e252`）+ PCB/TCB 结构体。
-板级自检 **44 passed / 0 failed**。
-**下一步是 M4-7：上下文切换（ARM 汇编，per-CPU）** ——
-它的第一件事是按 §4.5 把中断路径用 `srsdb` 落到**任务的栈**上。**
+**M4-6 已全部完成**；**M4-7 的第一步（把异常帧落到任务的栈上）也已完成**
+（提交 `ff60c7b`，板级 **46 passed / 0 failed**，见 §4.7.7d）。
+**M4-7 的剩下一半是协作式切换原语**（`arch_ctx_switch(from, to)`）与
+"两个上下文来回切、各自栈与局部状态都保住"的验证；
+它依赖 M4-8 的就绪队列才有真实用途。
 
 ### 0.5.2 分支与提交
 
@@ -43,7 +44,8 @@ M4-5 的 guard page 已经拿到**第三级证据**（破坏性 A/B 成立）。
 | M4-5 内核栈池 + guard page | `d78798a` `47820fb` | **42 passed / 0 failed**；`guard_trip.py` 的**两组** A/B 都成立：不映射（FS 0x07）+ AP=0b000（FS 0x0F，顺带证明 M2-4 的 DACR=client 真的在生效）|
 | M4-6 第一步:调研源 OS | `1bef1ed` `5e7826c` + §4.7 | 产出三份清单 + 硬约束；抽查复核过（全库确实只有 2 条 static_assert、`include/cpu/gdt.h` 确实不存在）|
 | M4-6 寄存器帧 | `451e252` | 43 passed / 0 failed（新增 `exc_frame_layout`）；实测改正 pc 偏移（SVC 与 Data Abort 各偏 4）|
-| M4-6 PCB/TCB 结构体 | 见下 | **44 passed / 0 failed**（新增 `tcb_ctx_layout`）；板上实测 `sizeof=512 align_ok=1`；汇编边界收窄为"指向 ctx 的指针" |
+| M4-6 PCB/TCB 结构体 | `66e2c26` | **44 passed / 0 failed**（新增 `tcb_ctx_layout`）；板上实测 `sizeof=512 align_ok=1`；汇编边界收窄为"指向 ctx 的指针" |
+| M4-7 第一步:帧落到任务栈 | `ff60c7b` | **46 passed / 0 failed**；`exc_frame_on_task_stack=1`、`irq_frame_violations=0`；逼出两个只有上板才暴露的 bug（见 §4.7.7d）|
 
 ### 0.5.3 构建与验证命令（照抄即可）
 
@@ -1820,6 +1822,43 @@ Linux ABI(`futex` / `ZOMBIE` / `aux_*`)、`poll`/`epoll`、`vfork`、
 的硬件要求,**ARM 没有对应物**。改掉之后加了一条绊线
 `_Static_assert(_Alignof(tcb) == 8u, ...)`:将来谁照抄 x86 的 `aligned(16)`,
 编译期就会被迫面对"分配器给不出那个对齐"。
+
+#### 4.7.7d ★ M4-7 第一步:帧落到任务的栈上,以及两个只有上板才会暴露的坑 ★
+
+计划 §4.5 写明"加入调度后,切换点必须落在**任务的栈**上 —— 否则两个任务会
+共用同一段异常栈,症状是高负载下随机踩栈"。这一步做完了(提交 `ff60c7b`)。
+
+做法:所有异常入口 `srsdb sp!, #MODE_SVC`(在异常模式下把 SPSR/LR 压到 SVC 栈)
+→ `msr cpsr_c` 切到 SVC 模式 → 在任务的栈上建帧 → `rfeia sp!` 一条指令完成
+"跳转 + 恢复 CPSR"。板级自检 **46 passed / 0 failed**,帧地址落在 SVC 栈区里。
+
+**这一步逼出两个真 bug,两个都只有上板才会暴露,记在这里免得重踩:**
+
+**① `srsdb` 存的是原始 LR,它不是返回地址。**
+返回地址 = "LR 减去一个取决于异常类型的偏移"。漏掉修正 ⇒ IRQ 每条
+**跳过一条指令**。症状是随机的 Data Abort(实测 DFAR 一次 0x00、一次
+0x0010AA26,毫无关系),因为被跳过的是哪条不确定。
+
+**② 处理函数搬到 SVC 模式之后,`bl` 会踩掉 LR_svc。**
+异常来自 SVC 模式时,硬件把返回地址放进 LR_irq,**LR_svc 完全没被动过 ——
+它还是被中断函数的活返回地址**。旧实现把处理函数跑在 IRQ 模式
+(`bl` 用 banked 的 LR_irq),所以没这个问题;搬到 SVC 模式而不先存它,
+被中断的函数一 `bx lr` 就飞到垃圾地址 ——
+**整个 PS 挂住,连 JTAG 的 DAP 都读不到,只能断电**(前后断电三次)。
+⇒ 帧里必须有 `svc_lr`,这也正是 Linux 的 `pt_regs` 带 r13/r14 的原因。
+
+**③ 顺带:`cpsid if, #mode` 在目标模式等于当前模式时是 UNPREDICTABLE。**
+SVC 向量正是这种情况。改用 `msr cpsr_c, #imm`。
+
+**新增的自检本该拦住 ①**:`irq_frame_violations` —— 每个 IRQ 帧必须满足
+`ret == pc + 4`、返回地址在 `.text` 内、spsr 是 SVC 模式,**每个 tick 查一次并累积**。
+"偶尔跳错"这种 bug,只看当前一帧是躲不过去的。
+
+**给 M4-7 后半段的结论**:帧布局定成
+`{ r[0..12] | svc_lr | ret | spsr }`(64 字节、8 字节对齐),
+`ret` 与 `spsr` 相邻且 `ret` 在低地址 —— 这是 `rfeia sp!` 的要求,
+而用 RFE 是为了让"CPSR 恢复"与"跳转"原子完成(否则中间那几条指令
+可以被中断打断,而帧还没收完)。
 
 #### 4.7.8 给 ARM 侧的直接结论
 
