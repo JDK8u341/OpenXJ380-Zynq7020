@@ -286,16 +286,40 @@ void shell_poll(void)
             break;
 
         case SHELL_ACT_CANCEL:
+            console_excl_begin();
             sh_puts("^C\n");
             sh_prompt();
+            console_excl_end();
             shell_line_reset(&g_line);
             break;
 
         case SHELL_ACT_SUBMIT:
+            /*
+             * ★ 整段输出排他(M4-11.2 收尾时补上)★
+             *
+             * 一条命令的回显是好几十行(`ver` 5 行、`dump` 二十几行),
+             * 而状态行每秒都会打一行 —— 实测它正好劈在
+             * `Switches  : 0x..` 的中间:
+             *
+             *     Switches[XJ380/arm32] alive loop=4 led=0x02 …
+             *       : 0x00
+             *
+             * 于是 `tmp-test/shell_test.py` 的 `ver` 用例假失败(它找的是
+             * `"Switches  : 0x"`)。⚠ 这是 M4-11.1 的直接后果:排他从
+             * "关调度"换成真锁之后,状态线程不再被冻住,交错的机会变多了。
+             *
+             * 排他包**整段**:"半行被劈开"对人也是废的,而对机器判据是致命的。
+             * 提示符也包在里面 —— 它前面那个换行与 `> ` 必须连在一起
+             * (`shell_test.py` 等的片段就是 `"\n> "`)。
+             *
+             * ⚠ 锁本身是递归的,命令内部再排他(例如 `selftest` 打报告)不会自锁。
+             */
+            console_excl_begin();
             sh_puts("\r\n");
             shell_execute();
             shell_line_reset(&g_line);
             sh_prompt();
+            console_excl_end();
             break;
 
         case SHELL_ACT_IGNORED:
@@ -307,6 +331,9 @@ void shell_poll(void)
 
 void shell_banner(void)
 {
+    /* ⚠ 提示符与它前面那句必须连在一起 —— 与 SUBMIT 那一段同一个理由 */
+    console_excl_begin();
     sh_puts(" Serial command channel ready. Type 'help'.\n");
     sh_prompt();
+    console_excl_end();
 }
