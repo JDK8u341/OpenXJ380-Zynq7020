@@ -20,6 +20,9 @@ bool axi_gpio_ready(void);
 /* 写 LED 通道。值会按描述里的位宽截断 */
 void axi_gpio_led_write(u8 value);
 
+/* 读回 LED 通道 —— 用于证明写真的到了硬件,而不是只有代码跑过 */
+u8 axi_gpio_led_read(void);
+
 /* 读拨码开关通道 */
 u8 axi_gpio_switch_read(void);
 

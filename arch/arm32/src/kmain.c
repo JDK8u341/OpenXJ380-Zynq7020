@@ -271,13 +271,57 @@ void kmain(void)
      * "描述表 -> 匹配 -> probe -> 驱动配置硬件"这条链路真的通了。
      */
     if (axi_gpio_ready()) {
+        /*
+         * 自检分两步,而且**第二步才是真正的验证**。
+         *
+         * 第一步(全亮再全灭)只是把肉眼可见的反馈做出来,能说明的信息
+         * 很有限 —— 即使驱动把值写到了错误的地址,这一步也照样"跑完"了,
+         * 只是板上什么都不亮。
+         *
+         * 第二步做写回读:把几个固定图案写进 LED 通道再读回来比对。
+         * AXI GPIO 的输出通道 DATA 寄存器是可读的,所以这条链路
+         * (驱动基址 -> 寄存器 -> 读回)能被直接观测。
+         *
+         * 这是唯一能区分"代码跑了"与"硬件真的动了"的手段。本项目在
+         * SCU/ACTLR 上就因为少了这类观测而误判过一次:缓存使能位读回是 1,
+         * 系统也照常跑,但实际上完全没有加速。
+         */
+        static const u8 patterns[] = {0x00u, 0xFFu, 0xA5u, 0x5Au, 0x01u, 0x80u};
+        u32             i;
+        u32             mismatches = 0;
+
         console_printf(" LED self-test: AXI GPIO at 0x%08X, %u-bit, dual-channel\n",
                        (u32)axi_gpio_get_base(), axi_gpio_get_width());
+
         led_pl_set(0xFFu);
         timer_delay_ms(150);
         led_pl_set(0x00u);
+
+        for (i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++) {
+            u8 readback;
+
+            led_pl_set(patterns[i]);
+            readback = axi_gpio_led_read();
+
+            if (readback != patterns[i]) {
+                mismatches++;
+                console_printf("   write/readback mismatch: wrote 0x%02X, read 0x%02X\n", patterns[i],
+                               readback);
+            }
+        }
+
+        console_printf(" LED check    : write/readback %s (%u patterns)\n",
+                       (mismatches == 0u) ? "PASS" : "FAIL",
+                       (u32)(sizeof(patterns) / sizeof(patterns[0])));
+        console_printf(" LED switches : ch1 = 0x%02X\n", axi_gpio_switch_read());
+
+        HB[HB_SLOT_LEDCHECK] = mismatches;
+
+        /* 留给主循环一个干净的起点 */
+        led_pl_set(0x00u);
     } else {
         console_puts(" LED WARN     : AXI GPIO was not claimed - PL LEDs unavailable\n");
+        HB[HB_SLOT_LEDCHECK] = 0xFFFFFFFFu;
     }
     console_puts("\n");
 

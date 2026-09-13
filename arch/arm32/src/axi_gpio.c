@@ -132,6 +132,29 @@ u8 axi_gpio_switch_read(void)
     return (u8)(mmio_read32(g_axi_gpio_base + AXI_GPIO_CH1_DATA) & 0xFFu);
 }
 
+/*
+ * 读回 LED 通道的值。
+ *
+ * 存在的意义:**证明写真的到了硬件**,而不只是"代码路径跑过了"。
+ *
+ * AXI GPIO 的输出通道 DATA 寄存器是可读的,读回的就是寄存器的当前值。
+ * 这一点很关键,因为 M3 把 led_pl_set 从"写一个编译期常量基址"改成了
+ * "写 probe 填进来的基址" —— 如果 probe 填错了地址,写入会静默落到
+ * 某个无关的地方,LED 不亮,而**调用方的代码看起来一切正常**
+ * (心跳里那个 LED 图案是算出来的,不是读回来的,所以它骗得过人)。
+ *
+ * 这与本项目踩过的 SCU/ACTLR 那个坑是同一类:寄存器位说得通,
+ * 但硬件到底动没动,只能靠直接观测。
+ */
+u8 axi_gpio_led_read(void)
+{
+    if (g_axi_gpio_base == 0u) {
+        return 0u;
+    }
+
+    return (u8)(mmio_read32(g_axi_gpio_base + AXI_GPIO_CH2_DATA) & 0xFFu);
+}
+
 uintptr_t axi_gpio_get_base(void)
 {
     return g_axi_gpio_base;

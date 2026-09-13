@@ -92,6 +92,16 @@
  */
 #define HB_SLOT_L2BENCH   20u
 
+/*
+ * AXI GPIO 写回读自检:失配的图案数,0 = 全对,0xFFFFFFFF = 驱动没 probe 上。
+ *
+ * 存在的意义:心跳与主循环里的 LED 图案都是**算出来的**,不是读回来的 ——
+ * 即使驱动把值写到了错误的地址(probe 填错基址),那个图案照样会变,
+ * LED 却一个都不亮。这个槽记录的是真的写进寄存器再读回来比对的失配数,
+ * 是唯一能区分"代码跑了"与"硬件真的动了"的证据。
+ */
+#define HB_SLOT_LEDCHECK  21u
+
 /* MMU 阶段的取值。0 表示还没开始 */
 #define HB_MMU_STAGE_IDLE       0u /* 尚未开始 */
 #define HB_MMU_STAGE_BUILT      1u /* 页表已填好 */
@@ -101,7 +111,7 @@
 #define HB_MMU_STAGE_FAILED     0xEEu /* 自检未通过,主动放弃开 MMU */
 
 /* 已定义的槽位数。越界写会踩到后面的故障注入选择器 */
-#define HB_SLOT_COUNT     21u
+#define HB_SLOT_COUNT     22u
 
 /* 心跳区预留的槽位容量(见 platform.h 的 PLAT_HEARTBEAT_REGION_SLOTS) */
 #define HB_SLOT_CAPACITY  PLAT_HEARTBEAT_REGION_SLOTS
