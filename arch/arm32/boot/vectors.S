@@ -279,6 +279,18 @@ _vec_irq:
     EXC_FRAME_ENTER ARM_EXC_RET_FIX_IRQ
     mov     r0, sp                  /* 帧指针作为第一个参数传给 C */
     bl      c_irq_handler
+    /*
+     * ★ 协议:返回值就是"要从哪个帧离开" ★
+     *
+     * 照抄 x86 `scheduler.cpp:68-69` 的 `call timer_handle; mov rsp, rax` ——
+     * C 侧通过**返回一个帧指针**决定异常返回到哪里:
+     *   - 不切换:原样返回传进来的那个帧(下面的 `mov sp, r0` 是空操作)
+     *   - 切换:返回在**目标任务栈上新搭的帧** —— `rfeia` 于是落到新任务的
+     *     PC/CPSR 上,SP 也变成它的
+     *
+     * 这正是 M4-7 把现场帧建在**任务的栈**上的用处:帧在谁的栈上,谁就被恢复。
+     */
+    mov     sp, r0
     EXC_FRAME_LEAVE
 
 /*

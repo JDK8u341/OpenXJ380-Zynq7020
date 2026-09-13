@@ -165,9 +165,28 @@ tcb_t sched_boot_idle(void);
 
 /*
  * tick 里给 current 计费 ← `timer_handle()` `scheduler.cpp:437`。
- * 本步唯一让策略在板上活起来的地方;它**不做任何切换**(切换是 M4-9)。
+ * 独立出来是为了能单独测"计费"这件事(它不涉及切换)。
  */
 void sched_tick_account(void);
+
+/*
+ * ★ M4-9:tick 里的完整调度决策 ★ ← `timer_handle()` `scheduler.cpp:430-470`
+ *
+ * 收现场帧,返回**应当从哪个帧离开**:
+ *   - 时间片没到 / 挑不到别人 / 挑到上下文无效的:原样返回 frame
+ *   - 否则:在目标任务的栈上新搭一个帧并返回它(照 x86 `change_proccess`
+ *     就地改写现场的做法,只是 ARM 的帧要**换栈**)
+ *
+ * ⚠ **本步只做决策,不搬帧** —— 返回值目前恒为 `frame`。
+ *   先让决策路径每 tick 跑起来并被观测,再让它动帧:
+ *   "该不该切"与"搬帧搬得对不对"是两类完全不同的错误,混在一起没法归因。
+ */
+arm_exc_frame_t *sched_tick(arm_exc_frame_t *frame);
+
+/* 诊断:时间片到点、且挑到了别人的次数(即"本来应该切换"的次数)*/
+u32 sched_tick_would_switch(void);
+/* 诊断:挑到"上下文无效"而放弃切换的次数 */
+u32 sched_tick_invalid_ctx(void);
 
 /* 诊断:本核累计切换次数 */
 u32 sched_switch_count(void);

@@ -181,7 +181,13 @@ u32 gic_acknowledge(void);
 void gic_eoi(u32 intid);
 
 /* 供汇编入口调用的 C 分发函数 */
-void c_irq_handler(arm_irq_frame_t *frame);
+/*
+ * 异常处理函数。**返回值是"要从哪个帧离开"** ——
+ * 不切换就原样返回 `frame`;切换则返回在目标任务栈上新搭的帧。
+ * 见 boot/vectors.S 里 `mov sp, r0` 那一段(照抄 x86 的
+ * "返回值即新栈指针"协议,`scheduler.cpp:68-69`)。
+ */
+arm_exc_frame_t *c_irq_handler(arm_irq_frame_t *frame);
 
 /* 诊断:统计信息 */
 typedef struct

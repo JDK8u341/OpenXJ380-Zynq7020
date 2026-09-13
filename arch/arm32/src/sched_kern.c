@@ -353,3 +353,106 @@ void sched_tick_account(void)
 
     sched_account_run(cur, SCHED_TICK_NS);
 }
+
+/* (sched_tick / sched_tick_would_switch / sched_tick_invalid_ctx
+ *  实现在文件末尾 —— 它们是完整的决策路径,而本函数只是其中的计费部分。) */
+
+/* ------------------------------------------------------------------ */
+/* M4-9:tick 里的调度决策                                              */
+/* ------------------------------------------------------------------ */
+
+static u32 g_tick_would_switch;
+static u32 g_tick_invalid_ctx;
+
+/*
+ * ← `timer_handle()` `scheduler.cpp:430-470`。逐段对应:
+ *
+ *   if (current 在跑 且 不是 idle) { scheduler_ticks++;
+ *                                    charge_current_eevdf_runtime(current, TICK_NS);
+ *                                    if (scheduler_ticks < TIME_SLICE) return; }
+ *   else scheduler_ticks = 0;
+ *
+ *   best = select_next_task();
+ *   if (best == NULL || best == current) { scheduler_ticks = 0; return; }
+ *   if (best->context0.rip != 0) 换;  else 什么都不做;
+ *
+ * ⚠ 时间片计数放在**每核**结构里(源 OS 用 `cpu->scheduler_ticks`):
+ *   两个核各跑各的 tick,共用一个静态变量会让两核互相把对方的时间片清零 ——
+ *   表现为"抢占几乎不发生",而且只在双核下出现。
+ */
+arm_exc_frame_t *sched_tick(arm_exc_frame_t *frame)
+{
+    sched_queue_t *q;
+    tcb_t          cur;
+    tcb_t          next;
+    percpu_t      *pc;
+
+    if (frame == NULL) {
+        return frame;
+    }
+
+    pc = percpu_self();
+    if (pc == NULL) {
+        return frame;
+    }
+
+    q   = &g_runq[pc->cpu_id];
+    cur = sched_current();
+
+    /* ---- 1. 计费 + 时间片 ---- */
+    if (cur != NULL && cur->status == RUNNING && cur->task_level != TASK_IDLE_LEVEL) {
+        pc->scheduler_ticks++;
+        sched_account_run(cur, SCHED_TICK_NS);
+
+        if (pc->scheduler_ticks < SCHED_TIME_SLICE) {
+            return frame; /* 时间片没到 */
+        }
+    } else {
+        pc->scheduler_ticks = 0u;
+    }
+
+    /* ---- 2. 挑下一个 ---- */
+    next = sched_pick(q);
+    if (next == NULL || next == cur) {
+        pc->scheduler_ticks = 0u;
+        return frame;
+    }
+
+    /* ---- 3. ★ 上下文有效才切换 ★(源 OS:`context0.rip != 0`)*/
+    if (next->ctx.pc == 0u) {
+        /*
+         * 上下文无效 —— 源 OS 在这里**什么都不做**,并把 current 的状态
+         * 恢复成 RUNNING。这正是 idle 的执行方式:启动上下文没有可恢复的
+         * 现场,所以"挑到它"等于"不切换"。
+         */
+        pc->scheduler_ticks = 0u;
+        g_tick_invalid_ctx++;
+        if (cur != NULL && cur->status != RUNNING) {
+            cur->status = RUNNING;
+        }
+        return frame;
+    }
+
+    /*
+     * ---- 4. 到这里"本来应该切换" ----
+     *
+     * ⚠ 本步**只记数、不搬帧**:先让决策路径每 tick 跑起来并被观测,
+     *   确认"该不该切"是对的,再让它动帧。
+     *   "该不该切"错 与 "搬帧搬错" 是两类完全不同的错误,混在一起没法归因 ——
+     *   这个项目已经因为"把两位信息压成一位"多花过一整轮上板时间。
+     */
+    g_tick_would_switch++;
+    pc->scheduler_ticks = 0u;
+
+    return frame;
+}
+
+u32 sched_tick_would_switch(void)
+{
+    return g_tick_would_switch;
+}
+
+u32 sched_tick_invalid_ctx(void)
+{
+    return g_tick_invalid_ctx;
+}

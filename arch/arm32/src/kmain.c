@@ -194,6 +194,9 @@ static u32            g_yield_local_ok;
 static u32            g_sched_idle_ok;
 static u64            g_tick_acc_delta;
 static u32            g_tick_acc_ok;
+static u32            g_tick_would_switch;
+static u32            g_tick_invalid_ctx;
+static u32            g_tick_decision_ok;
 
 #define YIELD_ROUNDS 8u
 
@@ -395,15 +398,6 @@ static volatile u32 g_tick_first;
 
 static void tick_handler(u32 intid, void *arg)
 {
-    /*
-     * ← 源 OS `timer_handle()` `scheduler.cpp:437`:
-     *      charge_current_eevdf_runtime(current, EEVDF_TICK_NS);
-     *
-     * M4-8 里**唯一**让调度策略在板上活起来的地方,而且它不做任何切换
-     * (切换是 M4-9 的事)。放在处理函数的最前面:后面的诊断计数只影响 CPU0,
-     * 而计费必须每核都做。
-     */
-    sched_tick_account();
 
     u32       now;
     percpu_t *pc;
@@ -1760,6 +1754,30 @@ void kmain(void)
              * (探针切回来用的是 arch_ctx_switch 原语,它只搬寄存器与栈,
              *  不负责改 current_task;那是调度器的账。)
              */
+            /*
+             * ---- M4-9:tick 里的调度决策(只记数,不搬帧)----
+             *
+             * 让两个**不让出**的线程在就绪队列里待着,然后跑一段时间。
+             * 每 tick 的决策路径都会跑:时间片计数 -> 到点挑下一个 ->
+             * 上下文有效就"本来应该切换"。
+             *
+             * 判据(二值、且能区分两类错误):
+             *   - would_switch > 0:决策路径真的走到了"该切"那一支
+             *   - invalid_ctx 计数变化正常:idle 被挑到时走的是"放弃"那一支
+             *   ★ 而系统**没有崩**:帧没有被搬,所以行为应当与之前完全一致 ★
+             */
+            g_tick_would_switch = sched_tick_would_switch();
+            g_tick_invalid_ctx  = sched_tick_invalid_ctx();
+            timer_delay_ms(20);
+            g_tick_would_switch = sched_tick_would_switch() - g_tick_would_switch;
+            g_tick_invalid_ctx  = sched_tick_invalid_ctx() - g_tick_invalid_ctx;
+
+            g_tick_decision_ok = (g_tick_would_switch > 0u) ? 1u : 0u;
+
+            console_printf(" Sched tick  : would_switch=%u invalid_ctx=%u decision=%s\n",
+                           g_tick_would_switch, g_tick_invalid_ctx,
+                           g_tick_decision_ok ? "PASS" : "FAIL");
+
             /* ---- tick 计费:跑 20ms,一个**非 idle** 线程的 vruntime 应当涨 ≈ 20ms ---- */
             /*
              * ⚠ 第一版测的是 idle 的 vruntime,得到恒为 0 —— 而那是**对的**:
@@ -1982,6 +2000,14 @@ void kmain(void)
      * 精确值由宿主单测保证。
      */
     selftest_report("sched_tick_account", g_tick_acc_ok, 1u, SELFTEST_EQ);
+
+    /*
+     * ---- tick 里的调度决策(M4-9,本步只决策不搬帧)----
+     *
+     * 判据是"决策路径走到了该切的那一支" —— 而系统行为与之前完全一致
+     * (帧没动)。这样"该不该切"与"搬帧搬得对不对"这两类错误就能分开归因。
+     */
+    selftest_report("sched_tick_decision", g_tick_decision_ok, 1u, SELFTEST_EQ);
 
     selftest_report("sched_yield_rounds", g_yield_ok, 1u, SELFTEST_EQ);
     selftest_report("sched_switches", (g_yield_switches > YIELD_ROUNDS) ? 1u : 0u, 1u, SELFTEST_EQ);

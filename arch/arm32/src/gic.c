@@ -10,6 +10,7 @@
 #include <arch/cpu.h>
 #include <arch/io.h>
 #include <arch/irq.h>
+#include <arch/sched.h>
 #include <arch/percpu.h>
 #include <arch/platform.h>
 
@@ -279,7 +280,7 @@ void gic_eoi(u32 intid)
  */
 static void irq_frame_check(const arm_exc_frame_t *frame);
 
-void c_irq_handler(arm_irq_frame_t *frame)
+arm_exc_frame_t *c_irq_handler(arm_irq_frame_t *frame)
 {
     u32       intid;
     u32       cpu_intid; /* 只取 INTID 字段,忽略 CPU 号(spec 里高 3 位是 CPU id) */
@@ -349,7 +350,15 @@ void c_irq_handler(arm_irq_frame_t *frame)
     }
 
     gic_eoi(intid);
+    /*
+     * ★ M4-9:在 tick 里做调度决策 ★
+     *
+     * 位置:在 EOI 之后 —— 中断已经应答完,这时改动现场帧不会影响
+     * GIC 的状态机。返回值决定"从哪个帧离开"。
+     */
+    return sched_tick(frame);
 }
+
 
 const irq_stats_t *irq_get_stats(void)
 {
