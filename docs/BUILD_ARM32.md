@@ -209,7 +209,7 @@ import config                     # noqa: E402
 | `...\System_wrapper.bit` | `config.BITSTREAM` | 3 个 Tcl |
 | `...\ps7_init_uart1.tcl` | `config.PS7_INIT` | `run_kernel_uart.tcl` |
 | `...\ps7_mio_bank1_check.tcl` | `config.PS7_MIO_CHECK` | `run_kernel_uart.tcl` |
-| `D:\BaiduNetdiskDownload\...\原理图.pdf` | `config.SCHEMATIC_PDF` | `sch_render.py` |
+| `D:\<资料盘>\...\原理图.pdf` | `config.SCHEMATIC_PDF` | `sch_render.py` |
 | `C:\AMDDesignTools\2025.2\gnu\...`（PowerShell 里） | `config.py --get toolchain.dir` | `tmp-test/led/build.ps1` |
 
 ### 5.3 故意**没有**改的

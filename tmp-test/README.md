@@ -109,7 +109,8 @@ RESULT: RUNNING
 （详见 `docs/ZYNQ7020_PORT_PLAN.md` §2.15）
 
 ### 3.5 工具链
-- 编译器：`C:\AMDDesignTools\2025.2\gnu\aarch32\nt\gcc-arm-none-eabi\bin\arm-none-eabi-gcc.exe`（GCC 13.3.0）
+- 编译器：`<vitis-dir>\gnu\aarch32\nt\gcc-arm-none-eabi\bin\arm-none-eabi-gcc.exe`（GCC 13.3.0）
+  —— 具体在哪由仓库根目录的 `config.py` 给出（`python config.py` 可自检）
 - libgcc：`...\aarch32-xilinx-eabi\usr\lib\arm-xilinx-eabi\13.3.0\libgcc.a`
 - 编译选项：`-mcpu=cortex-a9 -marm -mfpu=vfpv3 -mfloat-abi=hard`
 - 产物：`ELF32 / ARM / Version5 EABI / hard-float ABI`
@@ -142,13 +143,13 @@ tmp-test/
 pwsh -File tmp-test/led/build.ps1
 
 # 复用已运行的 hw_server（可选）
-& 'C:\AMDDesignTools\2025.2\Vitis\bin\hw_server.bat'
+& "$(python config.py --get jtag.hw_server)"
 
-# 一键上板运行
-& 'C:\AMDDesignTools\2025.2\Vitis\bin\xsdb.bat' -no-ini tmp-test\jtag\run_led.tcl
+# 一键上板运行（路径来自 config.py 生成的 paths.tcl）
+& "$(python config.py --get jtag.xsdb)" -no-ini tmp-test\jtag\run_led.tcl
 
 # 确认存活（两次采样对比）
-& 'C:\AMDDesignTools\2025.2\Vitis\bin\xsdb.bat' -no-ini tmp-test\jtag\verify.tcl
+& "$(python config.py --get jtag.xsdb)" -no-ini tmp-test\jtag\verify.tcl
 ```
 
 **硬件前提**：板子处于 **JTAG 启动模式**（BootROM 会等待 JTAG 命令）。

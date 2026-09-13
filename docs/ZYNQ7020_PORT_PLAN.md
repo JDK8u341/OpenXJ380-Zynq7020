@@ -115,25 +115,33 @@
 
 ### 0.5.3 构建与验证命令（照抄即可）
 
+> ★ **本机路径不写在这里。** 工具链/串口/比特流全在**仓库根目录的 `config.py`**，
+> 换机器只改那一个文件；完整步骤见 **`docs/BUILD_ARM32.md`**。★
+>
+> 下面用 `python` / `ninja` 代指你自己的解释器与 Ninja（本机 `python` 若是 Microsoft Store
+> 的占位程序，就写全路径或设 `$env:PYTHON`）。
+
 ```powershell
-$py    = "C:\Users\VeryS\.conda\envs\rxgb\python.exe"
-$ninja = "C:\Users\VeryS\AppData\Local\Programs\CLion\bin\ninja\win\x64\ninja.exe"
+# 先改 config.py 顶部那段，再自检(逐项指出缺什么)
+python config.py
 
 # 构建(新增 .c 后必须先重跑 gen_ninja.py)
-& $py tools/gen_ninja.py --out build-arm.ninja --arch arm32
-& $ninja -f build-arm.ninja arm32            # 产物 out/kernel-arm.elf
+python tools/gen_ninja.py --out build-arm.ninja --arch arm32
+ninja -f build-arm.ninja arm32               # 产物 out/kernel-arm.elf
 
-# 宿主单测(基线:9 failed / 73 passed;那 9 项预先存在,与本移植无关)
-& $py -m pytest tests/ -q
+# 宿主单测(基线:9 failed / 74 passed;那 9 项预先存在,与本移植无关)
+python -m pytest tests/ -q
 
 # 上板:全部自检 + 退出码即判定
-& $py tmp-test\verify_board.py --load
+#   ★ --seconds 必须给够:默认 8 秒会截断在半行,报"找不到 SELF-TEST BEGIN",
+#     看着像内核坏了,其实只是抓取窗口太短(完整报告要 50 秒以上)★
+python tmp-test/verify_board.py --load --seconds 75
 
 # 上板:串口命令通道 / guard A/B / FSR 译码回归 / 异常 LR 偏移测量
-& $py tmp-test\shell_test.py --load
-& $py tmp-test\guard_trip.py --load
-& $py tmp-test\fsr_decode_check.py
-& $py tmp-test\exc_frame_probe.py [2|5]
+python tmp-test/shell_test.py --load
+python tmp-test/guard_trip.py
+python tmp-test/fsr_decode_check.py
+python tmp-test/exc_frame_probe.py [2|5]
 ```
 
 **诊断常用**:抓原始串口（`verify_board` 只打印表格，看不到 `Sched` / `Exc` 那些行）：

@@ -171,7 +171,7 @@ out/kernel-arm.elf                      # ELF32 / ARM / EABI5
 ```bash
 python tmp-test/verify_board.py --load            # 加载 + 抓串口 + 解析自检报告，退出码即结论
 python tmp-test/shell_test.py  --load            # 串口命令通道 10 项
-python tmp-test/run_and_capture.py COM4 9600 60  # 只抓原始串口（hex + ASCII）
+python tmp-test/run_and_capture.py <串口> 9600 60  # 只抓原始串口（hex + ASCII）
 ```
 
 **上游 x86_64 构建未受影响，但本分支没有验证过它**：
@@ -257,7 +257,7 @@ python tmp-test/run_and_capture.py COM4 9600 60  # 只抓原始串口（hex + AS
 | 项 | 值 |
 |---|---|
 | 板 | AC880-CB + AC850-CB（XC7Z020-1CLG400）；PL 比特流来自 `AXI_GPIO_1` 工程 |
-| 串口 | PS UART1 @ `0xE0001000`，MIO48/49，**9600 8N1**，主机侧 `COM4` |
+| 串口 | PS UART1 @ `0xE0001000`，MIO48/49，**9600 8N1**；主机侧串口号**因机器而异**，写在 `config.py` 的 `SERIAL_PORT` |
 | JTAG | Vitis `xsdb`；脚本 `tmp-test/jtag/run_kernel_uart.tcl`（`reset system` → `ps7_init` → 比特流 → `dow`） |
 | LED | PL 侧 AXI GPIO @ `0x41200000`（跑马灯，用来肉眼确认"内核在跑"） |
 | 心跳 | OCM `0x00020000` 起 32 槽（**已满**，新的诊断量走串口/自检报告） |

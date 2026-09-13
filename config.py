@@ -125,6 +125,7 @@ PATH_KEYS = frozenset(
     {
         "vitis.dir",
         "jtag.xsdb",
+        "jtag.hw_server",
         "toolchain.dir",
         "toolchain.arm_gcc",
         "board.bitstream",
@@ -186,6 +187,7 @@ def as_dict() -> dict[str, str]:
     return {
         "vitis.dir": VITIS_DIR,
         "jtag.xsdb": str(XSDB),
+        "jtag.hw_server": str(HW_SERVER),
         "toolchain.dir": str(ARM_TOOLCHAIN_DIR),
         "toolchain.arm_gcc": str(ARM_CC),
         "board.serial_port": SERIAL_PORT,

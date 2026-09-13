@@ -386,7 +386,7 @@ MMU 打开过程一旦出错，`kmain` 就再也执行不到了，
 
 | 芯片 | 用途 | 对应 |
 |---|---|---|
-| **CH9102F** | PS USB 转串口 | `PS_UART_TXD = MIO48` / `RXD = MIO49` → **COM4** |
+| **CH9102F** | PS USB 转串口 | `PS_UART_TXD = MIO48` / `RXD = MIO49` → PC 上的一个 USB 串口（本机是 `COM4`，**因机器而异**，写在 `config.py` 的 `SERIAL_PORT`）|
 | CH340E | **PL 侧** USB 转 TTL | 另一路，PL 无 UART 逻辑所以不会有数据 |
 | JTAG18M02HS2 | USB 转 JTAG | 与上述经 SL2.1S Hub 共用一根 USB 线 |
 
@@ -495,14 +495,16 @@ irq_global_enable();                               /* 最后才开中断 */
 一条命令完成"加载 → 跑起来 → 等中断子系统 → 注入 → 回读寄存器"：
 
 ```
-C:\AMDDesignTools\2025.2\Vitis\bin\xsdb.bat tmp-test/jtag/run_kernel_uart.tcl <1|2|3|4>
+<vitis-dir>\Vitis\bin\xsdb.bat tmp-test/jtag/run_kernel_uart.tcl <1|2|3|4>
 ```
 
 配合串口抓取（会打印原始 hex，波特率不对时能区分"全 0x00 / 全 0xFF / 有字符"）：
 
 ```
-python tmp-test/run_and_capture.py COM4 9600 2 <1|2|3|4>
+python tmp-test/run_and_capture.py <串口> 9600 2 <1|2|3|4>
 ```
+
+（`<vitis-dir>` 与 `<串口>` 都不写死在这里 —— 它们来自仓库根目录的 `config.py`；改动与自检见 `docs/BUILD_ARM32.md`。）
 
 **实测结果**（五个用例各跑一遍，注入前 `ticks` 与 `irqcount` 均相等）：
 
@@ -949,7 +951,7 @@ bit16=MIO48、bit17=MIO49）。
 
 #### 信号链已从官方图纸逐段确认
 
-翻 `D:\BaiduNetdiskDownload` 里的官方资料（底板原理图、核心板原理图、
+翻官方资料包里的那几份 PDF（底板原理图、核心板原理图、
 管脚信息表、硬件说明文档），把整条链核实了一遍。**三个独立来源互相印证**：
 
 | 来源 | 内容 |
