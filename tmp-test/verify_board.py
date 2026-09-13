@@ -44,6 +44,10 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# 本机路径(工具链/串口/比特流)全在仓库根目录的 config.py —— 换机器只改那一个文件。
+sys.path.insert(0, str(ROOT))
+import config  # noqa: E402
+
 
 BEGIN = "=== SELF-TEST BEGIN ==="
 END = "=== SELF-TEST END ==="
@@ -61,9 +65,9 @@ CHECK_RE = re.compile(r"^CHECK (\S+)\s*=\s*(\d+)\s+\(expect (\S+) (\d+)\)\s+(PAS
 # ⇒ 于是把"跑完了"变成机器可判的:**缺了这一行,即使 SUMMARY 全过也算失败**。
 POST_SIGNATURE = "Boot complete:"
 
-DEFAULT_PORT = "COM4"
-DEFAULT_BAUD = 9600
-XSDC = r"C:\AMDDesignTools\2025.2\Vitis\bin\xsdb.bat"
+DEFAULT_PORT = config.SERIAL_PORT
+DEFAULT_BAUD = config.SERIAL_BAUD
+XSDC = str(config.XSDB)
 LOAD_TCL = ROOT / "tmp-test" / "jtag" / "run_kernel_uart.tcl"
 
 

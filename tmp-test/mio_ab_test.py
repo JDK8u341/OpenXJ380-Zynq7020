@@ -22,10 +22,14 @@ from pathlib import Path
 import serial
 
 ROOT = Path(__file__).resolve().parent.parent
-XSDB = r"C:\AMDDesignTools\2025.2\Vitis\bin\xsdb.bat"
+# 本机路径(工具链/串口/比特流)全在仓库根目录的 config.py —— 换机器只改那一个文件。
+sys.path.insert(0, str(ROOT))
+import config  # noqa: E402
+
+XSDB = str(config.XSDB)
 POKE = ROOT / "tmp-test" / "jtag" / "mio49_poke.tcl"
-PORT = "COM4"
-BAUD = 9600
+PORT = config.SERIAL_PORT
+BAUD = config.SERIAL_BAUD
 
 # 1 = LVCMOS18(本板实际电压,正确) ; 3 = LVCMOS33(XSA 里的错误值)
 GOOD = 0x000012E1

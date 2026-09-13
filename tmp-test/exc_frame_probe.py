@@ -49,10 +49,13 @@ from guard_trip import (  # noqa: E402
     SerialLog,
     poke,
 )
+# 本机路径(工具链/串口/比特流)全在仓库根目录的 config.py —— 换机器只改那一个文件。
+sys.path.insert(0, str(ROOT))
+import config  # noqa: E402
+
 
 ELF = ROOT / "out" / "kernel-arm.elf"
-OBJDUMP = (r"C:\AMDDesignTools\2025.2\gnu\aarch32\nt\gcc-arm-none-eabi"
-           r"\bin\arm-none-eabi-objdump.exe")
+OBJDUMP = str(config.ARM_OBJDUMP)
 
 PC_RE = re.compile(r"pc\s+=\s+0x([0-9A-F]{8})")
 

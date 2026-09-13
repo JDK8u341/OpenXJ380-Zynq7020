@@ -78,12 +78,16 @@ from pathlib import Path
 import serial
 
 ROOT = Path(__file__).resolve().parent.parent
-XSDB = r"C:\AMDDesignTools\2025.2\Vitis\bin\xsdb.bat"
+# 本机路径(工具链/串口/比特流)全在仓库根目录的 config.py —— 换机器只改那一个文件。
+sys.path.insert(0, str(ROOT))
+import config  # noqa: E402
+
+XSDB = str(config.XSDB)
 LOAD_TCL = ROOT / "tmp-test" / "jtag" / "run_kernel_uart.tcl"
 POKE_TCL = ROOT / "tmp-test" / "out" / "_guard_trip_poke.tcl"
 
-PORT = "COM4"
-BAUD = 9600
+PORT = config.SERIAL_PORT
+BAUD = config.SERIAL_BAUD
 
 FAULT_SEL_ADDR = 0x00020080
 SEL_GUARD = 6

@@ -70,3 +70,15 @@ venv/
 # 硬件描述)。JTAG 流程实际需要的只有同目录下的 ps7_init_uart1.tcl。
 /tmp-test/zynq/ps7_init_uart1.c
 /tmp-test/zynq/design_1.hwh
+
+# --- 本机配置(见仓库根目录 config.py 顶部说明)------------------------------
+# config.py 本身是要提交的(里面只有通用/占位值)。若你不想让自己的机器路径
+# 进版本库,就 `cp config.example.py config.local.py` 后只改 config.local.py ——
+# 它被忽略,而 config.py 会自动读它覆盖。
+/config.local.py
+
+# 由 `python config.py` 生成,给 JTAG 的 Tcl 脚本 source 用。内容是本机路径。
+/tmp-test/jtag/paths.tcl
+
+# verify_board.py 在失败时留下的串口原文(含本机信息)
+/verify_board_raw.txt

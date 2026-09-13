@@ -7,7 +7,7 @@
 
 用法:
     python tmp-test/shell_test.py --load
-    python tmp-test/shell_test.py --port COM4            # 不重新加载
+    python tmp-test/shell_test.py --port <串口>           # 不重新加载
 """
 
 from __future__ import annotations
@@ -19,7 +19,11 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-XSDC = r"C:\AMDDesignTools\2025.2\Vitis\bin\xsdb.bat"
+# 本机路径(工具链/串口/比特流)全在仓库根目录的 config.py —— 换机器只改那一个文件。
+sys.path.insert(0, str(ROOT))
+import config  # noqa: E402
+
+XSDC = str(config.XSDB)
 LOAD_TCL = ROOT / "tmp-test" / "jtag" / "run_kernel_uart.tcl"
 
 PROMPT = "\n> "
@@ -132,8 +136,8 @@ def main() -> int:
         pass
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--port", default="COM4")
-    parser.add_argument("--baud", type=int, default=9600)
+    parser.add_argument("--port", default=config.SERIAL_PORT)
+    parser.add_argument("--baud", type=int, default=config.SERIAL_BAUD)
     parser.add_argument("--load", action="store_true")
     args = parser.parse_args()
 

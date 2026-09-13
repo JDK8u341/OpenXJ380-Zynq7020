@@ -13,10 +13,15 @@ import argparse
 import sys
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+# 本机路径(工具链/串口/比特流)全在仓库根目录的 config.py —— 换机器只改那一个文件。
+sys.path.insert(0, str(ROOT))
+import config  # noqa: E402
+
 import pypdfium2 as pdfium
 from pypdf import PdfReader
 
-DEFAULT_PDF = Path(r"D:\BaiduNetdiskDownload\zynq\09_硬件图纸\AC880-CB底板\AC880-CB-底板原理图-2512030405.pdf")
+DEFAULT_PDF = Path(config.SCHEMATIC_PDF) if config.SCHEMATIC_PDF else None
 
 
 def text_items(pdf_path: Path, page_index: int):

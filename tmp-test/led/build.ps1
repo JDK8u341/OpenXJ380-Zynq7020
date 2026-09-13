@@ -1,9 +1,17 @@
 # 构建 AC880 LED 测试程序
 # 用法: pwsh -File build.ps1
+#
+# 工具链在哪来自仓库根目录的 config.py(换机器只改那一个文件)。
+# 改完 config.py 后本脚本会自动取到新值,这里不用动。
 
 $ErrorActionPreference = 'Stop'
 
-$GNU  = 'C:\AMDDesignTools\2025.2\gnu\aarch32\nt\gcc-arm-none-eabi'
+$REPO = (Resolve-Path "$PSScriptRoot\..\..").Path
+$PY   = if ($env:PYTHON) { $env:PYTHON } else { 'python' }
+$GNU  = (& $PY "$REPO\config.py" --get toolchain.dir).Trim()
+if (-not (Test-Path $GNU)) {
+    throw "config.py 给出的工具链目录不存在: $GNU`n  请改 $REPO\config.py 里的 VITIS_DIR,然后跑 python config.py 自检"
+}
 $BIN  = "$GNU\bin"
 $CC   = "$BIN\arm-none-eabi-gcc.exe"
 $OBJDUMP = "$BIN\arm-none-eabi-objdump.exe"

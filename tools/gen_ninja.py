@@ -13,11 +13,17 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "build.ninja"
+
+# 本机路径(工具链装在哪)集中在仓库根目录的 config.py —— 换机器只改那一个文件。
+# 仓库根不在 sys.path 里(本文件在 tools/ 下),所以先把根插进去。
+sys.path.insert(0, str(ROOT))
+import config  # noqa: E402
 
 # Keep generated Ninja output easy to scan with colored progress labels.
 LOG_RESET = "\033[0m"
@@ -547,11 +553,12 @@ ARM32_COMMON_FLAGS = (
 )
 
 # Candidate install roots for the Vitis GNU toolchain, used only when the
-# compiler is not already on PATH.
+# compiler is not already on PATH.  The path itself lives in the repository-root
+# `config.py` (that is the one file to edit on a new machine); a couple of stock
+# install locations are kept as a courtesy fallback.
 _VITIS_ARM_ROOTS = (
-    Path(r"C:\AMDDesignTools\2025.2\gnu\aarch32\nt\gcc-arm-none-eabi"),
+    Path(config.ARM_TOOLCHAIN_DIR),
     Path(r"C:\Xilinx\Vitis\2025.2\gnu\aarch32\nt\gcc-arm-none-eabi"),
-    Path("/tools/Xilinx/Vitis/2025.2/gnu/aarch32/nt/gcc-arm-none-eabi"),
 )
 
 
@@ -561,7 +568,7 @@ def resolve_arm_toolchain() -> tuple[str, str, str]:
     Resolution order:
       1. explicit ARM_CC / ARM_OBJCOPY / ARM_LIBGCC environment variables
       2. a toolchain already on PATH (arm-none-eabi-gcc)
-      3. a known Vitis install root
+      3. the toolchain named by config.py (and a stock Xilinx location)
 
     About libgcc: ARM has no hardware integer division, so 32/64-bit division
     emits __aeabi_uidiv / __aeabi_uldivmod calls that live in libgcc.  With
@@ -590,7 +597,7 @@ def resolve_arm_toolchain() -> tuple[str, str, str]:
                 cc = found
                 break
 
-    # 3. Known Vitis install roots.
+    # 3. The toolchain named by config.py, then a stock Xilinx location.
     if not cc:
         for root in _VITIS_ARM_ROOTS:
             for name in ("arm-none-eabi-gcc.exe", "arm-none-eabi-gcc"):
@@ -604,9 +611,12 @@ def resolve_arm_toolchain() -> tuple[str, str, str]:
     if not cc:
         raise SystemExit(
             "ARM toolchain not found.\n"
-            "  Install one or set ARM_CC to the compiler, e.g.\n"
-            '    set ARM_CC=C:\\AMDDesignTools\\2025.2\\gnu\\aarch32\\nt\\gcc-arm-none-eabi\\bin\\arm-none-eabi-gcc.exe\n'
-            "  See docs/ZYNQ7020_PORT_PLAN.md section 6.7."
+            f"  config.py says it should be at:\n    {config.ARM_CC}\n"
+            "  Fix VITIS_DIR in the repository-root config.py (one file), or set\n"
+            "  ARM_CC to the compiler directly, e.g.\n"
+            '    set ARM_CC=<vitis>\\gnu\\aarch32\\nt\\gcc-arm-none-eabi\\bin\\arm-none-eabi-gcc.exe\n'
+            "  Self-check: python config.py\n"
+            "  See docs/BUILD_ARM32.md."
         )
 
     cc_path = Path(cc)
