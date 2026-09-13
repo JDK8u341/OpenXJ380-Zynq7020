@@ -96,21 +96,27 @@
 /*
  * 布局(全部 4 字节,共 16 字 = 64 字节),偏移见 taskctx_asm.h:
  *
- *   0x00  r[0..12]   r0..r12(13 个字)
- *   0x34  ret        异常返回地址 —— `movs pc, ret`
- *   0x38  pc         出错/被中断的**指令地址** —— ★ 只用于诊断 ★
- *   0x3C  spsr       被中断时的 CPSR
+ *   0x00  r[0..12]   r0..r12
+ *   0x34  pc         出错/被中断的**指令地址** —— ★ 只用于诊断 ★
+ *   0x38  spsr       被中断时的 CPSR
+ *   0x3C  ret        异常返回地址 —— `movs pc, ret`
  *
- * ⚠ 名字里刻意把 `ret` 与 `pc` 分开。旧代码只有一个 `pc`,同时承担
- *   "返回"和"报告"两件事,于是**至少有一件是错的**(实测:SVC 与 Data Abort
- *   各差 4 字节)。分成两个字段之后,两者各自取自己该取的值。
+ * ★ 顺序由 `srsdb` 的语义决定,不是随便定的 ★
+ *   异常入口在异常模式下执行 `srsdb sp!, #MODE_SVC`,SRS 压出来的是
+ *   [SPSR, LR](低地址是 SPSR),所以 spsr 在 ret 前面;pc 是汇编随后补上去的。
+ *   详见 taskctx_asm.h。
+ *
+ * ⚠ `ret` 与 `pc` 是**两个不同的字段**,这是 M4-6 用板上实测改出来的:
+ *   旧代码只有一个 `pc`,同时承担"返回"和"报告"两件事,而这两件事要的
+ *   值不一样(见 taskctx_asm.h 的 RET_FIX / PC_FIX 表),于是至少有一件是错的 ——
+ *   实测 SVC 与 Data Abort 打印的 pc 各偏 4 字节,指向了隔壁那条指令。
  */
 typedef struct
 {
-    u32 r[13]; /* r0 .. r12 */
-    u32 ret;   /* 异常返回地址 */
-    u32 pc;    /* 出错/被中断的指令地址(仅诊断) */
-    u32 spsr;  /* 被中断时的 CPSR */
+    u32 r[13];  /* r0 .. r12 */
+    u32 svc_lr; /* ★ 被中断者的 LR —— 必须在任何 bl 之前存下来 ★ */
+    u32 ret;    /* 返回地址(RFEIA 要求 [sp]=PC)*/
+    u32 spsr;   /* 被中断时的 CPSR([sp+4]=CPSR)*/
 } arm_exc_frame_t;
 
 /*
@@ -119,14 +125,14 @@ typedef struct
  * 都在**编译期**报错,而不是等异常真的发生。
  */
 _Static_assert(ARM_EXC_OFF_R0 == 0u, "异常帧必须从 r0 开始");
-_Static_assert(ARM_EXC_OFF_RET == 13u * 4u, "r0-r12 之后必须紧跟 ret");
-_Static_assert(ARM_EXC_OFF_PC == ARM_EXC_OFF_RET + 4u, "pc 紧跟 ret");
-_Static_assert(ARM_EXC_OFF_SPSR == ARM_EXC_OFF_PC + 4u, "spsr 紧跟 pc");
-_Static_assert(ARM_EXC_FRAME_BYTES == 64u, "异常帧大小变了,vectors.S 的 sub sp 也要改");
-_Static_assert(ARM_EXC_FRAME_BYTES % 8u == 0u, "AAPCS 要求 8 字节栈对齐");
+_Static_assert(ARM_EXC_OFF_SVC_LR == 13u * 4u, "r0-r12 之后必须紧跟 svc_lr");
+_Static_assert(ARM_EXC_OFF_RET == ARM_EXC_OFF_SVC_LR + 4u, "ret 紧跟 svc_lr");
+_Static_assert(ARM_EXC_OFF_SPSR == ARM_EXC_OFF_RET + 4u, "spsr 紧跟 ret(RFEIA 的 [sp+4])");
+_Static_assert(ARM_EXC_FRAME_BYTES == 64u, "异常帧大小变了,vectors.S 的偏移也要改");
+_Static_assert(ARM_EXC_FRAME_BYTES % 8u == 0u, "异常帧不是 8 的倍数,调用 C 时 SP 会不对齐");
 _Static_assert(sizeof(arm_exc_frame_t) == ARM_EXC_FRAME_BYTES, "结构体与偏移宏不一致");
+_Static_assert(offsetof_arm(arm_exc_frame_t, svc_lr) == ARM_EXC_OFF_SVC_LR, "svc_lr 偏移与汇编不一致");
 _Static_assert(offsetof_arm(arm_exc_frame_t, ret) == ARM_EXC_OFF_RET, "ret 偏移与汇编不一致");
-_Static_assert(offsetof_arm(arm_exc_frame_t, pc) == ARM_EXC_OFF_PC, "pc 偏移与汇编不一致");
 _Static_assert(offsetof_arm(arm_exc_frame_t, spsr) == ARM_EXC_OFF_SPSR, "spsr 偏移与汇编不一致");
 
 /* ------------------------------------------------------------------ */
@@ -189,6 +195,19 @@ _Static_assert(offsetof_arm(arm_task_ctx_t, cpsr) == ARM_CTX_OFF_CPSR, "cpsr 偏
 static inline u32 arm_svc_immediate(u32 insn)
 {
     return insn & ARM_SVC_IMM_MASK;
+}
+
+/*
+ * 出错/被中断的**指令地址** —— 只用于诊断,由 `ret` 算出来。
+ *
+ * 帧里不再单独存一个 pc 字段:64 字节的布局已经被 svc_lr 占满了,
+ * 而"出错指令"本来就是 `ret` 减去一个**取决于异常类型**的常数
+ * (见 taskctx_asm.h 的 PC_FIX 表)。把它做成一个有名字的纯函数,
+ * 比多存一个字段再让两边同步更不容易错。
+ */
+static inline u32 arm_exc_pc(const arm_exc_frame_t *f, u32 pc_fix)
+{
+    return f->ret - pc_fix;
 }
 
 /* SPSR/CPSR 的模式位文本。纯函数,宿主可测 */

@@ -59,12 +59,21 @@ int main(void)
     CHECK(sizeof(arm_task_ctx_t) == ARM_CTX_BYTES);
 
     /* ---- 2. 独立重算偏移,不信头文件里的断言 ---- */
+    /*
+     * ★ 布局决定:r0-r12 | svc_lr | ret | spsr ★
+     *   svc_lr 必须在 bl 之前存下来 —— 处理函数跑在 SVC 模式,
+     *   `bl` 会踩掉被中断代码的 LR(不存它,被中断的函数一 bx lr 就飞)。
+     *   ret/spsr 相邻且 ret 在低地址,是为了让 `rfeia sp!` 一条指令
+     *   同时完成"跳转 + 恢复 CPSR"。
+     */
     CHECK(ARM_EXC_OFF_R0 == 0u);
-    CHECK(ARM_EXC_OFF_RET == 13u * 4u);
-    CHECK(ARM_EXC_OFF_PC == ARM_EXC_OFF_RET + 4u);
-    CHECK(ARM_EXC_OFF_SPSR == ARM_EXC_OFF_PC + 4u);
+    CHECK(ARM_EXC_OFF_SVC_LR == 13u * 4u);
+    CHECK(ARM_EXC_OFF_RET == ARM_EXC_OFF_SVC_LR + 4u);
+    CHECK(ARM_EXC_OFF_SPSR == ARM_EXC_OFF_RET + 4u);
     CHECK(ARM_EXC_FRAME_WORDS == 16u);
     CHECK(ARM_EXC_FRAME_BYTES == 64u);
+    /* RFEIA 从 ret 槽开始:PC=[sp], CPSR=[sp+4] */
+    CHECK(ARM_EXC_OFF_RFE_BASE == ARM_EXC_OFF_RET);
 
     CHECK(ARM_CTX_OFF_R0 == 0u);
     CHECK(ARM_CTX_OFF_SP == 13u * 4u);
@@ -81,8 +90,8 @@ int main(void)
         unsigned char     *ep = (unsigned char *)&ef;
         unsigned char     *tp = (unsigned char *)&tc;
 
+        CHECK((unsigned char *)&ef.svc_lr - ep == (long)ARM_EXC_OFF_SVC_LR);
         CHECK((unsigned char *)&ef.ret - ep == (long)ARM_EXC_OFF_RET);
-        CHECK((unsigned char *)&ef.pc - ep == (long)ARM_EXC_OFF_PC);
         CHECK((unsigned char *)&ef.spsr - ep == (long)ARM_EXC_OFF_SPSR);
         CHECK((unsigned char *)&ef.r[12] - ep == (long)ARM_EXC_OFF_R(12));
 
@@ -105,8 +114,15 @@ int main(void)
         CHECK(ARM_CTX_OFF_R(0u) == 0u);
     }
 
-    /* ---- 5. 帧大小必须满足 AAPCS 的 8 字节栈对齐 ---- */
+    /*
+     * ---- 5. 帧大小必须满足 AAPCS 的 8 字节栈对齐 ----
+     *
+     * 这不是洁癖:帧建好之后要 `bl` 到 C。60 字节(不带 pc 槽)会让 SP 落到
+     * 4 mod 8,后果不是编译错误,而是 C 里某条 VFP 指令炸 Undefined
+     * Instruction(本项目在 M4-2 踩过一次)。
+     */
     CHECK(ARM_EXC_FRAME_BYTES % 8u == 0u);
+    CHECK(ARM_EXC_FRAME_BYTES == 16u * 4u);
     /* 任务上下文也一样:恢复它的时候 sp 要是 8 对齐的 */
     CHECK(ARM_CTX_BYTES % 4u == 0u);
 
@@ -117,20 +133,30 @@ int main(void)
      *   IRQ  返回用 LR-4,        诊断用 LR-8
      * 于是同一个异常的 ret/pc 之差随类型变化 —— 写死一个常数就是错的。
      */
-    CHECK(ARM_EXC_LR_TO_INSN_SVC == 4u);
-    CHECK(ARM_EXC_LR_TO_RET_SVC == 0u);
-    CHECK(ARM_EXC_LR_TO_INSN_IRQ == 8u);
-    CHECK(ARM_EXC_LR_TO_RET_IRQ == 4u);
-    CHECK(ARM_EXC_LR_TO_INSN_DABT == 8u);
+    /*
+     * ★ 两个"减多少"必须分开:ret 是"首选返回地址",pc 是"出错/被中断的指令" ★
+     *
+     * 实测表(本板,见 taskctx.h 顶部):
+     *   入口 LR -> ret 要减 RET_FIX -> 再减 PC_FIX 才得到 pc
+     */
+    CHECK(ARM_EXC_RET_FIX_SVC == 0u && ARM_EXC_PC_FIX_SVC == 4u);
+    CHECK(ARM_EXC_RET_FIX_IRQ == 4u && ARM_EXC_PC_FIX_IRQ == 4u);
+    CHECK(ARM_EXC_RET_FIX_UND == 4u && ARM_EXC_PC_FIX_UND == 0u);
+    CHECK(ARM_EXC_RET_FIX_PABT == 4u && ARM_EXC_PC_FIX_PABT == 0u);
+    CHECK(ARM_EXC_RET_FIX_DABT == 8u && ARM_EXC_PC_FIX_DABT == 0u);
+
     /*
      * ★ 这几条钉的是"同一个异常下 ret 与 pc 不是同一个值" ★
      *   旧代码只有一个 pc 字段,两者共用一个 LR-4,于是至少一个是错的。
-     *   (注意不要写成"不同异常的偏移互不相等" —— 那是错的:
-     *    SVC 的 pc 偏移与 IRQ 的 ret 偏移恰好都是 4。)
+     *   只有 SVC 与 IRQ 会返回,也只有这两个的 ret != pc —— 正好对应
+     *   实测里偏 4 的那两条(SVC 与 Data Abort 是偏的,Data Abort 是 pc 那一路)。
      */
-    CHECK(ARM_EXC_LR_TO_INSN_SVC != ARM_EXC_LR_TO_RET_SVC);
-    CHECK(ARM_EXC_LR_TO_INSN_IRQ != ARM_EXC_LR_TO_RET_IRQ);
-    CHECK(ARM_EXC_LR_TO_INSN_DABT != ARM_EXC_LR_TO_RET_IRQ);
+    CHECK(ARM_EXC_RET_FIX_SVC + ARM_EXC_PC_FIX_SVC == 4u); /* pc = LR-4 */
+    CHECK(ARM_EXC_RET_FIX_IRQ + ARM_EXC_PC_FIX_IRQ == 8u); /* pc = LR-8 */
+    CHECK(ARM_EXC_PC_FIX_SVC != 0u); /* SVC 的 ret(减 0)与 pc(减 4)不同 */
+    CHECK(ARM_EXC_PC_FIX_IRQ != 0u); /* IRQ 的 ret(减 4)与 pc(减 8)不同 */
+    /* 其余三个 ret == pc(不返回,两者取同一个值)*/
+    CHECK(ARM_EXC_PC_FIX_UND == 0u && ARM_EXC_PC_FIX_PABT == 0u && ARM_EXC_PC_FIX_DABT == 0u);
 
     /* ---- 7. SVC 立即数的提取 ---- */
     {
@@ -154,6 +180,22 @@ int main(void)
     CHECK(arm_mode_text(ARM_MODE_SVC) [0] == 'S');
     CHECK(arm_mode_text(0x80000013u)[1] == 'u'); /* 高位有标志也不影响模式判定 */
     CHECK(arm_mode_text(0x00000000u)[0] == 'u'); /* 未知识别成 unknown,不返回 NULL */
+
+    /* ---- 8b. arm_exc_pc():帧里只存 ret,pc 按异常类型算出来 ---- */
+    {
+        arm_exc_frame_t f = {0};
+
+        f.ret = 0x1004u;
+        /* SVC:ret = svc+4,pc = ret-4 = svc 本身 */
+        CHECK(arm_exc_pc(&f, ARM_EXC_PC_FIX_SVC) == 0x1000u);
+        /* IRQ:ret = 被中断指令+4,pc = ret-4 = 被中断的那条 */
+        CHECK(arm_exc_pc(&f, ARM_EXC_PC_FIX_IRQ) == 0x1000u);
+        /* Data Abort / Prefetch / Undefined:ret 本身就是出错指令 */
+        CHECK(arm_exc_pc(&f, ARM_EXC_PC_FIX_DABT) == 0x1004u);
+        CHECK(arm_exc_pc(&f, ARM_EXC_PC_FIX_PABT) == 0x1004u);
+        CHECK(arm_exc_pc(&f, ARM_EXC_PC_FIX_UND) == 0x1004u);
+        CHECK(sizeof(f) == ARM_EXC_FRAME_BYTES);
+    }
 
     /* ---- 9. 错误编号与"槽个数"对得上 ---- */
     CHECK(ARM_FRAME_CHECK_BAD_SPSR == 14);

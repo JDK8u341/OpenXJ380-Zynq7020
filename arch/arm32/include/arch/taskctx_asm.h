@@ -76,16 +76,34 @@
 #define ARM_CPSR_A_BIT 0x100u
 
 /*
- * 从入口 LR 到两个不同目标的偏移 —— 见 taskctx.h 顶部的实测表。
+ * 从**入口 LR** 到两个不同目标各要减多少。实测表在 arch/taskctx.h 顶部。
  *
- *   返回(首选返回地址)   SVC = LR,IRQ = LR-4
- *   诊断(出错/被中断指令) SVC = LR-4,Data Abort = LR-8,IRQ = LR-8
+ * 分两步,不再是一个数:
+ *
+ *   RET_FIX  入口 LR -> **首选返回地址**(`movs pc, lr` 要跳的地方)
+ *   PC_FIX   首选返回地址 -> **出错/被中断的那条指令**(只用于诊断)
+ *
+ * 于是 pc 有没有可能与 ret 不同,一眼可见:
+ *   SVC   RET_FIX 0  PC_FIX 4   ← 不同:返回是 SVC 的下一条,pc 是 SVC 自己
+ *   IRQ   RET_FIX 4  PC_FIX 4   ← 不同:返回是下一条,pc 是被中断的那条
+ *   UND   RET_FIX 4  PC_FIX 0   ← 相同
+ *   PABT  RET_FIX 4  PC_FIX 0   ← 相同
+ *   DABT  RET_FIX 8  PC_FIX 0   ← 相同
+ *
+ * ★ 旧代码把这两件事当成一个值(统一的 LR-4),于是 SVC 与 Data Abort
+ *   打印的 pc 各偏 4 字节。M4-6 用实测把它拆开了。
  */
-#define ARM_EXC_LR_TO_INSN_SVC  4u
-#define ARM_EXC_LR_TO_INSN_UND  4u
-#define ARM_EXC_LR_TO_INSN_PABT 4u
-#define ARM_EXC_LR_TO_INSN_DABT 8u
-#define ARM_EXC_LR_TO_INSN_IRQ  8u
+#define ARM_EXC_RET_FIX_SVC  0u
+#define ARM_EXC_RET_FIX_IRQ  4u
+#define ARM_EXC_RET_FIX_UND  4u
+#define ARM_EXC_RET_FIX_PABT 4u
+#define ARM_EXC_RET_FIX_DABT 8u
+
+#define ARM_EXC_PC_FIX_SVC   4u
+#define ARM_EXC_PC_FIX_IRQ   4u
+#define ARM_EXC_PC_FIX_UND   0u
+#define ARM_EXC_PC_FIX_PABT  0u
+#define ARM_EXC_PC_FIX_DABT  0u
 
 /*
  * "返回"那一路。只有 SVC 与 IRQ 会返回,所以只有这两个有值:
@@ -104,12 +122,47 @@
 /* 帧一:异常帧的偏移                                                  */
 /* ------------------------------------------------------------------ */
 
-#define ARM_EXC_OFF_R0   0x00u
-#define ARM_EXC_OFF_RET  0x34u
-#define ARM_EXC_OFF_PC   0x38u
-#define ARM_EXC_OFF_SPSR 0x3Cu
+/*
+ * 布局由 `srsdb` + 一串 push 的实际顺序决定,不是随便定的:
+ *
+ *   0x00  r0 .. r12       push {r0-r12}
+ *   0x34  svc_lr          ★ 被中断者的 LR ★(见下面那一段,这是 M4-7 的关键)
+ *   0x38  ret             返回地址(RFEIA 要用 [sp]=PC、[sp+4]=CPSR)
+ *   0x3C  spsr            被中断时的 CPSR
+ *   ---- 共 64 字节(8 的倍数,AAPCS 要求)
+ *
+ * ## ★ 为什么必须有 svc_lr ★
+ *
+ * 异常入口现在是**切到 SVC 模式**再调 C 处理函数的 —— 这样才能把现场帧建在
+ * 任务的栈上(M4-7 的核心要求)。
+ *
+ * 但 `bl c_irq_handler` 会写 **LR_svc**,而 LR_svc 里装的正是**被中断的那段
+ * 内核代码的返回地址**!(异常来自 SVC 模式时,硬件把返回地址放进 LR_irq,
+ * LR_svc 完全没被动过 —— 它还是活的。)
+ *
+ * 旧实现把处理函数跑在 IRQ 模式,`bl` 用的是 banked 的 LR_irq,所以 LR_svc
+ * 安然无恙;一旦搬到 SVC 模式,`bl` 就把它**踩掉了**。等被中断的函数
+ * `bx lr` 时就跳到一个垃圾地址。
+ *
+ * 实测后果:内核卡在"中断刚打开"那一刻,而且**整个 PS 挂住** ——
+ * 连 JTAG 的 DAP 都读不到(APB AP transaction error)。串口上什么都不打,
+ * 因为执行已经飞到不存在的地址上去了。
+ *
+ * ⇒ 所以 LR 必须在切到 SVC 模式后、任何 `bl` 之前**立刻存进帧里**。
+ *   这正是 Linux 的 `pt_regs` 里带 r13/r14 的原因。
+ */
+#define ARM_EXC_OFF_R0     0x00u
+#define ARM_EXC_OFF_SVC_LR 0x34u
+#define ARM_EXC_OFF_RET    0x38u
+#define ARM_EXC_OFF_SPSR   0x3Cu
 #define ARM_EXC_FRAME_WORDS (ARM_EXC_OFF_SPSR / 4u + 1u)
 #define ARM_EXC_FRAME_BYTES (ARM_EXC_FRAME_WORDS * 4u)
+
+/* 第 n 个通用寄存器槽(r0..r12)的偏移 */
+#define ARM_EXC_OFF_R(n) (ARM_EXC_OFF_R0 + 4u * (n))
+
+/* 返回(RFEIA sp!)要用的偏移:从帧底加到 ret 槽 */
+#define ARM_EXC_OFF_RFE_BASE ARM_EXC_OFF_RET
 
 /* 第 n 个通用寄存器槽(r0..r12)的偏移。照写会被 4 整除的算式,汇编也认 */
 #define ARM_EXC_OFF_R(n) (ARM_EXC_OFF_R0 + 4u * (n))

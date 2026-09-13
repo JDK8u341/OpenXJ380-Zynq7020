@@ -121,6 +121,28 @@ SECTIONS
     __stack_top  = __stack_bottom + CPU_STACK_BYTES;                       /* CPU0 */
     __stack1_top = __stack_bottom + CPU_STACK_BYTES * 2;                   /* CPU1 */
 
+/*
+ * SVC 栈区的上下界(M4-7)。
+ *
+ * start.S 的 setup_mode_stacks 从各核栈区顶部依次向下切:
+ *   IRQ(8KB) -> FIQ(4KB) -> ABT(4KB) -> UND(4KB) -> 剩下的全给 SVC
+ * 所以 SVC 栈顶 = __stack_top - STACK_TOTAL。
+ *
+ * 为什么要把这两个界导出来:M4-7 之后**异常现场帧必须落在 SVC 栈里**
+ * (而不是异常模式自己的栈)。这是可以板上核对的硬判据 ——
+ * 帧地址在不在这个区间里,一眼可辨,而且两个区间**不相交**,
+ * 所以"落错地方"不会被"看起来也差不多"糊过去。
+ */
+/*
+ * .text 的上下界(M4-7):IRQ 帧校验要确认返回地址落在内核代码段里 ——
+ * 挡住"返回到野地址"这一类。用链接期符号而不是硬编码常量。
+ */
+__text_start = ADDR(.text);
+__text_end   = ADDR(.text) + SIZEOF(.text);
+
+__stack_svc_top    = __stack_top - STACK_TOTAL;                        /* CPU0 */
+__stack_svc_bottom = __stack_svc_top - STACK_SIZE_SVC;
+
     ASSERT(__stack_top - __stack_bottom == CPU_STACK_BYTES,
            "CPU0 栈区大小不对")
     ASSERT(__stack1_top - __stack_bottom == CPU_STACK_BYTES * CPU_STACK_COUNT,

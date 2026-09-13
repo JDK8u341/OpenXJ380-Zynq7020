@@ -45,6 +45,13 @@
  * start.S 用同一个符号建 CPU0 的栈;这里读它是为了在 percpu 表里
  * 留下一条可核对的记录 —— 两个核的栈区必须不同。
  */
+/*
+ * M4-7:CPU0 的 SVC 栈区上下界(boot/kernel.ld)。
+ * 异常现场帧必须落在这段区间里 —— 判据与理由见 9.5 那段。
+ * 这两段与 IRQ 栈**不相交**,所以"落错地方"是二值的,糊不过去。
+ */
+extern char __stack_svc_bottom[];
+extern char __stack_svc_top[];
 extern char __stack_top[];
 
 /*
@@ -174,6 +181,9 @@ static int g_svc_frame_check = -1;
 
 /* M4-6:TCB 里 ctx 偏移的运行时自检结果(-1 = 没跑过) */
 static int g_tcb_ctx_check = -1;
+
+/* M4-7:异常帧是否落在 SVC 栈区(1 = 在,0 = 不在)*/
+static u32 g_exc_frame_on_svc_stack;
 
 static u32 g_kstack_selftest;
 static u32 g_kstack_slots_ok;
@@ -533,7 +543,16 @@ void kmain(void)
      */
     console_puts(" IRQ init: vectors installed, configuring GIC...\n");
 
+    /*
+     * ⚠ 这一段被刻意切成了四小段并各自打印一行。
+     *
+     * 为什么:M4-7 把异常入口改成"帧建在任务的栈上"之后,曾经在这段窗口里
+     * **整个 PS 挂住**(连 JTAG 的 DAP 都读不到),而串口停在"configuring GIC..."
+     * 那行后面 —— 光靠"最后一行输出"分不清是 gic_init 挂了、定时器启动挂了、
+     * 还是第一条中断挂了。四行输出把这个窗口一次切开。
+     */
     gic_init();
+    console_puts(" IRQ init: gic_init() done\n");
 
     if (irq_register(GIC_INTID_A9_PRIVATE_TIMER, tick_handler, NULL) != 0) {
         console_puts(" WARN: 定时器 INTID 29 已被占用,周期 tick 未启用\n");
@@ -542,11 +561,14 @@ void kmain(void)
     a9_timer_start_tick(1000u);                            /* 1 ms 一次 */
     gic_set_priority(GIC_INTID_A9_PRIVATE_TIMER, 0x80u);   /* 数值越小优先级越高 */
     gic_enable_irq(GIC_INTID_A9_PRIVATE_TIMER);
+    console_puts(" IRQ init: timer started\n");
 
     irq_global_enable();
+    console_puts(" IRQ init: interrupts enabled\n");
 
     /* 给中断一点时间跑起来,再报告结果 */
     timer_delay_ms(20);
+    console_puts(" IRQ init: 20 ms elapsed (ticks should be > 0)\n");
 
     console_printf(" IRQ status  : ticks=%u irq_count=%u last_intid=%u spurious=%u\n",
                    g_tick_seen, irq_get_stats()->irq_count, irq_get_stats()->last_intid,
@@ -1395,6 +1417,40 @@ void kmain(void)
         }
     }
 
+    /* ---- 9.5 异常帧落在**任务的栈**上(M4-7 的第一件事) ---- */
+    /*
+     * 在这之前,异常帧建在**异常模式自己的栈**上 —— IRQ 用全局的 IRQ 栈,
+     * Data Abort 用 ABT 栈。单线程时看不出问题,一旦有了任务就是错的:
+     * 两个任务会共用那一段全局栈、互相覆盖现场,而且**不报任何错**。
+     *
+     * 现在所有异常都先 `srsdb sp!, #MODE_SVC` 落到 SVC 栈(当前任务的栈)上。
+     *
+     * 判据用链接脚本导出的两段**不相交**的区间:
+     *   SVC 栈  [__stack_svc_bottom, __stack_svc_top)
+     *   IRQ 栈  [__stack_svc_top,    __stack_top)
+     * 所以"帧落在哪一边"是二值的,不存在"看起来差不多"。
+     */
+    {
+        u32 lo     = (u32)(uintptr_t)__stack_svc_bottom;
+        u32 hi     = (u32)(uintptr_t)__stack_svc_top;
+        u32 irq_hi = (u32)(uintptr_t)__stack_top;
+        u32 frame;
+
+        /*
+         * 触发一次会返回的异常(SVC)并取回它的帧地址。
+         * 选择器 9 顺带跑帧布局自检,所以这一步不额外花时间。
+         */
+        fault_test_trigger(FAULT_SEL_SVC_FRAME);
+        frame = irq_last_svc_frame_addr();
+
+        g_exc_frame_on_svc_stack = ((frame >= lo) && (frame < hi)) ? 1u : 0u;
+
+        console_printf(" Exc stack   : frame=0x%08X  svc=[0x%08X,0x%08X)  irq=[0x%08X,0x%08X)\n",
+                       frame, lo, hi, hi, irq_hi);
+        console_printf(" Exc stack   : on SVC stack (task stack) = %s\n",
+                       g_exc_frame_on_svc_stack ? "YES" : "NO");
+    }
+
     /* ---- 10. 启动自检总账 ---- */
     /*
      * 位置:所有自检都跑完之后、主循环之前。
@@ -1513,6 +1569,27 @@ void kmain(void)
     selftest_report("tcb_ctx_layout", (u32)((g_tcb_ctx_check < 0) ? 0xFFFFFFFFu
                                                                  : (u32)g_tcb_ctx_check),
                     0u, SELFTEST_EQ);
+
+    /*
+     * ---- 异常帧的落点(M4-7)----
+     *
+     * 这是 M4-7"把异常帧搬到任务的栈上"这一条的验收判据。
+     * 旧实现(帧建在 IRQ 模式自己的栈上)会让它判 FAIL ——
+     * 而且那个失败是**可复现**的,不是概率性的:两段栈区在链接脚本里不相交。
+     */
+    selftest_report("exc_frame_on_task_stack", g_exc_frame_on_svc_stack, 1u, SELFTEST_EQ);
+
+    /*
+     * ---- IRQ 返回地址的结构自检(M4-7)----
+     *
+     * 判据:每一个 IRQ 帧都必须满足 `ret == pc + 4`。漏掉"按异常类型修正 LR"
+     * 那一步时两者会取到同一个原始值,于是**每条中断跳过一条指令** ——
+     * 而那个 bug 的表现是随机的 Data Abort,光看现场根本猜不到根因。
+     *
+     * 到自检这一刻已经过去了上千个 tick,所以这个计数是"每帧都查"的累积结果,
+     * 不是抽样。必须恒为 0。
+     */
+    selftest_report("irq_frame_violations", irq_frame_violations(), 0u, SELFTEST_EQ);
 
     selftest_report("smp_cpu1_online", g_percpu[1].online, 1u, SELFTEST_EQ);
     selftest_report("smp_cpu1_stage", HB[HB_SLOT_CPU1_STAGE], HB_CPU1_STAGE_ONLINE, SELFTEST_EQ);

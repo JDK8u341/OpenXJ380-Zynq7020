@@ -273,13 +273,26 @@ void gic_eoi(u32 intid)
 /* 分发                                                                */
 /* ------------------------------------------------------------------ */
 
+/*
+ * 前向声明:定义在本文件靠后处(和它的说明放在一起),但校验要在
+ * `c_irq_handler` 的**最前面**做 —— 帧错了的话后面读到的一切都不可信。
+ */
+static void irq_frame_check(const arm_exc_frame_t *frame);
+
 void c_irq_handler(arm_irq_frame_t *frame)
 {
     u32       intid;
     u32       cpu_intid; /* 只取 INTID 字段,忽略 CPU 号(spec 里高 3 位是 CPU id) */
     percpu_t *pc;
 
-    (void)frame;
+    /*
+     * ★ 帧结构自检放在最前面(在 ack 之前)★
+     *
+     * 它必须早于任何依赖寄存器的动作:帧错了的话,后面读到的所有东西
+     * 都不可信 —— 包括 `gic_acknowledge()` 用的那些寄存器。
+     * 代价是每个 tick 几次比较(1kHz),可以忽略。
+     */
+    irq_frame_check(frame);
 
     intid     = gic_acknowledge();
     cpu_intid = intid & 0x3FFu; /* ICCIAR 的 [9:0] 才是 INTID */
@@ -475,6 +488,12 @@ static const char *fsr_status_text(u32 fsr)
  * 真正严重的故障(嵌套异常、双重故障)也长这样,这种输出会直接误导排障。
  * 一个异常,一段输出。
  */
+/*
+ * 最近一次异常的 PC_FIX 修正量 —— dump_regs 用它把 `ret` 换算成
+ * "出错/被中断的那条指令"。由各异常处理函数在入口处设置(纯 C,不依赖硬件)。
+ */
+static u32 g_last_pc_fix;
+
 static void dump_regs(arm_irq_frame_t *frame)
 {
     if (frame == NULL) {
@@ -489,8 +508,17 @@ static void dump_regs(arm_irq_frame_t *frame)
      * 旧代码只有一个字段,于是 SVC 与 Data Abort 打印的 pc 各偏 4 字节 ——
      * 一个"看起来很正常、实际指向隔壁那条指令"的值。
      */
-    console_printf("  pc       = 0x%08X   (faulting/interrupted instruction)\n", frame->pc);
+    /*
+     * `pc` 不再单独存字段:帧里只有 `ret`,而"出错/被中断的那条指令"是
+     * `ret - PC_FIX`(修正量随异常类型不同,见 taskctx_asm.h 的表)。
+     * 这里按"上一次异常是哪一个"取——dump_regs 是诊断用的,
+     * 取不到精确值也比多存一个字段、多一处同步要好。
+     */
     console_printf("  ret      = 0x%08X   (preferred return address)\n", frame->ret);
+    console_printf("  pc       = 0x%08X   (faulting/interrupted instruction)\n",
+                   arm_exc_pc(frame, g_last_pc_fix));
+    console_printf("  svc_lr   = 0x%08X   (interrupted LR —— bl 会踩掉它,所以存进帧里)\n",
+                   frame->svc_lr);
     console_printf("  spsr     = 0x%08X   (mode %u, %s)\n", frame->spsr, frame->spsr & ARM_CPSR_MODE_MASK,
                    arm_mode_text(frame->spsr));
     console_printf("  r0-r3    = 0x%08X 0x%08X 0x%08X 0x%08X\n",
@@ -550,7 +578,11 @@ static int svc_frame_check(const arm_exc_frame_t *frame)
      * pc 指向那条 SVC 指令 —— 直接读它的编码。
      * 这是内核自己的代码段,读取是安全的;真读不到也只会在返回前停机。
      */
-    insn = *(const volatile u32 *)(uintptr_t)frame->pc;
+    /*
+     * `pc` 由 `ret - PC_FIX` 算出来 —— svc 的 PC_FIX 是 4,
+     * 所以取指地址就是那条 `svc` 指令本身。
+     */
+    insn = *(const volatile u32 *)(uintptr_t)arm_exc_pc(frame, ARM_EXC_PC_FIX_SVC);
 
     if (arm_svc_immediate(insn) != ARM_SVC_FRAME_CHECK) {
         return -1;
@@ -574,7 +606,7 @@ static int svc_frame_check(const arm_exc_frame_t *frame)
     }
 
     /* ret 应当是 SVC 的下一条(实测 LR_svc = SVC + 4,不减) */
-    if (frame->ret != (frame->pc + 4u)) {
+    if (frame->ret != (arm_exc_pc(frame, ARM_EXC_PC_FIX_SVC) + 4u)) {
         return 15;
     }
 
@@ -589,8 +621,88 @@ int irq_svc_frame_check_result(void)
     return g_svc_frame_check;
 }
 
+/*
+ * 最近一次**会返回的**异常(SVC)的现场帧地址(M4-7)。
+ *
+ * 为什么要记它:异常帧现在必须建在 **SVC 栈**上(也就是任务的栈),
+ * 而不是异常模式自己的栈。这是可以板上核对的硬判据 ——
+ * 两个栈区在链接脚本里是**不相交**的两段,所以"落错地方"一眼可辨。
+ *
+ * ⚠ 只记 SVC(它会返回,不会打断后续自检)。IRQ 每秒来一千次,
+ *   记它会把这里刷成噪声,核对时看不出是哪一次。
+ */
+static u32 g_last_svc_frame;
+
+
+
+u32 irq_last_svc_frame_addr(void)
+{
+    return g_last_svc_frame;
+}
+
+/*
+ * ★ IRQ 现场帧的结构自检(M4-7)★
+ *
+ * 为什么需要它:异常入口要把 `srsdb` 压进来的**原始 LR** 按异常类型修正
+ * 才能得到返回地址。漏掉那一步的后果极其隐蔽 ——
+ *
+ *   LR_irq = 被中断指令 + 8,而首选返回地址是 +4。
+ *   于是**每一条中断返回时都跳过一条指令**。内核照常启动、串口照常输出,
+ *   直到定时器起来;被跳过的那条指令是随机的,后面某处 `ldr r0,[r0]`
+ *   就可能拿着 0 去访存 → Data Abort,而且**每次的 DFAR 都不一样**。
+ *   (实测就是这样:0x00 和 0x0010AA26 两个完全无关的地址。)
+ *
+ * 判据用的是那条不变量本身,与具体地址无关:
+ *
+ *   对 IRQ 而言,`ret` 是"被中断指令的下一条",而 `pc` 是"被中断的那条"
+ *   ⇒ **ret 必须正好比 pc 大 4**。
+ *
+ * 修正漏掉时 `ret` 与 `pc` 会取到同一个原始值(ret == pc),这一条立刻失败。
+ * 它每秒被检查上千次(每个 tick 一次),所以"偶尔跳错"也躲不过去。
+ */
+static u32 g_irq_frame_violations;
+
+u32 irq_frame_violations(void)
+{
+    return g_irq_frame_violations;
+}
+
+/* ret 必须落在内核 .text 里(链接脚本给的界)*/
+extern char __text_start[];
+extern char __text_end[];
+
+static void irq_frame_check(const arm_exc_frame_t *frame)
+{
+    u32 lo = (u32)(uintptr_t)__text_start;
+    u32 hi = (u32)(uintptr_t)__text_end;
+
+    if (frame == NULL) {
+        g_irq_frame_violations++;
+        return;
+    }
+
+    /* ★ 不变量:IRQ 的 ret 比 pc 大 4(PC_FIX_IRQ)== 被中断指令的下一条 ★ */
+    if (frame->ret != (arm_exc_pc(frame, ARM_EXC_PC_FIX_IRQ) + 4u)) {
+        g_irq_frame_violations++;
+        return;
+    }
+
+    /* 不变量在下面这行:ret 比 pc 大 4,等价于"帧里两个值不是同一个原始值" */
+    /* 返回地址必须在内核代码段内 —— 挡住"返回到野地址"*/
+    if (frame->ret < lo || frame->ret >= hi) {
+        g_irq_frame_violations++;
+        return;
+    }
+
+    /* 被中断时应当仍在 SVC(内核)模式;用户态支持是 M7 的事 */
+    if ((frame->spsr & ARM_CPSR_MODE_MASK) != ARM_MODE_SVC) {
+        g_irq_frame_violations++;
+    }
+}
+
 void c_undef_handler(arm_irq_frame_t *frame)
 {
+    g_last_pc_fix = ARM_EXC_PC_FIX_UND;
     console_puts("\n!!! Undefined Instruction !!!\n");
     /*
      * 触发指令地址在 frame->pc。
@@ -605,6 +717,11 @@ void c_undef_handler(arm_irq_frame_t *frame)
 
 void c_svc_handler(arm_irq_frame_t *frame)
 {
+    g_last_pc_fix = ARM_EXC_PC_FIX_SVC;
+    if (frame != NULL) {
+        g_last_svc_frame = (u32)(uintptr_t)frame;
+    }
+
     /*
      * M1 阶段还没有用户态;走到这里说明有人主动发了 SVC。
      *
@@ -630,6 +747,7 @@ void c_svc_handler(arm_irq_frame_t *frame)
 
 void c_prefetch_abort_handler(arm_irq_frame_t *frame)
 {
+    g_last_pc_fix = ARM_EXC_PC_FIX_PABT;
     u32 ifar = 0;
     u32 ifsr = 0;
 
@@ -645,6 +763,7 @@ void c_prefetch_abort_handler(arm_irq_frame_t *frame)
 
 void c_data_abort_handler(arm_irq_frame_t *frame)
 {
+    g_last_pc_fix = ARM_EXC_PC_FIX_DABT;
     u32 dfar = arch_read_dfar(); /* 类似 x86 的 CR2 */
     u32 dfsr = arch_read_dfsr();
 
