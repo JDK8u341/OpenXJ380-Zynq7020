@@ -434,19 +434,55 @@ tcb_t sched_kthread_create_level(void (*entry)(void *), void *arg, const char *n
 void sched_yield(void);
 
 /*
- * 把自己挂起(status = WAIT,wakeup_time = 0 = **不按时间唤醒**),然后切走。
+ * ~~`sched_park_self()`~~ —— **M4-11.2 已删**。
  *
- * ⚠ 它是"永久挂起",与 `sched_sleep_ns` 不是一回事:后者的 wakeup_time 非 0,
- *   到点会被 `sched_queue_scan()` 的扫描唤醒;这里的 0 表示"没有时间点",
- *   只有 `sched_wake_task()` 能把它叫回来。
- *
- * ⚠ 源 OS **没有**这个函数(它的任务由 `process_exit` 回收,那是用户进程的事)。
- *   这里是自检探针的便利设施:干完活挂起,于是 idle 能被挑中、启动流程回得来。
- *   M4-11 有了线程退出机制之后,它应当被"退出"取代。
- *
- * ⚠ 本函数**不会返回**(除非调用者是 idle)。
+ * 它原来做的是"把自己挂起(status = WAIT、wakeup_time = 0)然后切走",
+ * 是自检探针的便利设施。源 OS **没有**这个函数,而且它表达错了语义:
+ * 探针干完活是"**退出**"(源 OS 的 `process_exit` → `kill_thread` → `DEATH`),
+ * 不是"睡下去等一个永远不会来的唤醒"。
+ * ⇒ 探针改走 `sched_thread_exit()`,本函数随之没有调用者,按 D10/D11 删除。
  */
-void sched_park_self(void);
+
+/*
+ * ★ M4-11.2:线程退出 —— 源 OS 两段式的**第一段** ★
+ *
+ * ← `process_exit()` `pcb.cpp:494-505` + `kill_thread()` `:447-458`:
+ * 置 `DEATH`(唯一拒绝条件是 `TASK_IDLE_LEVEL`)、让出、然后永久停住
+ * (`while (true) hlt` 的 ARM 对应物是 `wfi`)。
+ *
+ * ★★ **不释放任何资源** ★★ —— 这是**决定**,不是没做完:
+ * 源 OS 的 `kill_thread0()`(还栈 + 摘队 + 由调用者 free TCB)对挂在
+ * `kernel_group` 上的线程**没有任何可达路径**(`kill_proc` 直接拒绝
+ * "Cannot kill System process."),而 2026-09-13 的决定是**不改源 OS 的行为**。
+ * 完整证据链与代价见 `docs/PTASK.md` §2.5/§4.0/§9.3。
+ *
+ * ⇒ 后果(必须知道):内核栈池**只增不减**,`KSTACK_SLOTS` 就是
+ *   "每次启动能创建的内核线程数上限"。容量判据是 `kstack_peak_used`
+ *   与 `kstack_headroom`。
+ *
+ * ⚠ 本函数**不返回**(idle 调用时除外 —— 那时它被拒绝并计数)。
+ */
+void sched_thread_exit(void);
+
+/* 走到过退出路径的线程数(判据的非空转条件:必须 > 0)*/
+u32 sched_thread_exit_count(void);
+
+/* "有代码想停 idle" 的次数 —— 源 OS 也会拒绝,这里做成可读的计数(必须 0)*/
+u32 sched_thread_exit_refused(void);
+
+/*
+ * ★ 破坏性 A/B 开关 ★ 置 1 时退出路径写 `WAIT` 而不是 `DEATH`
+ * (= M4-11.2 之前 `sched_park_self()` 的行为)。两边"线程停住了"一样,
+ * 差别只在名册上的状态 ⇒ 它证明的是"退出语义真的接上了"。
+ * 生产路径恒为 0。
+ */
+void sched_set_exit_legacy(u32 on);
+
+/*
+ * 数某个核名册上处于 `st` 状态的线程 —— 11.2 判据的**独立**数据源
+ * (不看退出路径自己报的数,而是去名册里数;退出的线程按源 OS 留在名册上)。
+ */
+u32 sched_runq_count_status(u32 cpu_id, TaskStatus st);
 
 /* ------------------------------------------------------------------ */
 /* ★ 睡眠与唤醒(M4-8.4)★                                             */

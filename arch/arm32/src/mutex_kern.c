@@ -283,3 +283,24 @@ u32 console_mutex_legacy_refused(void)
 {
     return g_console_legacy_refused;
 }
+
+/*
+ * ★ M4-11.2 的绊线:当前线程是不是**正持着串口锁**。
+ *
+ * 为什么需要它:源 OS 的 `mutex->owner` **从不注销**(`include/mutex.h:17`,
+ * 清零点只有 unlock/destroy)。在"线程不会退出"的世界里那不构成问题;
+ * 而 M4-11.2 让"线程会退出"第一次变得可达 ⇒ **持锁线程退出**就成了一个
+ * 真实的死锁源:锁永远回不来,下一次 `console_excl_begin()` 会一直等下去
+ * (等锁者睡一个 tick 再重试,于是表现为"串口再也不出声",不报任何东西)。
+ *
+ * ⚠ 处置是**报警而不是修**:源 OS 没有"退出时注销 owner"这回事,
+ *   按 2026-09-13 的决定不发明它。所以退出路径上问一句、计数、进报告
+ *   (判据恒为 0),同时报告里有一条**正向对照**(故意在持锁时问一次,
+ *   必须为真)证明这条绊线接在了正确的信号上,而不是永远为假。
+ */
+bool console_mutex_owner_is_current(void)
+{
+    tcb_t owner = mutex_get_owner(&g_console_mutex);
+
+    return (owner != NULL) && (owner == sched_current());
+}

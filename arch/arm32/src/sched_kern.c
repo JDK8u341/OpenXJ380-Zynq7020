@@ -87,6 +87,18 @@ static kern_runq_t g_runq[PERCPU_MAX_CPUS];
  */
 static u32 g_pick_cpu0;
 
+/*
+ * ★ M4-11.2:退出路径的计数与"退回到 WAIT 挂起"的对照组开关 ★
+ *
+ * `g_exit_count`   真的有线程走到过退出路径(判据的非空转条件)
+ * `g_exit_refused` "有代码想停 idle" —— 源 OS 也会拒绝(`kill_thread` 的
+ *                  `TASK_IDLE_LEVEL` 那一支),但我们的做成可读的计数
+ * `g_exit_legacy`  置 1 时退出路径写 `WAIT` 而不是 `DEATH`(只给 A/B 用)
+ */
+static u32 g_exit_count;
+static u32 g_exit_refused;
+static u32 g_exit_legacy;
+
 void sched_set_pick_cpu0(u32 on)
 {
     g_pick_cpu0 = on;
@@ -619,30 +631,157 @@ void sched_yield(void)
 /*
  * 把自己挂起,然后切走。
  *
- * ⚠ 必须走 `sched_yield()` 而不是自己去挑下一个并 `arch_ctx_switch`:
- *   内核线程跑在自己的内核栈上,"切走"只有一条合法路径 ——
- *   经过异常帧,让 `rfeia` 把栈和 CPSR 一起换掉。直接从 C 里跳走
- *   会留在同一个栈上,那不是切换。
- *
- * ⚠ 本函数不会返回:状态是 WAIT,调度器不会再挑中自己。
- *   真返回了说明调度器出了别的问题,那就让它继续跑 ——
- *   在自检探针里,继续跑会立刻把 `done` 之后的死循环暴露出来。
+ * ⚠ **M4-11.2 起它没有调用者了** —— 自检探针改走 `sched_thread_exit()`
+ *   (源 OS 的形状:置 `DEATH` 而不是 `WAIT`)。
+ *   按本项目对"没人用的东西"的规矩(D10/D11)它已经**删掉**;
+ *   这里留一段说明,免得后来者以为它丢了 —— 它的历史用途是
+ *   "探针干完活挂起",而那个语义现在由退出路径承担。
  */
-void sched_park_self(void)
+
+/*
+ * ★★★ M4-11.2:线程退出 —— 源 OS 两段式的**第一段** ★★★
+ *
+ * ← `pcb.cpp:494-505` 的 `process_exit()`(内核线程入口 return 后落在那里):
+ *
+ *      write_serial_string("Kernel thread exit, Code: ");
+ *      kill_thread(get_current_task());      // 只置 DEATH,不释放任何东西
+ *      open_interrupt;
+ *      while (true) hlt;                     // ← 永久停住(正常到不了)
+ *
+ * ← `kill_thread()` `pcb.cpp:447-458`:
+ *
+ *      if (task->task_level == TASK_IDLE_LEVEL) { 打印 "Cannot stop kernel thread."; return; }
+ *      task->status = DEATH;
+ *      // kill_thread0(task);   ← ★ 注释掉的:释放是**回收者**的活 ★
+ *
+ * ====================================================================
+ * ★ 为什么只做第一段(以及"不回收"这个决定)★
+ * ====================================================================
+ *
+ * 源 OS 里 `kill_thread0()`(还栈 + 摘队 + 由调用者 free TCB)只被
+ * `kill_proc0` → `kill_proc` 调到,而 `kill_proc` 对 `kernel_group`
+ * 直接 return("Cannot kill System process.");内核线程的 `parent_group`
+ * 正是 `kernel_group` ⇒ **那三句没有任何可达路径**(完整证据链见
+ * `docs/PTASK.md` §2.5/§9.3)。
+ *
+ * ★ 2026-09-13 的决定是**不改源 OS 的行为**:只补上"退出"这一段,
+ *   不引入源 OS 没有的回收器。代价是内核栈池**只增不减**
+ *   (`KSTACK_SLOTS` 个 1 MiB 槽,启动自检用掉一大半)⇒ 容量靠
+ *   `kstack_peak_used` / `kstack_headroom` 两条判据盯着。
+ *
+ * ⚠ 与 D14 那句原话的差别:"线程没有退出路径"这个描述在 M4-11.2 之后
+ *   不再成立 —— 它**有**退出路径(就是本函数),只是退出**不释放资源**。
+ *   这正是源 OS 的既成事实。
+ *
+ * ⚠ 本函数**不会返回**(除非调用者是 idle —— 那说明调用方用错了)。
+ *   状态置成 DEATH 之后:
+ *     - `is_task_schedulable` 不再把它当候选(`sched_status_runnable`
+ *       只认 RUNNING/START/CREATE);
+ *     - 兜底链 `sched_current_runnable(current) ? current : idle` 也不再兜到它
+ *       ⇒ `sched_yield()` 那一下必定切走,而且**再也切不回来**。
+ */
+void sched_thread_exit(void)
 {
     tcb_t cur = sched_current();
 
     if (cur == NULL) {
+        return; /* 没有 current:启动极早期,谈不上"退出" */
+    }
+
+    /*
+     * ← `kill_thread` 的唯一拒绝条件(`pcb.cpp:450`)。源 OS 那句打印没有换行、
+     *   而且 `kill_thread` 返回 `void`(调用者拿不到反馈)—— 我们把它做成
+     *   **可读的计数**,因为它一旦非 0 就意味着"有代码想停 idle"。
+     */
+    if (cur->task_level == TASK_IDLE_LEVEL) {
+        g_exit_refused++;
         return;
     }
-    if (cur->task_level == TASK_IDLE_LEVEL) {
-        return; /* 启动上下文不能把自己停掉 —— 停了就没人再跑启动了 */
+
+    if (g_exit_legacy != 0u) {
+        /*
+         * ★ 破坏性 A/B:M4-11.2 之前的行为 —— 置 WAIT 挂起 ★
+         *
+         * `wakeup_time = 0` 是"不按时间唤醒"(不是"立刻唤醒"),于是它同样
+         * 再也不会被选中。两边的"线程停住了"完全一样,唯一的差别是
+         * **名册上的状态**:WAIT vs DEATH。这正是判据要区分的东西。
+         */
+        cur->status      = WAIT;
+        cur->wakeup_time = 0u;
+        sched_yield();
+        for (;;) {
+            arch_wfi();
+        }
     }
 
-    cur->status      = WAIT;
-    cur->wakeup_time = 0u; /* 0 = **不按时间唤醒**,不是"立刻唤醒" */
+    cur->status = DEATH; /* ← `kill_thread` `:456` */
+    g_exit_count++;      /* 诊断:真的有线程走到这里(判据的非空转条件)*/
 
+    /*
+     * 让出。走的是**同一条**切换路径(`svc` 陷阱 → `sched_tick` → 搬帧),
+     * 所以"退出"与"被抢占"在机制上没有分叉 —— 与源 OS 一样。
+     */
     sched_yield();
+
+    /*
+     * 正常路径到不了这里(DEATH 不再被选中)。留着与源 OS 的
+     * `while (true) hlt` 同形同义:**最后一道保险**,而不是"idle 省电"。
+     * 真被切回来只可能是调度器出了别的问题。
+     */
+    for (;;) {
+        arch_wfi();
+    }
+}
+
+u32 sched_thread_exit_count(void)
+{
+    return g_exit_count;
+}
+
+u32 sched_thread_exit_refused(void)
+{
+    return g_exit_refused;
+}
+
+/*
+ * ★ 破坏性 A/B:让退出路径**退回 M4-11.2 之前的行为**(置 WAIT 挂起)★
+ *
+ * 只改一件事:状态写 `WAIT` 而不是 `DEATH`。于是"线程不再跑"这件事两边一样
+ * (都不会再被选中),差别只在**名册上的状态** —— 而那正是要证的:
+ * "退出语义真的接上了",而不是"线程恰好停住了"。
+ * 生产路径上恒为 0。
+ */
+void sched_set_exit_legacy(u32 on)
+{
+    g_exit_legacy = on;
+}
+
+/*
+ * 数一数某个核的名册上处于 `st` 状态的线程。
+ *
+ * 它是 11.2 判据的**独立**数据源:不看 `sched_thread_exit()` 自己报的数,
+ * 而是**去名册里数**(源 OS 的队列就是"全部线程的名册",退出的线程留在上面)。
+ * 取锁是必须的 —— 另一个核可能正在往这个队列里放线程。
+ */
+u32 sched_runq_count_status(u32 cpu_id, TaskStatus st)
+{
+    kern_runq_t *kq = runq_of(cpu_id);
+    const tcb_t *link;
+    u32          n = 0u;
+
+    if (kq == NULL) {
+        return 0u;
+    }
+
+    spin_lock(&kq->lock);
+    for (link = &kq->q.head; *link != NULL; link = &(*link)->sched_next) {
+        if ((*link)->status == st) {
+            n++;
+        }
+    }
+    spin_unlock(&kq->lock);
+
+    return n;
 }
 
 u32 sched_switch_count(void)

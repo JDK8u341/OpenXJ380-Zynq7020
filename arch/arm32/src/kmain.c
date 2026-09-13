@@ -108,11 +108,16 @@ static u32 g_vmap_live_ok;
  *   kernel/task/pcb.cpp: 每个任务成对分配 kernel_stack 与 syscall_stack,
  *                        两个栈都用这个大小。
  *
- * 所以一个任务实占 2MB 栈,32 个栈 = 16 个任务。
- * 任务真要用**两个**栈这件事在 M4-6/M4-7 落地(那时 kstack_alloc 会被
- * 连着调两次);这里先把池按这个口径开出来,免得池小到要用时才返工。
- * "等用到再说"在这里的代价是改一个常量,而代价不在常量本身 ——
- * 在于池的分区方式一旦被别的代码依赖,改起来就不是改常量了。
+ * ★ M4-11.2:槽数 32 → **64**,而且**理由变了** ★
+ *
+ * 原来 32 槽是按"16 个任务 × 2 栈"的口径开的。M4-11.2 决定**退出不回收**
+ * 内核栈(`docs/PTASK.md` §4.0:尊重源 OS —— 它的内核线程退出后同样不释放),
+ * 于是**池容量 = 每次启动能创建的内核线程数上限**,而不是"同时活跃的线程数"。
+ * 启动自检本身要造三十来个线程,32 槽已经贴边(实测余量只剩几个)⇒ 扩到 64。
+ *
+ * ⚠ `KSTACK_MAX_SLOTS` 在 `arch/kstack.h` 里就是 **64**(位图按它定长),
+ *   再往上要同时改那个头文件与池的实现 —— 所以这是一次**有上限**的扩容。
+ * ⚠ 代价是 64.25MB DDR(原 32.125MB),由 palloc 一次性划出。
  *
  * ====================================================================
  * 为什么单独一个 vmap 实例
@@ -122,12 +127,12 @@ static u32 g_vmap_live_ok;
  * 已经把它的区间(测试区)用掉了。栈池的区间来自 palloc,地址与它无关,
  * 所以必须另开一个实例、另给一份 L2 表池。
  *
- * L2 表需求:池 32.125MB,最多跨 34 个 1MB 段,每段一张表,留 40 张。
+ * L2 表需求:池 64.25MB,最多跨 66 个 1MB 段,每段一张表,留 72 张。
  */
-#define KSTACK_SLOTS       32u
+#define KSTACK_SLOTS       64u
 #define KSTACK_STACK_PAGES 256u /* 1MB */
 #define KSTACK_POOL_PAGES  (KSTACK_SLOTS * (KSTACK_STACK_PAGES + 1u))
-#define KSTACK_L2_TABLES   40u
+#define KSTACK_L2_TABLES   72u
 
 static u32    g_l2_pool_stack[KSTACK_L2_TABLES * VMAP_L2_ENTRIES] __attribute__((aligned(1024)));
 static vmap_t g_vmap_stack;
@@ -252,28 +257,73 @@ static u32 g_smp_ctl_cpu0_delta;
 #define YIELD_ROUNDS 8u
 
 /*
+ * ★ M4-11.2:把探针"挂起",但**已经退出的线程不许改** ★
+ *
+ * 各对照组收尾时会把探针置成 `WAIT`(那是 M4-11.2 之前"挂起"的唯一办法)。
+ * 现在探针干完活会**退出**(`status = DEATH`),把 DEATH 改回 WAIT 会把
+ * "它死了"这件事抹掉:名册上从此看不出退出过,而 11.2 的判据正是
+ * **去名册里数 DEATH**(`sched_runq_count_status`)。
+ *
+ * 所以收尾统一走这里:死的保持死,活着的才挂起。
+ */
+static void probe_park(tcb_t t)
+{
+    if (t == NULL || t->status == DEATH) {
+        return;
+    }
+
+    t->status      = WAIT;
+    t->wakeup_time = 0u;
+}
+
+/*
  * ★ 探针线程的"干完活了" ★
  *
  * ← 源 OS `pcb.cpp:501-504`:
  *       kill_thread(get_current_task());
  *       open_interrupt;
  *       while (true) __asm__ volatile("hlt");
- *   也就是"把线程回收掉,然后在 `hlt` 上永久停住"。
- *   ARM 侧的对应物就是 `park` + `wfi` 死循环 —— **`wfi` 在这里是对的**
+ *   也就是"把线程标记为死,然后在 `hlt` 上永久停住"。
+ *   ARM 侧的对应物就是 `DEATH` + `wfi` 死循环 —— **`wfi` 在这里是对的**
  *   (它的正当用途是"永久停住",不是"idle 省电";见 arch/cpu.h 的说明)。
  *
- * ⚠ 但本函数**目前不可达**(退化清单 D14):
- *   M4-11 之前没有线程退出机制,`sched_park_self()` 对一条真实线程
- *   **不会返回**(状态置 WAIT、`wakeup_time = 0`,再也不会被挑中)。
- *   所以下面那个循环是"到不了的第二道保险",留着是为了**语义完整**
- *   (线程不能从入口返回),而不是因为它有用。
+ * ★ M4-11.2:这一段**现在是活的** ★
  *
- *   ⇒ 它看起来像一项策略,其实不是。等 M4-11 有了 `kill_thread` 的对应物,
- *     这个函数才真的会被执行到。
+ * 在它之前,`sched_park_self()` 对一条真实线程不会返回,于是下面那段
+ * 循环"到不了"(D14)。现在走 `sched_thread_exit()`(置 `DEATH` + 让出),
+ * 语义与源 OS 一致:线程**退出了**,只是**不释放任何资源**(决定,不是没做完)。
+ *
+ * ⚠ 这里那条绊线是给"线程会退出"这件事收尾的:`mutex->owner` 在源 OS 里
+ *   从不注销 ⇒ **持着串口锁退出**会把锁永久带走(下一次打印会一直等下去,
+ *   而且不报任何东西)。源 OS 没有"退出时注销 owner"这回事,按 2026-09-13
+ *   的决定**不发明它**,只把这种情况记成可读的计数。
  */
+static volatile u32 g_exit_guard_fired;    /* 生产路径上"持着锁退出"的次数(必须 0)*/
+static volatile u32 g_exit_guard_selftest; /* 绊线的正向对照(故意触发一次,必须 1)*/
+
+/*
+ * 绊线的判据体。**一处实现、两处使用**:
+ *   - 生产路径:`thread_finish()` 里问一次;
+ *   - 正向对照:报告区间里问一次(那时 kmain 正持着串口锁)——
+ *     它证明这条绊线接在**正确的信号**上,而不是一个永远为假的常量。
+ */
+static bool exit_lock_guard(void)
+{
+    return console_mutex_owner_is_current();
+}
+
 static void thread_finish(void)
 {
-    sched_park_self();
+    if (exit_lock_guard()) {
+        g_exit_guard_fired++;
+    }
+
+    sched_thread_exit(); /* ★ 不返回(状态已置 DEATH)*/
+
+    /*
+     * 只有"被拒绝"(调用者是 idle)才可能到这里 —— 那是调用方用错了,
+     * 而不是本函数该继续跑。与源 OS 的 `while (true) hlt` 同形。
+     */
     for (;;) {
         arch_wfi();
     }
@@ -710,6 +760,24 @@ static void status_thread_ctl(void *arg)
         g_status_ctl_wakes++;
         g_status_ctl_printed++;
     }
+}
+
+/*
+ * ★ M4-11.2 的破坏性 A/B 用的探针:跑一步就"干完活" ★
+ *
+ * 它做的唯一一件事就是调 `thread_finish()` —— 也就是**退出路径本身**。
+ * 生产路径下它把自己标记成 `DEATH`;对照组(`sched_set_exit_legacy(1)`)下
+ * 退回 M4-11.2 之前的 `WAIT` 挂起。两边"线程停住了"完全一样,
+ * 差别**只在名册上的状态** ⇒ 判据证明的是"退出语义真的接上了",
+ * 而不是"线程恰好停住了"。
+ */
+static volatile u32 g_exit_ab_ran;
+
+static void exit_ab_probe(void *arg)
+{
+    (void)arg;
+    g_exit_ab_ran++;
+    thread_finish();
 }
 
 /*
@@ -3163,8 +3231,7 @@ void kmain(void)
              *   这件事是**说出来的**,而不是推出来的。
              */
             for (i = 0u; i < STARVE_K; i++) {
-                sv[i]->status      = WAIT;
-                sv[i]->wakeup_time = 0u;
+                probe_park(sv[i]); /* ⚠ 已退出的别改回 WAIT(M4-11.2)*/
             }
             starve_arm(NULL, 0u);
         }
@@ -3415,6 +3482,21 @@ void kmain(void)
      */
     console_printf(" Irq frame   : C handler entry SP misaligned %u times (修复前它应当等于上面那个数)\n",
                    c_handler_sp_violations());
+
+    /*
+     * ★ M4-11.2:线程池与退出路径的读数 —— 打在报告区间**之外** ★
+     *
+     * 池**只增不减**(决定:退出不回收,见 `docs/PTASK.md` §4.0)⇒
+     * "这次启动一共用掉多少槽"是每次都要看得见的事实,而不是一个只在
+     * 快满的时候才红一次的判据。报告区间里只放 0/1 判据(格式是机器解析的),
+     * 所以这些数走普通输出行。
+     */
+    console_printf(" Kernel stack: peak_used=%u of %u (headroom=%u)"
+                   "  threads: exit=%u death=%u refused=%u\n",
+                   g_kstack.peak_used, g_kstack.slot_count,
+                   g_kstack.slot_count - g_kstack.peak_used, sched_thread_exit_count(),
+                   sched_runq_count_status(0u, DEATH) + sched_runq_count_status(1u, DEATH),
+                   sched_thread_exit_refused());
 
     selftest_begin();
     /*
@@ -3807,6 +3889,45 @@ void kmain(void)
                     console_mutex_lock_errors() + console_mutex_unlock_errors(), 0u, SELFTEST_EQ);
 
     /*
+     * ---- ★ M4-11.2:线程退出路径(D14 结案)★ ----
+     *
+     * 五条判据,分成三组,每组的失败含义不同:
+     *
+     *   非空转(否则后面全是空话):
+     *     `kthread_exit_reached`  真的**有线程走到过退出路径**(不是"编译过"而已)
+     *     `kthread_exit_lock_guard` 绊线的**正向对照** —— 此刻 kmain 正持着串口锁,
+     *                             问一句必须为真。它证明"持锁退出"那条绊线接在
+     *                             正确的信号上,而不是一个恒假的常量(坑 43 的同一类)
+     *
+     *   判据本身:
+     *     `kthread_exit_death`    ★ 去**名册里数** `status == DEATH` 的线程 ★
+     *                             这是"退出语义照源 OS"的证据 —— 它是 `DEATH`,
+     *                             不是 `WAIT`(后者是 M4-11.2 之前的挂起)
+     *     `kthread_exit_held_lock` 持着串口锁退出的次数(必须 0)。`mutex->owner`
+     *                             在源 OS 里从不注销,所以这种情况会**永久**
+     *                             带走那把锁(`docs/PTASK.md` §5 第 4 条)
+     *
+     *   容量(★ 不回收 ⇒ 这是永久判据,不是临时哨兵 ★):
+     *     `kthread_exit_refused`   "有代码想停 idle" 的次数(源 OS 也会拒绝)
+     *     `kstack_peak_used`       池的峰值用量(数值本身要能看见)
+     *     `kstack_headroom`        余量 ≥ 4
+     */
+    selftest_report("kthread_exit_reached", (sched_thread_exit_count() > 0u) ? 1u : 0u, 1u,
+                    SELFTEST_EQ);
+    selftest_report("kthread_exit_death",
+                    sched_runq_count_status(0u, DEATH) + sched_runq_count_status(1u, DEATH), 1u,
+                    SELFTEST_GE);
+    selftest_report("kthread_exit_refused", sched_thread_exit_refused(), 0u, SELFTEST_EQ);
+    /*
+     * ⚠ 绊线的正向对照必须在**持锁**的时候问 —— 报告区间正好满足
+     *   (kmain 从 `console_excl_begin()` 起一直持着串口锁)。
+     */
+    g_exit_guard_selftest = exit_lock_guard() ? 1u : 0u;
+    selftest_report("kthread_exit_lock_guard", g_exit_guard_selftest, 1u, SELFTEST_EQ);
+    selftest_report("kthread_exit_held_lock", g_exit_guard_fired, 0u, SELFTEST_EQ);
+    selftest_report("kstack_peak_used", g_kstack.peak_used, g_kstack.slot_count - 4u, SELFTEST_LE);
+
+    /*
      * `invalid_ctx` 必须恒为 0:它不是"发生过多少件坏事"的计数,
      * 而是"调度器有没有挑到过不可切换的上下文"。挑了就是有 bug ——
      * 正常路径上 idle 的 pc==0 只在注册与第一次切走之间成立,
@@ -4035,6 +4156,78 @@ void kmain(void)
      */
     sched_set_pick_cpu0(1u);
 
+    /* ---- 9.73 线程退出路径的破坏性对照组(必须在自检报告**之后**)---- */
+    /*
+     * ## 对照的是什么
+     *
+     * 同一个探针线程、同一段等待,只把"干完活之后怎么停"换掉:
+     *
+     *   A(生产路径)  `thread_finish()` → `sched_thread_exit()` ⇒ 名册上 `DEATH`
+     *   B(对照组)    `sched_set_exit_legacy(1)` ⇒ 退回 `WAIT` 挂起(M4-11.2 之前)
+     *
+     * 两边的"线程不再被选中"完全一样 —— 所以**只看"它停了没有"判不出来**。
+     * 能判出来的是**名册上的状态**,而那是去名册里数出来的
+     * (`sched_runq_count_status`,独立于退出路径自己报的数):
+     *
+     *   A:`DEATH` 计数 +1     B:`DEATH` 计数不变(它变成了 WAIT)
+     *
+     * ⚠ 非空转条件两项,缺一不可:`ran` 必须为 1(探针真的跑到了那一步),
+     *   两个线程都必须造出来(否则"计数没涨"只是因为**什么都没发生**)。
+     *   这是坑 43 的同一类。
+     */
+    {
+        tcb_t pa;
+        tcb_t pb;
+        u32   death0;
+        u32   death_a;
+        u32   death_b;
+        u32   ran_a;
+        u32   ran_b;
+
+        death0  = sched_runq_count_status(0u, DEATH) + sched_runq_count_status(1u, DEATH);
+        death_a = death0;
+        death_b = death0;
+        ran_a   = 0u;
+        ran_b   = 0u;
+
+        /* ---- A:生产路径(退出 ⇒ DEATH)---- */
+        sched_set_exit_legacy(0u);
+        sched_disable(); /* 造线程的窗口照旧罩起来 */
+        g_exit_ab_ran = 0u;
+        pa            = sched_kthread_create(exit_ab_probe, NULL, "exa");
+        sched_enable();
+
+        if (pa != NULL) {
+            wait_ms_wall(200u);
+            ran_a   = g_exit_ab_ran;
+            death_a = sched_runq_count_status(0u, DEATH) + sched_runq_count_status(1u, DEATH);
+        }
+
+        /* ---- B:对照组(退回 WAIT 挂起)---- */
+        sched_set_exit_legacy(1u);
+        sched_disable();
+        g_exit_ab_ran = 0u;
+        pb            = sched_kthread_create(exit_ab_probe, NULL, "exb");
+        sched_enable();
+
+        if (pb != NULL) {
+            wait_ms_wall(200u);
+            ran_b   = g_exit_ab_ran;
+            death_b = sched_runq_count_status(0u, DEATH) + sched_runq_count_status(1u, DEATH);
+        }
+        sched_set_exit_legacy(0u);
+
+        console_excl_begin();
+        console_printf(" Exit A/B    : death=%u -> %u (probe ran=%u)  legacy: death=%u (probe ran=%u)\n",
+                       death0, death_a, ran_a, death_b, ran_b);
+        console_printf(" Exit A/B    : exit-path(DEATH) vs wait-park(WAIT) -> %s\n",
+                       ((pa != NULL) && (pb != NULL) && (ran_a == 1u) && (ran_b == 1u) &&
+                        ((death_a - death0) >= 1u) && (death_b == death_a))
+                           ? "DETECTED"
+                           : "NOT DETECTED");
+        console_excl_end();
+    }
+
     /* ---- 9.75 抢占的破坏性对照组(必须在自检报告**之后**)---- */
     /*
      * 为什么必须在报告之后:对照组会**故意把调度状态搅歪**
@@ -4196,10 +4389,8 @@ void kmain(void)
              * 是 kmain 那一刻的现场(那发 IRQ 的帧在 kmain 的启动栈上,
              * 落在它们自己那块栈区之外) —— 那是垃圾,只能挂起,不能留着。
              */
-            ca->status      = WAIT;
-            ca->wakeup_time = 0u;
-            cb->status      = WAIT;
-            cb->wakeup_time = 0u;
+            probe_park(ca);
+            probe_park(cb);
             g_reloc_skip    = 0u;
 
             sched_set_current(sched_boot_idle());
@@ -4343,11 +4534,9 @@ void kmain(void)
                            g_vfp_ctl_detected ? "检出" : "未检出 —— 判据不承重!");
             console_excl_end();
 
-            /* 收拾:挂起两个探针(它们此后不再被调度)*/
-            ca->status      = WAIT;
-            ca->wakeup_time = 0u;
-            cb->status      = WAIT;
-            cb->wakeup_time = 0u;
+            /* 收拾:挂起两个探针(它们此后不再被调度;⚠ 已退出的不许改回 WAIT)*/
+            probe_park(ca);
+            probe_park(cb);
             g_vfp_skip      = 0u;
 
             sched_set_current(sched_boot_idle());
@@ -4399,9 +4588,8 @@ void kmain(void)
                            g_wake_ctl_detected ? "检出" : "未检出 —— 判据不承重!");
             console_excl_end();
 
-            /* 收拾:挂起探针 */
-            sc->status      = WAIT;
-            sc->wakeup_time = 0u;
+            /* 收拾:挂起探针(⚠ 已退出的不许改回 WAIT)*/
+            probe_park(sc);
             g_wake_skip     = 0u;
 
             sched_set_current(sched_boot_idle());
@@ -4523,8 +4711,7 @@ void kmain(void)
              * 前四个对照组已经被这件事咬过一次(见 9.75 那段留痕)。
              */
             for (i = 0u; i < STARVE_K; i++) {
-                sa[i]->status      = WAIT;
-                sa[i]->wakeup_time = 0u;
+                probe_park(sa[i]); /* ⚠ 同上:已经退出的保持 DEATH */
             }
             starve_arm(NULL, 0u); /* 撤销观察名单:现在没有东西在被监视 */
             g_pick_sticky = 0u;
@@ -4654,6 +4841,22 @@ void kmain(void)
         /* 收拾:开关恢复成生产值(0 = 挑最短队列)*/
         sched_set_pick_cpu0(0u);
     }
+
+    /*
+     * ★ M4-11.2:全部对照组跑完之后的**最终**池用量 ★
+     *
+     * 启动到报告那一刻只用到 20 个槽,而报告**之后**的七组对照组还要再造
+     * 十几个线程 —— 那些同样是"退出了也不还"的。所以这个数才是
+     * "一次启动一共要吃多少"的答案,它必须打出来:
+     * 池容量(`KSTACK_SLOTS`)就是照它定的(不回收 ⇒ 容量 = 每次启动的上限)。
+     */
+    console_excl_begin();
+    console_printf(" Kernel stack: final peak_used=%u of %u (headroom=%u)"
+                   "  threads: exit=%u death=%u\n",
+                   g_kstack.peak_used, g_kstack.slot_count,
+                   g_kstack.slot_count - g_kstack.peak_used, sched_thread_exit_count(),
+                   sched_runq_count_status(0u, DEATH) + sched_runq_count_status(1u, DEATH));
+    console_excl_end();
 
     /* ---- 9.7 切换器的破坏性对照组(必须在自检报告**之后**)---- */
     /*
