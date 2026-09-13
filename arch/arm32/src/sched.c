@@ -10,6 +10,22 @@
 #include <krlibc.h>
 
 /* ------------------------------------------------------------------ */
+/* ★ 破坏性 A/B:跳过扫描里的唤醒 ★                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 置 1 时 `sched_queue_scan()` 仍会遍历队列,但**不唤醒**到点的睡眠任务。
+ *
+ * 这是"唤醒发生在扫描里"这件事的对照组:关掉它,睡下去的任务就
+ * **永远醒不过来** —— 而"取队首"的那一版 M4-8 本来就等于一直关着它。
+ *
+ * ⚠ 定义在**纯逻辑层自己这里**,不在 `sched_kern.c`:
+ *   `sched_queue_scan` 是宿主可测的,宿主编译单元里必须能解析这个符号,
+ *   否则宿主单测链接不过。生产路径上恒为 0。
+ */
+u32 g_wake_skip;
+
+/* ------------------------------------------------------------------ */
 /* 策略原语                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -164,7 +180,7 @@ void sched_queue_init(sched_queue_t *q)
     q->count = 0u;
 }
 
-bool sched_queue_insert(sched_queue_t *q, tcb_t t)
+bool sched_queue_append(sched_queue_t *q, tcb_t t)
 {
     tcb_t *link;
 
@@ -173,11 +189,17 @@ bool sched_queue_insert(sched_queue_t *q, tcb_t t)
     }
 
     /*
-     * ⚠ 重复插入必须被拒绝,而不是静默地挂两次。
+     * ← `queue_enqueue()` → `queue_append_node()`(`kernel/lock_queue.cpp:100`):
+     *   **追加到尾部,不排序。**
      *
-     * 挂两次的后果不是"这个任务被调度两次",而是**链表被做成环** ——
-     * 之后任何一次遍历都会无限循环。这类错误在板上表现为"某个核突然不动了",
-     * 而现场完全看不出原因。所以这里宁可多走一遍队列也要查重。
+     * ⚠ M4-8 第一版这里是"按 deadline 有序插入,于是队首就是应选者"。
+     *   那是我发明的:源 OS 的队列是普通 FIFO,**选取靠全表扫描**
+     *   (`select_next_task_safe`)。排序版不只是"不一样",它还有直接后果 ——
+     *   唤醒睡眠任务的那次扫描在 `select_next_task_safe` 里,而"取队首"
+     *   的写法里没有那次扫描,于是睡下去的任务永远醒不过来。
+     *
+     * ⚠ 查重仍然保留,而且比源 OS 严格:挂两次会把链表做成环,
+     *   之后任何一次遍历都无限循环(表现是"某个核突然不动了")。
      */
     for (link = &q->head; *link != NULL; link = &(*link)->sched_next) {
         if (*link == t) {
@@ -185,15 +207,8 @@ bool sched_queue_insert(sched_queue_t *q, tcb_t t)
         }
     }
 
-    /* 按 deadline 有序插入:队首即"应选者",sched_pick 于是是 O(1) */
-    for (link = &q->head; *link != NULL; link = &(*link)->sched_next) {
-        if (sched_deadline_before(t, *link)) {
-            break;
-        }
-    }
-
-    t->sched_next = *link;
     *link         = t;
+    t->sched_next = NULL;
     q->count++;
 
     return true;
@@ -219,17 +234,19 @@ void sched_queue_remove(sched_queue_t *q, tcb_t t)
     }
 }
 
-tcb_t sched_pick(const sched_queue_t *q)
-{
-    if (q == NULL) {
-        return NULL;
-    }
-
-    return q->head;
-}
-
 u64 sched_queue_avg_vruntime(const sched_queue_t *q, tcb_t ignore, u64 fallback)
 {
+    /*
+     * 只算平均、**不唤醒**的只读版本。
+     *
+     * 源 OS 没有这个函数:`queue_average_vruntime` 一定会顺带唤醒。
+     * 这里留一个纯读的版本,是给两处"不该有副作用"的场景用的:
+     *   - 宿主单测里核对平均值本身;
+     *   - `sched_kthread_create()` 给新线程定 vruntime 起点。
+     *     (源 OS 在 `add_task()` 里调的也是 `queue_average_vruntime`,
+     *      职责是 `queue_average_vruntime(..., NULL, now, NULL, NULL)` ——
+     *      传 NULL 的 fallback/idle,于是只取平均值那一路。)
+     */
     const tcb_t *link;
     u64          sum   = 0u;
     u64          count = 0u;
@@ -247,6 +264,149 @@ u64 sched_queue_avg_vruntime(const sched_queue_t *q, tcb_t ignore, u64 fallback)
     }
 
     return (count == 0u) ? fallback : (sum / count);
+}
+
+u64 sched_queue_scan(const sched_queue_t *q, tcb_t current, u64 now, tcb_t *out_fallback, tcb_t *out_idle)
+{
+    /* ← `queue_average_vruntime()` `scheduler.cpp:256-287`,逐句对应 */
+    const tcb_t *link;
+    u64          sum   = 0u;
+    u64          count = 0u;
+
+    if (out_fallback != NULL) {
+        *out_fallback = NULL;
+    }
+    if (out_idle != NULL) {
+        *out_idle = NULL;
+    }
+    if (q == NULL) {
+        return 0u;
+    }
+
+    for (link = &q->head; *link != NULL; link = &(*link)->sched_next) {
+        tcb_t candidate = *link;
+        /*
+         * 睡醒补偿的基准:有 current 就用 current 的 vruntime,
+         * 否则用候选自己的(源 OS 就是这个三元表达式)。
+         */
+        u64 wake_base = (current != NULL) ? current->eevdf_vruntime : candidate->eevdf_vruntime;
+
+        /* ★ 唤醒就发生在这里 ★ —— 遍历到谁就给谁一次机会 */
+        if (g_wake_skip == 0u) {
+            (void)sched_wake_if_due(candidate, now, wake_base);
+        }
+
+        if (candidate != current && candidate->task_level == TASK_IDLE_LEVEL && out_idle != NULL) {
+            *out_idle = candidate;
+        }
+
+        if (candidate == current) {
+            /*
+             * current 在队列里(源 OS 就是这样),它算不算进平均取决于
+             * "它现在还能不能跑" —— 注意这里用的是 `sched_current_runnable`,
+             * 它对 idle **不**早退,与候选那一路刻意不对称。
+             */
+            if (sched_current_runnable(candidate)) {
+                sum += candidate->eevdf_vruntime;
+                count++;
+            }
+        } else if (sched_task_schedulable(candidate, current)) {
+            sum += candidate->eevdf_vruntime;
+            count++;
+            if (out_fallback != NULL && sched_deadline_before(candidate, *out_fallback)) {
+                *out_fallback = candidate;
+            }
+        }
+    }
+
+    return (count == 0u) ? 0u : (sum / count);
+}
+
+void sched_mark_dispatched(tcb_t t, u64 now)
+{
+    /* ← `mark_task_dispatched()` `scheduler.cpp:304-314` */
+    if (t == NULL) {
+        return;
+    }
+
+    if (t->eevdf_slice < SCHED_MIN_SLICE_NS) {
+        t->eevdf_slice = SCHED_BASE_SLICE_NS;
+    }
+    /*
+     * ⚠ 只在 deadline 为 0 时才补算。这不是"防御性编程":deadline 为 0
+     *   表示"还没被算过"(新任务),而已有的 deadline 是**上次计费**的结果,
+     *   无条件重算会把它抹掉 —— 那会让公平性静默失真。
+     */
+    if (t->eevdf_deadline == 0u) {
+        t->eevdf_deadline = t->eevdf_vruntime + sched_slice(t);
+    }
+    t->eevdf_last_start = now;
+}
+
+tcb_t sched_select_next(const sched_queue_t *q, tcb_t current, u64 now)
+{
+    /* ← `select_next_task_safe()` `scheduler.cpp:316-362`
+     *   + `select_next_task()` `scheduler.cpp:364-378`,两段合成一个函数 */
+    tcb_t          fallback = NULL;
+    tcb_t          idle     = NULL;
+    tcb_t          best     = NULL;
+    tcb_t          result;
+    u64            avg;
+    const tcb_t   *link;
+
+    if (q == NULL || q->head == NULL) {
+        /*
+         * 源 OS 在这一支直接 return NULL(队列空),然后由 `select_next_task()`
+         * 兜成 current。这里合成一处,免得调用方记两条规则。
+         */
+        if (current != NULL && (current->status == RUNNING || current->status == START)) {
+            return current;
+        }
+        return NULL;
+    }
+
+    /* 1. current 自己也到点就唤醒(源 OS 在扫描**之前**单独做这一次) */
+    (void)sched_wake_if_due(current, now, (current != NULL) ? current->eevdf_vruntime : 0u);
+
+    /* 2. 扫描:唤醒 + 平均值 + fallback + idle */
+    avg = sched_queue_scan(q, current, now, &fallback, &idle);
+
+    /* 3. 闸门:fallback 达标就用它(源 OS `scheduler.cpp:340`) */
+    if (fallback != NULL && fallback->eevdf_vruntime <= avg) {
+        best = fallback;
+    }
+
+    /*
+     * 4. fallback 不达标时,在**合格者**里取 deadline 最小的
+     *    (源 OS `scheduler.cpp:344-354`)。
+     *
+     * ⚠ 源 OS 这里有 `if (best == NULL && fallback != NULL)` 这一层额外条件;
+     *   照抄。它的含义是"只有在有 fallback 时才做第二遍扫描"——
+     *   队列里没有任何可调度候选时,扫也扫不出东西。
+     */
+    if (best == NULL && fallback != NULL) {
+        for (link = &q->head; *link != NULL; link = &(*link)->sched_next) {
+            tcb_t candidate = *link;
+
+            if (sched_task_schedulable(candidate, current) && candidate->eevdf_vruntime <= avg &&
+                sched_deadline_before(candidate, best)) {
+                best = candidate;
+            }
+        }
+    }
+
+    if (best == NULL) {
+        best = fallback;
+    }
+
+    /* 5. 兜底链:best → current(可运行)→ idle(源 OS `scheduler.cpp:358`) */
+    result = (best != NULL) ? best : (sched_current_runnable(current) ? current : idle);
+
+    if (result != NULL) {
+        sched_mark_dispatched(result, now);
+    }
+
+    return result;
 }
 
 /* ------------------------------------------------------------------ */
@@ -293,22 +453,10 @@ bool sched_current_runnable(tcb_t t)
     return sched_status_runnable(t->status);
 }
 
-tcb_t sched_pick_next(const sched_queue_t *q, tcb_t current)
-{
-    const tcb_t *link;
-
-    if (q == NULL) {
-        return NULL;
-    }
-
-    for (link = &q->head; *link != NULL; link = &(*link)->sched_next) {
-        if (sched_task_schedulable(*link, current)) {
-            return *link;
-        }
-    }
-
-    return NULL;
-}
+/* (`sched_pick_next` 在这里 —— 它是 M4-9 中间的产物:"从队首往后找第一个
+ *  可调度的"。M4-8.4 对齐源 OS 之后它没有调用者了:`sched_select_next`
+ *  做的是**全表扫描 + avg_vruntime 闸门**,不是"取第一个合格的"。
+ *  删掉而不是留着 —— "声明与定义都在、就是没人调"会让人以为功能还在。) */
 
 /* ------------------------------------------------------------------ */
 /* ★ M4-9:帧搬迁 ★                                                    */

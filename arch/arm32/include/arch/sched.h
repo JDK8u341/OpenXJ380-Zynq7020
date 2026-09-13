@@ -60,14 +60,26 @@
 /* ------------------------------------------------------------------ */
 
 /*
- * 侵入式单链表:**节点就在 TCB 里**(`sched_next`),不为队列单独分配内存。
+ * 就绪队列。**照源 OS：插入序 FIFO,不排序**。
  *
- * 为什么不用源 OS 的 `lock_queue`:那个结构带独立的锁与节点分配,
- * 而 ARM 侧的可睡眠同步原语排在 M4-11 —— 现在只要一个能在宿主上
- * 穷尽测的、无副作用的队列。等 M4-11 需要跨核保护时再决定要不要换。
+ * ⚠ 这条在 M4-8 被我写错过一次:M4-S 第一版是"按 deadline 有序插入、
+ *   取队首就是应选者"。而源 OS 的队列(`lock_queue`)是 **FIFO 追加**
+ *   (`queue_enqueue` → `queue_append_node`),**选取靠全表扫描**
+ *   (`select_next_task_safe`):先算 `avg_vruntime`,再要求
+ *   `candidate->eevdf_vruntime <= avg`,在合格者里取 deadline 最小。
  *
- * ⚠ 只存"当前核"的队列,所以队列本身不需要锁;跨核迁移(M4-10)会用
- *   另一套机制,到那时再处理。
+ *   差别不只是"像不像":**唤醒睡眠任务的那次扫描在 `select_next_task_safe`
+ *   里**,取队首的写法里根本没有它 ⇒ 睡下去的任务永远醒不过来。
+ *   M4-8.4 要做的第一件事就是把这个账补上。
+ *
+ * 仍然沿用 M4-8 的两条 ARM 侧选择(与源 OS 的差别,各有理由):
+ *   - **内嵌 `sched_next` 指针**,不用源 OS 那种独立分配的 `lock_node`
+ *     (队列不需要额外分配,宿主测试也就不需要构造分配器);
+ *   - **无锁**:单核,只有 CPU0 碰它(M4-10 再定每核一把还是无锁)。
+ *
+ * ⚠ `current`(正在跑的那个)与睡眠中的任务**都留在队列里** —— 源 OS 就是这样,
+ *   靠 `sched_task_schedulable()` 把它们排除在候选之外。
+ *   队列是"全部线程的名册",不是"就绪链表"。
  */
 typedef struct
 {
@@ -77,10 +89,8 @@ typedef struct
 
 void  sched_queue_init(sched_queue_t *q);
 void  sched_queue_remove(sched_queue_t *q, tcb_t t);
-/* 按 deadline 有序插入(同 deadline 按 vruntime)。这样队首就是应选者 */
-bool  sched_queue_insert(sched_queue_t *q, tcb_t t);
-/* 队首(应选者);空队列返回 NULL */
-tcb_t sched_pick(const sched_queue_t *q);
+/* FIFO 追加(← `queue_enqueue` 的 `queue_append_node`)。重复插入被拒绝 */
+bool  sched_queue_append(sched_queue_t *q, tcb_t t);
 
 /* ------------------------------------------------------------------ */
 /* 策略原语(逐个对应源 OS 的同名函数)                                 */
@@ -114,8 +124,24 @@ bool sched_wake_if_due(tcb_t t, u64 now, u64 base_vruntime);
 /* 新线程的初始调度状态。源 OS 在 `init_task_eevdf_entity()` 里做同名的事 */
 void sched_entity_init(tcb_t t, u64 now);
 
-/* 纯函数:队列平均 vruntime(源 OS 的 `queue_average_vruntime` 用来算基准)。
- * 队列为空时返回 fallback */
+/* ← `queue_average_vruntime()` `scheduler.cpp:256`
+ *
+ * **它不只是算平均值** —— 它在遍历队列的同时:
+ *   1. **唤醒到点的睡眠任务**(`wake_sleeping_task`,基准是 `current` 的 vruntime);
+ *   2. 记下"可调度的候选里 deadline 最小的那个"(`*out_fallback`);
+ *   3. 记下队列里的 idle 任务(`*out_idle`,源 OS 用它做最后的兜底);
+ *   4. 把 `current`(若可运行)与各候选的 vruntime 一起计入平均。
+ *
+ * ★ 第 1 条是 M4-8.4 的关键:源 OS 里**唤醒就发生在这次扫描里**。
+ *   所以这个函数不能简化成"求个平均" —— 那正是 M4-8 的 `sched_pick`
+ *   (取队首)漏掉的那一步,也是睡眠任务醒不过来的原因。
+ *
+ * 队列为空(或没有可计入者)时返回 `fallback`。
+ */
+u64 sched_queue_scan(const sched_queue_t *q, tcb_t current, u64 now, tcb_t *out_fallback, tcb_t *out_idle);
+
+/* 保留一个"只算平均"的只读版本,给不需要唤醒的场景用(宿主测与新建线程定起点)。
+ * `ignore` 为 NULL 时统计全部。 */
 u64 sched_queue_avg_vruntime(const sched_queue_t *q, tcb_t ignore, u64 fallback);
 
 /* ------------------------------------------------------------------ */
@@ -145,18 +171,43 @@ bool sched_task_schedulable(tcb_t t, tcb_t current);
 bool sched_current_runnable(tcb_t t);
 
 /*
- * 从队首往后找第一个可调度的任务(源 OS 的 `select_next_task` 主干)。
+ * ★ M4-8.4:选取下一个任务 ← `select_next_task_safe()` + `select_next_task()`
+ *   (`scheduler.cpp:316-378`)
  *
- * 用"遍历"而不是"取队首",是因为队列里可能有**当前正在跑的那个**
- * (它被切回来之前会一直挂在队列里)—— 取队首会挑到自己,
- * 而 `is_task_schedulable(candidate, current)` 的第一条就是把 current 排除掉。
+ * 一次调用做完四件事(顺序与源 OS 一致):
+ *   1. `wake_sleeping_task(current, now, current->vruntime)` —— current 自己到点也唤醒;
+ *   2. `sched_queue_scan(...)` —— 扫描中唤醒所有到点的睡眠任务,并取回
+ *      `avg_vruntime` / `fallback` / `idle`;
+ *   3. 闸门:`fallback->vruntime <= avg` 就用它;否则在合格者里取 deadline 最小;
+ *      都不合格就退回 `fallback`;
+ *   4. 结果 = `best ? best : (current 可运行 ? current : idle)`,
+ *      并对结果做 `mark_task_dispatched`;
+ *   5. 最后 `select_next_task()` 的收尾:结果为 NULL 而 current 是
+ *      RUNNING/START 时返回 current。
  *
- * ⚠ idle **不在**就绪队列里(见 sched_kern.c 的说明):它的 vruntime 永远是 0,
- *   进了队列就会凭借最小的 deadline 把队首永远占住。
- *   源 OS 靠 `is_task_schedulable` 里那条 `task_level == TASK_IDLE_LEVEL`
- *   把它排除在候选之外,只在最后兜底时才用它 —— 这里等价地保留了那条排除。
+ * ⚠ 第 1、2 条里的**唤醒**是副作用,不是查询 —— 这个函数会改任务状态
+ *   (status / wakeup_time / vruntime / deadline / last_start)。
+ *   名字叫 "select" 有点轻描淡写,但源 OS 就是这么放的。
+ *
+ * ⚠ 需要 `now`,而不是自己去读时钟:本层是纯逻辑,宿主上要能构造
+ *   "过了 3ms" 这种场景。
  */
-tcb_t sched_pick_next(const sched_queue_t *q, tcb_t current);
+tcb_t sched_select_next(const sched_queue_t *q, tcb_t current, u64 now);
+
+/*
+ * ★ 破坏性 A/B:跳过扫描里的唤醒 ★
+ *
+ * 置 1 时 `sched_queue_scan()` 仍遍历队列但**不唤醒**到点的睡眠任务 ——
+ * 也就是"睡下去就永远醒不过来"。这正是 M4-8 "取队首"那一版的等效行为,
+ * 所以它是"唤醒发生在扫描里"这条判据承重的证明方式。
+ *
+ * ⚠ 定义在 `src/sched.c`(纯逻辑层自己持有),因为它必须能在宿主编译
+ *   单元里解析。生产路径上恒为 0。
+ */
+extern u32 g_wake_skip;
+
+/* ← `mark_task_dispatched()` `scheduler.cpp:304` */
+void sched_mark_dispatched(tcb_t t, u64 now);
 
 /* ------------------------------------------------------------------ */
 /* ★ M4-9:帧搬迁 ★                                                    */
@@ -297,15 +348,49 @@ tcb_t sched_kthread_create(void (*entry)(void *), void *arg, const char *name);
 void sched_yield(void);
 
 /*
- * 把自己挂起(status = WAIT,wakeup_time = 0 = 不按时间唤醒),然后切走。
+ * 把自己挂起(status = WAIT,wakeup_time = 0 = **不按时间唤醒**),然后切走。
  *
- * 内核线程没有"退出"这个概念(源 OS 里任务是被 `process_exit` 回收的,
- * 而那是用户进程的事)。自检里的探针线程干完活就调它,
- * 于是它**不再可调度**,idle 才有机会被挑中、启动流程才回得来。
+ * ⚠ 它是"永久挂起",与 `sched_sleep_ns` 不是一回事:后者的 wakeup_time 非 0,
+ *   到点会被 `sched_queue_scan()` 的扫描唤醒;这里的 0 表示"没有时间点",
+ *   只有 `sched_wake_task()` 能把它叫回来。
+ *
+ * ⚠ 源 OS **没有**这个函数(它的任务由 `process_exit` 回收,那是用户进程的事)。
+ *   这里是自检探针的便利设施:干完活挂起,于是 idle 能被挑中、启动流程回得来。
+ *   M4-11 有了线程退出机制之后,它应当被"退出"取代。
  *
  * ⚠ 本函数**不会返回**(除非调用者是 idle)。
  */
 void sched_park_self(void);
+
+/* ------------------------------------------------------------------ */
+/* ★ 睡眠与唤醒(M4-8.4)★                                             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * ← `scheduler_sleep_ns()` `scheduler.cpp:468-493`,逐句照抄。
+ *
+ * 睡 `ns` 纳秒。实现是**轮询式**的:置 `status = WAIT` 之后反复 `yield()`,
+ * 每次都被调度器的扫描看一眼醒没醒。
+ *
+ * ★ 源 OS 的三处调用点全是这个形状 ★
+ *   `ipc.cpp:37,46` 与 `sys.cpp:618`:
+ *       do { scheduler_sleep_ns(1000000ULL); …干活…; } while (!条件);
+ *   也就是说"睡一会儿→干活→再看"就是源 OS 表达"周期性任务"的方式 ——
+ *   M4-8.4 的 1Hz 状态行线程照这个写。
+ *
+ * ⚠ 谁会把它叫醒:`sched_select_next()` 里那次**全表扫描**
+ *   (`sched_queue_scan` → `sched_wake_if_due`)。睡眠的任务**留在队列里**
+ *   等着被扫到 —— 这正是 M4-8 的"取队首"版本做不到的事。
+ */
+void sched_sleep_ns(u64 ns);
+
+/*
+ * ← `scheduler_wake_task()` `scheduler.cpp:495-509`。
+ *
+ * 显式唤醒(不是"到点自动醒"):IPC / futex / 将来的可睡眠锁靠它。
+ * 只对 WAIT 的任务有效;唤醒时给一次睡醒补偿(基准取当前任务的 vruntime)。
+ */
+void sched_wake_task(tcb_t t);
 
 /*
  * ★ 两个破坏性 A/B 的开关 ★
@@ -382,3 +467,29 @@ u32 sched_tick_invalid_ctx(void);
 
 /* 诊断:本核累计切换次数 */
 u32 sched_switch_count(void);
+
+/* ------------------------------------------------------------------ */
+/* ★ 破坏性对照组专用:ctx 的快照 / 还原 ★                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 把**队列里每个线程的 `ctx`** 按遍历顺序抄进 `out`(最多 `max` 个),
+ * 返回抄了几个;还原时按同样的顺序写回。
+ *
+ * 为什么对照组需要它:`g_reloc_skip = 1` 时"决策照做、执行流不动",
+ * 而**收现场那一步照做** —— 于是每换一次 current,就把 kmain 的现场
+ * 写进那个线程的 ctx。对对照组自己的线程那是目的;对别的常驻线程
+ * (M4-8.4 的周期状态线程)就是污染:它的 `ctx.sp` 会指到 kmain 的启动栈,
+ * 从此**再也切不进去**(`sched_ctx_switchable` 一直拒绝它)。
+ *
+ * 上板实测过:状态线程的 `ctx.sp` 变成 0x0018BF10、`invalid_ctx` 涨到 85139、
+ * **状态行从此不再输出**。所以对照组必须自己把这段窗口罩起来。
+ *
+ * ⚠ 只抄队列里的线程 —— 只有它们可能被 `sched_select_next` 挑中。
+ * ⚠ 窗口内不许创建/销毁线程(对照组自己保证)。
+ */
+u32  sched_ctx_snapshot_all(arm_task_ctx_t *out, u32 max);
+void sched_ctx_restore_all(const arm_task_ctx_t *in, u32 n);
+
+/* 一次快照能装下的线程数上限(队列不会比这更长;超出的会被忽略) */
+#define SCHED_CTX_SNAPSHOT_MAX 32u

@@ -210,6 +210,16 @@ static u32 g_fp_bad;
 static u32 g_fp_rm_bad;
 static u32 g_vfp_ctl_bad;
 static u32 g_vfp_ctl_detected;
+/* M4-8.4:周期状态线程 */
+static u32 g_sleep_ok;
+static u32 g_sleep_wakes_at;
+static u32 g_sleep_late_max_at;
+static u32 g_sleep_printed_at;
+static u32 g_sleep_load_ok;
+static u32 g_sleep_load_count;
+static u32 g_status_ctl_wakes;
+static u32 g_status_ctl_printed;
+static u32 g_wake_ctl_detected;
 /* 对照组(搬帧关掉)*/
 static u32 g_reloc_ctl_a;
 static u32 g_reloc_ctl_b;
@@ -297,6 +307,7 @@ typedef struct
     volatile u32       sp_bad;    /* sp 掉出自己栈区的次数(正常恒为 0)*/
     volatile u32       done;      /* 循环跑完了 */
     const volatile u32 *other;    /* 对方的 count */
+    u32                budget_us; /* 跑多久墙钟(可配 —— M4-8.4 要一个跑几秒的)*/
 } spin_probe_t;
 
 #define SPIN_BUDGET_US 20000u /* 每个线程跑 20ms 墙钟(不是 20ms CPU 时间)*/
@@ -319,7 +330,7 @@ static void spin_probe(void *arg)
     tcb_t         self = sched_current();
     u64           t0   = timer_read_us();
 
-    while ((timer_read_us() - t0) < (u64)SPIN_BUDGET_US) {
+    while ((timer_read_us() - t0) < (u64)p->budget_us) {
         u32 sp;
 
         p->count++;
@@ -382,6 +393,7 @@ static void spin_reset(spin_probe_t *pair)
         pair[i].sp_bad    = 0u;
         pair[i].done      = 0u;
         pair[i].other     = &pair[1u - i].count;
+        pair[i].budget_us = SPIN_BUDGET_US;
     }
 }
 
@@ -540,6 +552,130 @@ static void fp_ctl_b(void *arg)
     (void)arg;
 }
 
+/* ------------------------------------------------------------------ */
+/* ★ M4-8.4:周期状态行 —— 第一个会睡会醒的真实负载 ★                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * ⚠ 这几个东西的定义在文件靠后处(或原本是 kmain 的局部变量),而状态线程
+ *   要读它们 —— 所以在这里先**定义**。
+ *   把 `loop_count` / `uart_present` 从 kmain 的局部变量提成文件级静态量
+ *   不是图省事:线程函数没法访问另一个函数的局部变量,而"状态行要报什么"
+ *   本来就该是能被告知的。它们只在 kmain 里读写,提升之后语义不变
+ *   (kmain 是唯一写者,线程只读)。
+ */
+static volatile u32 g_tick_seen;
+
+/* 中断延迟测量的两个量 —— 定义在下面 tick 探针那一段,这里先声明 */
+static volatile u32 g_tick_max_gap;
+
+/* kmain 的局部量,提升为文件级:状态线程要读它们 */
+static u32  loop_count;
+static bool uart_present;
+
+/* 全局定时器 333333343Hz -> 拍数换算成微秒(状态线程要用,所以放在这里) */
+#define GT_TICKS_TO_US(t) ((u32)(((u64)(t) * 1000000ull) / (u64)PLAT_GLOBAL_TIMER_FREQ_HZ))
+
+
+/*
+ * 原来这段在 kmain 的主循环里(`gt >> 29` 那个 1.6 秒的节拍)。
+ * 现在它是一个**内核线程**,形状照源 OS 的用法:
+ *
+ *     do { scheduler_sleep_ns(1ms); …干活…; } while (!条件);
+ *     —— `ipc.cpp:37,46`、`sys.cpp:618` 全是这个形状。
+ *
+ * ★ 它为什么是"第一个真实负载" ★
+ *   前面所有探针线程都是"跑一段就挂起",没有一个会用 `sched_sleep_ns`。
+ *   而这个线程会**睡下去、被扫描唤醒、拿到 CPU 再睡** —— 于是它同时压到:
+ *     - `sched_sleep_ns` 本身;
+ *     - 唤醒(必须发生在 `sched_select_next` 的**全表扫描**里,
+ *       这是 M4-8 "取队首"那一版根本做不到的事);
+ *     - 睡醒补偿 `sched_apply_wakeup_credit` 的**顺序**效果(不是比例);
+ *     - 与一个**纯占用线程**共存时还能被及时服务。
+ *
+ * ★ 判据:唤醒延迟 ★
+ *   `sched_sleep_ns(P)` 回来后立刻量"实际比 P 长了多少" —— 那就是
+ *   **从到点到真正拿到 CPU** 的延迟。它是对"顺序"的直接测量:
+ *   有个纯占用线程在旁边霸着 CPU 时,这个数仍然要小。
+ *   (按 §4.5 拍板的分工:睡醒补偿**不判比例**(等权负载下任何策略都过),
+ *    判的是**顺序** —— 而延迟就是顺序的可观测量。)
+ */
+#define STATUS_PERIOD_NS 1000000000ull /* 1 Hz */
+
+static volatile u32 g_status_wakes;
+static volatile u32 g_status_late_last_us;
+static volatile u32 g_status_late_max_us;
+static volatile u32 g_status_printed;
+
+static void status_thread(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        u64 t0 = timer_read_ns();
+        u32 late_us;
+        u64 t1;
+
+        sched_sleep_ns(STATUS_PERIOD_NS);
+
+        t1      = timer_read_ns();
+        late_us = (u32)((t1 - t0 - STATUS_PERIOD_NS) / 1000u);
+
+        g_status_wakes++;
+        g_status_late_last_us = late_us;
+        if (late_us > g_status_late_max_us) {
+            g_status_late_max_us = late_us;
+        }
+
+        /* 这一段就是原来主循环里那几行,一个字没改语义 */
+        HB[HB_SLOT_TICKS]    = g_tick_seen;
+        HB[HB_SLOT_IRQCOUNT] = irq_get_stats()->irq_count;
+        HB[HB_SLOT_TICKGAP]  = GT_TICKS_TO_US(g_tick_max_gap);
+
+        if (uart_present) {
+            /*
+             * ⚠ 状态行必须**整行排他**。
+             *
+             * M4-8.4 之后串口有两个写者(本线程 + kmain 的自检报告/shell),
+             * 而 9600 波特下一行要 60~80ms —— 足够别的上下文插进来几十次。
+             * 实测:状态行正好插进自检报告中间,把 `=== SELF-TEST END ===`
+             * 劈成两半,于是**一条命令判定过不过**这件事被打断。
+             */
+            console_excl_begin();
+            console_printf("[XJ380/arm32] alive loop=%u led=0x%02X ticks=%u irq=%u lag=%u ms maxgap=%u us "
+                           "wake=%u late=%u us\n",
+                           loop_count, (u32)(HB[HB_SLOT_LED] & 0xFFu), g_tick_seen,
+                           irq_get_stats()->irq_count, (u32)(timer_read_us() / 1000u) - g_tick_seen,
+                           GT_TICKS_TO_US(g_tick_max_gap), g_status_wakes, late_us);
+            console_excl_end();
+            g_status_printed++;
+        }
+    }
+}
+
+/* 对照组用的第二个状态线程(A/B 窗口里跑,窗口结束就挂起)*/
+static void status_thread_ctl(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        sched_sleep_ns(STATUS_PERIOD_NS);
+        g_status_ctl_wakes++;
+        g_status_ctl_printed++;
+    }
+}
+
+/*
+ * 纯占用负载:跑满一段墙钟,**绝不主动让出**。
+ * 用它来回答"M4-8.4 的第二个判据":状态线程睡觉的时候,CPU 有没有真的
+ * 被别的线程用起来(而不是它在忙等),以及它醒来之后能不能被及时服务。
+ */
+static void load_probe(void *arg)
+{
+    spin_probe((void *)&g_spin[0]);
+    (void)arg;
+}
+
 /* M4-7:异常帧是否落在 SVC 栈区(1 = 在,0 = 不在)*/
 static u32 g_exc_frame_on_svc_stack;
 
@@ -675,8 +811,6 @@ static smp_stress_result_t g_smp_stress;
 /* 周期 tick 处理函数                                                  */
 /* ------------------------------------------------------------------ */
 
-static volatile u32 g_tick_seen;
-
 /*
  * 中断延迟测量。
  *
@@ -689,11 +823,11 @@ static volatile u32 g_tick_seen;
  * 说明确实有一段中断没有被及时响应,而且能直接读出停了多久。
  */
 static volatile u32 g_tick_last_gt;
-static volatile u32 g_tick_max_gap;
 static volatile u32 g_tick_first;
 
 /* 全局定时器 333333343Hz -> 拍数换算成微秒 */
-#define GT_TICKS_TO_US(t) ((u32)(((u64)(t) * 1000000ull) / (u64)PLAT_GLOBAL_TIMER_FREQ_HZ))
+
+/* 全局定时器 333333343Hz -> 拍数换算成微秒 */
 
 static void tick_handler(u32 intid, void *arg)
 {
@@ -774,11 +908,9 @@ void kmain(void)
 {
     u32      uart_clk = 0;
     u32      clock_source = 0;
-    u32      loop_count = 0;
     u32      last_step  = 0xFFFFFFFFu;
     u32      last_ps    = 0xFFFFFFFFu;
     u32      before_us  = 0; /* 使能缓存前的基准耗时 */
-    bool     uart_present;
     bool     uart_loopback_ok = false;
 
     /* static: 由 BSS 自动清零。这样在"无串口"路径下打印诊断也不会读未初始化值 */
@@ -2225,6 +2357,65 @@ void kmain(void)
                                g_fp_ok ? "PASS" : "FAIL");
             }
         }
+
+        /* ---- 相 4:★ M4-8.4 —— 周期状态线程(第一个会睡会醒的真实负载)★ ---- */
+        /*
+         * 造两样东西:
+         *   - **状态线程**:永久存在,每秒醒一次,打一行状态(就是原来主循环
+         *     里那一段),并记录**唤醒延迟**;
+         *   - **纯占用负载**:跑满 2.4 秒、绝不主动让出 —— 用来占住 CPU,
+         *     这样"状态线程睡觉期间 CPU 有没有被别人用起来"和
+         *     "它醒来之后能不能被及时服务"才是有内容的判据。
+         *
+         * 三个判据(都来自实测值,不是推理):
+         *   wakes    至少醒过 2 次 —— 否则"延迟很小"只是因为压根没睡醒过
+         *   late_max 唤醒延迟上限。有个纯占用线程霸着 CPU,它仍应当很小 ——
+         *            这就是**顺序**的可观测量(睡醒补偿买的就是这个)
+         *   load     负载线程确实推进了很多 —— 说明状态线程睡觉时**真的
+         *            让出了 CPU**,而不是忙等
+         */
+        sched_disable();
+        spin_reset(g_spin);
+        g_spin[0].budget_us = 2400000u; /* 2.4 秒 —— 是状态周期的两倍多 */
+        {
+            tcb_t st = sched_kthread_create(status_thread, NULL, "stat");
+            tcb_t ld = sched_kthread_create(load_probe, NULL, "load");
+
+            sched_enable();
+
+            if (st == NULL || ld == NULL) {
+                console_puts(" Sched sleep : kthread_create FAILED\n");
+            } else {
+                /* 3 秒:够状态线程醒 2~3 次,也够负载线程跑完 2.4 秒 */
+                timer_delay_ms(3000u);
+
+                g_sleep_wakes_at   = g_status_wakes;
+                g_sleep_late_max_at = g_status_late_max_us;
+                g_sleep_printed_at = g_status_printed;
+                g_sleep_load_count = g_spin[0].count;
+
+                /*
+                 * 延迟上限取 20ms。看上去宽松,但它区分的是完全不同的两件事:
+                 * 正常路径上它在 1~5ms 量级(时间片 4 tick),而"醒不过来"
+                 * 或"被饿着"会是几十上百毫秒甚至永远不醒。
+                 * 定成一个"刚好够用"的数会让判据随负载波动而抖 —— 那不是更严,
+                 * 只是更脆。
+                 */
+                g_sleep_ok = ((g_sleep_wakes_at >= 2u) && (g_sleep_late_max_at < 20000u) &&
+                              (g_sleep_printed_at >= 2u))
+                                 ? 1u
+                                 : 0u;
+                g_sleep_load_ok = ((g_spin[0].count > 100000u) && g_spin[0].done) ? 1u : 0u;
+
+                console_printf(" Sched sleep : wakes=%u printed=%u late_max=%u us late_last=%u us\n",
+                               g_sleep_wakes_at, g_sleep_printed_at, g_sleep_late_max_at,
+                               g_status_late_last_us);
+                console_printf(" Sched sleep : load thread ran %u iters done=%u\n", g_spin[0].count,
+                               g_spin[0].done);
+                console_printf(" Sched sleep : 周期睡眠 + 全表扫描唤醒 = %s\n",
+                               g_sleep_ok ? "PASS" : "FAIL");
+            }
+        }
     }
 
     /* ---- 10. 启动自检总账 ---- */
@@ -2257,6 +2448,19 @@ void kmain(void)
                    irq_frame_unaligned8());
 
     selftest_begin();
+    /*
+     * ★ 整个报告区间排他 ★
+     *
+     * 理由见 console.h:报告是**机器可读的判定通道**,而 M4-8.4 之后
+     * 状态行线程随时可能插进来把某一行劈成两半 —— 上板实测过一次,
+     * `=== SELF-TEST END ===` 被劈开,`verify_board.py` 直接判"报告不完整"。
+     *
+     * ⚠ 代价:报告要打几秒钟,这几秒里**整个系统停摆**(状态线程也醒不过来)。
+     *   所以状态行的 `late` 在报告之后会偏大 —— 那是这个排他的直接后果,
+     *   不是调度器的问题。`sched_sleep_latency` 的判据取自报告**之前**的
+     *   那一段(相 4),所以不受影响。
+     */
+    console_excl_begin();
 
     selftest_report("uart_present", uart_present ? 1u : 0u, 1u, SELFTEST_EQ);
     selftest_report("uart_clock_source", clock_source, 1u, SELFTEST_EQ);
@@ -2464,6 +2668,25 @@ void kmain(void)
     selftest_report("sched_fp_vfp_context", g_fp_ok, 1u, SELFTEST_EQ);
     selftest_report("sched_fp_done", g_fp_done, 1u, SELFTEST_EQ);
     selftest_report("sched_fp_switched", (g_tick_preempted >= 2u) ? 1u : 0u, 1u, SELFTEST_EQ);
+
+    /*
+     * ---- ★ M4-8.4:周期睡眠 + 全表扫描唤醒 ★ ----
+     *
+     * 三项分开,因为它们失败的含义完全不同:
+     *   sched_sleep_wakes   睡下去之后**被唤醒过**至少两次
+     *   sched_sleep_latency 唤醒延迟在界内 —— 有个纯占用线程霸着 CPU 时
+     *                       它仍要小,这是"顺序"的直接测量
+     *   sched_sleep_yields  状态线程睡觉期间 CPU **真的被负载线程用起来了**
+     *                       (否则它是在忙等,而不是在睡)
+     *
+     * ⚠ 唤醒这件事**只能靠宿主测 + 这一条板级判据**:
+     *   "扫描里带唤醒"是个副作用,宿主测能穷尽它的语义(见 tests 的第 11b 节),
+     *   而"板上真的会醒"必须实测。
+     */
+    selftest_report("sched_sleep_wakes", (g_sleep_wakes_at >= 2u) ? 1u : 0u, 1u, SELFTEST_EQ);
+    selftest_report("sched_sleep_latency", (g_sleep_late_max_at < 20000u) ? 1u : 0u, 1u, SELFTEST_EQ);
+    selftest_report("sched_sleep_yields", g_sleep_load_ok, 1u, SELFTEST_EQ);
+    selftest_report("sched_sleep_printed", (g_sleep_printed_at >= 2u) ? 1u : 0u, 1u, SELFTEST_EQ);
     /*
      * `invalid_ctx` 必须恒为 0:它不是"发生过多少件坏事"的计数,
      * 而是"调度器有没有挑到过不可切换的上下文"。挑了就是有 bug ——
@@ -2544,6 +2767,7 @@ void kmain(void)
 
     HB[HB_SLOT_SELFTEST_FAILED] = selftest_summary();
     console_puts("\n");
+    console_excl_end(); /* ★ 报告区间结束,状态行线程可以继续说话了 ★ */
 
     /* ---- 9.75 抢占的破坏性对照组(必须在自检报告**之后**)---- */
     /*
@@ -2580,6 +2804,8 @@ void kmain(void)
             sched_enable();
             console_puts(" Preempt A/B : kthread_create FAILED\n");
         } else {
+            arm_task_ctx_t ctx_snapshot[SCHED_CTX_SNAPSHOT_MAX];
+            u32            ctx_snapshot_n;
             u32            sw_before;
             u32            inv_before;
             u32            inv_after;
@@ -2601,6 +2827,19 @@ void kmain(void)
              * 而它的栈已经退掉了。所以老老实实备份再还原。
              */
             idle_ctx_backup = sched_boot_idle()->ctx;
+            /*
+             * ★ 把队列里每个线程的 ctx 也抄一份 ★
+             *
+             * 对照组会把"发指令那一刻真正在跑的现场"(也就是 kmain 的)
+             * 写进当时的 current —— 对 ca/cb 那是目的,但对**别的常驻线程**
+             * (M4-8.4 的周期状态线程)就是污染:它的 ctx.sp 会指到 kmain 的
+             * 启动栈,从此**再也切不进去**(`sched_ctx_switchable` 一直拒绝它)。
+             *
+             * 上板实测过一次,症状很绕:报告之后状态行再也不出声,
+             * `invalid_ctx` 涨到 85139,而 A/B 自己的两个线程 done=0 ——
+             * 看起来像"判据不承重",实际是对照组把别人弄坏了。
+             */
+            ctx_snapshot_n = sched_ctx_snapshot_all(ctx_snapshot, SCHED_CTX_SNAPSHOT_MAX);
 
             sw_before  = sched_tick_switched();
             /*
@@ -2664,22 +2903,35 @@ void kmain(void)
              */
             ca->status      = WAIT;
             ca->wakeup_time = 0u;
-            ca->sched_next  = NULL;
             cb->status      = WAIT;
             cb->wakeup_time = 0u;
-            cb->sched_next  = NULL;
             g_reloc_skip    = 0u;
 
             sched_set_current(sched_boot_idle());
             sched_boot_idle()->status = RUNNING;
             sched_boot_idle()->ctx    = idle_ctx_backup; /* ★ 见上面那段说明 ★ */
-            sched_kern_init();
+            sched_ctx_restore_all(ctx_snapshot, ctx_snapshot_n); /* ★ 别人也不能被污染 ★ */
+            /*
+             * ⚠ **不要**在这里调 `sched_kern_init()`。
+             *
+             * 它会 `sched_queue_init()` —— 把整个队列清空。而 M4-8.4 之后
+             * **周期状态线程是常驻的、就挂在队列里**,清一次队列就把它从
+             * 名册上抹掉了:它再也不会被挑中,状态行从此消失。
+             *
+             * 而且**根本不需要清**:M4-8.4 之后队列是"全部线程的名册",
+             * 睡眠/挂起的任务本来就留在里面、靠 `sched_task_schedulable()`
+             * 排除。把 ctl 线程置成 WAIT 已经够了 —— 它们既不会被选中,
+             * 也不碍着别人。M4-9 那一版需要清,是因为那时"跑着的不在队列里",
+             * 切换路径在维护成员关系、可能留下半拉状态。
+             */
 
+            console_excl_begin();
             console_printf(" Preempt A/B : skip_frame -> a=%u b=%u switched=%u invalid=%u->%u\n",
                            g_reloc_ctl_a, g_reloc_ctl_b, sched_tick_switched() - sw_before,
                            inv_before, inv_after);
             console_printf(" Preempt A/B : 未搬帧 -> %s(这就是「决策说切了、执行流没动」的样子)\n",
                            g_reloc_ctl_detected ? "检出" : "未检出 —— 判据不承重!");
+            console_excl_end();
             /*
              * ⚠ 一个曾经留痕、现在有结果的观察:
              *
@@ -2730,12 +2982,17 @@ void kmain(void)
             console_puts(" VFP A/B     : kthread_create FAILED\n");
         } else {
             arm_task_ctx_t idle_ctx_backup = sched_boot_idle()->ctx;
+            arm_task_ctx_t ctx_snapshot[SCHED_CTX_SNAPSHOT_MAX];
+            u32            ctx_snapshot_n;
+
+            ctx_snapshot_n = sched_ctx_snapshot_all(ctx_snapshot, SCHED_CTX_SNAPSHOT_MAX);
 
             g_vfp_skip = 1u; /* ★ 对照组:不换浮点现场 ★ */
             sched_enable();
             timer_delay_ms(FP_BUDGET_US / 1000u + 300u);
             g_vfp_skip = 0u;
 
+            console_excl_begin();
             console_printf(" VFP A/B     : bad=(%u,%u) rmode_bad=(%u,%u) done=%u\n", g_fp_ctl[0].bad,
                            g_fp_ctl[1].bad, g_fp_ctl[0].rmode_bad, g_fp_ctl[1].rmode_bad,
                            (g_fp_ctl[0].done && g_fp_ctl[1].done) ? 1u : 0u);
@@ -2757,20 +3014,82 @@ void kmain(void)
 
             console_printf(" VFP A/B     : 未换浮点现场 -> %s(这就是「寄存器被对方改掉」的样子)\n",
                            g_vfp_ctl_detected ? "检出" : "未检出 —— 判据不承重!");
+            console_excl_end();
 
             /* 收拾:与 9.75 同一套(挂起两个线程、复位 current / 队列 / idle 现场)*/
             ca->status      = WAIT;
             ca->wakeup_time = 0u;
-            ca->sched_next  = NULL;
             cb->status      = WAIT;
             cb->wakeup_time = 0u;
-            cb->sched_next  = NULL;
             g_vfp_skip      = 0u;
 
             sched_set_current(sched_boot_idle());
             sched_boot_idle()->status = RUNNING;
             sched_boot_idle()->ctx    = idle_ctx_backup;
-            sched_kern_init();
+            sched_ctx_restore_all(ctx_snapshot, ctx_snapshot_n);
+            /* ⚠ 不调 sched_kern_init():见上面 9.75 那段说明 —— 它会清空队列、
+             *   把常驻的周期状态线程一起抹掉。 */
+        }
+    }
+
+    /* ---- 9.77 扫描唤醒的破坏性对照组(同样必须在报告**之后**)---- */
+    /*
+     * 同一段选取代码、同一个周期睡眠线程,**只把扫描里的那次唤醒关掉**
+     * (`g_wake_skip = 1`,也就是 M4-8 "取队首"那一版的等效行为)。
+     *
+     *   唤醒开:线程每秒醒一次 ⇒ `wakes` 每秒钟涨
+     *   唤醒关:线程睡下去就**再也醒不过来** ⇒ `wakes` 冻住不动
+     *
+     * ⚠ 判据是"**窗口内一次都没醒**"(检出),不是"醒得少了"。
+     *   与前两个对照组一样,这里是**预期它坏**。
+     *
+     * ⚠ 这一相**不要**放纯占用线程:
+     *   ① 对照组里睡着的线程永远不会醒,而负载线程不会主动让出 ⇒
+     *      idle(也就是 kmain 自己)再也拿不到 CPU,**这一相就没法收尾**;
+     *   ② 不设负载时,"没醒"唯一的原因就是那次唤醒被去掉了,
+     *      归因干净。
+     */
+    {
+        tcb_t sc;
+        u32   before = g_status_ctl_wakes;
+
+        sched_disable();
+        sc = sched_kthread_create(status_thread_ctl, NULL, "wctl");
+        if (sc == NULL) {
+            sched_enable();
+            console_puts(" Wake A/B    : kthread_create FAILED\n");
+        } else {
+            arm_task_ctx_t idle_ctx_backup = sched_boot_idle()->ctx;
+            arm_task_ctx_t ctx_snapshot[SCHED_CTX_SNAPSHOT_MAX];
+            u32            ctx_snapshot_n;
+
+            ctx_snapshot_n = sched_ctx_snapshot_all(ctx_snapshot, SCHED_CTX_SNAPSHOT_MAX);
+
+            g_wake_skip = 1u; /* ★ 对照组:扫描里不再唤醒 ★ */
+            sched_enable();
+            timer_delay_ms(1500u);
+            g_wake_skip = 0u;
+
+            g_wake_ctl_detected = (g_status_ctl_wakes == before) ? 1u : 0u;
+
+            console_excl_begin();
+            console_printf(" Wake A/B    : ctl_wakes %u -> %u over 1.5 s (line=%u)\n", before,
+                           g_status_ctl_wakes, g_status_ctl_printed);
+            console_printf(" Wake A/B    : 不唤醒 -> %s(这就是「睡下去就醒不过来」的样子)\n",
+                           g_wake_ctl_detected ? "检出" : "未检出 —— 判据不承重!");
+            console_excl_end();
+
+            /* 收拾:与 9.75 / 9.76 同一套 */
+            sc->status      = WAIT;
+            sc->wakeup_time = 0u;
+            g_wake_skip     = 0u;
+
+            sched_set_current(sched_boot_idle());
+            sched_boot_idle()->status = RUNNING;
+            sched_boot_idle()->ctx    = idle_ctx_backup;
+            sched_ctx_restore_all(ctx_snapshot, ctx_snapshot_n);
+            /* ⚠ 不调 sched_kern_init():见上面 9.75 那段说明 —— 它会清空队列、
+             *   把常驻的周期状态线程一起抹掉。 */
         }
     }
 
@@ -2847,7 +3166,6 @@ void kmain(void)
      * 在"不确定哪个 COM 口 / 波特率对不对"的阶段,一个稳定可预期的
      * 周期信号比一次性的启动横幅好找得多。
      */
-    u32 last_print = 0xFFFFFFFFu;
 
     for (;;) {
         u32 gt    = timer_read_ticks_low();
@@ -2888,33 +3206,16 @@ void kmain(void)
         }
 
         if (uart_present) {
-            /* gt >> 29 在 333.33MHz 下约 1.6 秒一次 */
-            u32 tick = gt >> 29;
-
-            if (tick != last_print) {
-                last_print = tick;
-
-                /*
-                 * 同时汇报两套计数,便于交叉验证:
-                 *   ticks     —— 周期中断次数,应当约等于 uptime(ms)
-                 *   irq_count —— GIC 实际转发的中断总数
-                 * 两者若明显不符,说明有中断被吞或未被 EOI。
-                 */
-                HB[HB_SLOT_TICKS]    = g_tick_seen;
-                HB[HB_SLOT_IRQCOUNT] = irq_get_stats()->irq_count;
-                HB[HB_SLOT_TICKGAP]  = GT_TICKS_TO_US(g_tick_max_gap);
-
-                /*
-                 * uptime 与 ticks 的差就是"累计欠下的 tick 数":
-                 * 若中断一次不丢,两者应当始终相差一个固定值。
-                 * maxgap 是最大单次延迟,正常应贴着 1000us。
-                 */
-                console_printf("[XJ380/arm32] alive loop=%u led=0x%02X ticks=%u irq=%u lag=%u ms maxgap=%u us\n",
-                               loop_count, (u32)(HB[HB_SLOT_LED] & 0xFFu), g_tick_seen,
-                               irq_get_stats()->irq_count,
-                               (u32)(timer_read_us() / 1000u) - g_tick_seen,
-                               GT_TICKS_TO_US(g_tick_max_gap));
-            }
+            /*
+             * ★ 1Hz 状态行**已经搬进 `status_thread` 里了**(M4-8.4)★
+             *
+             * 原来这里有一段 `if (tick != last_print) { … console_printf("alive…") }`,
+             * 现在它由那个内核线程负责 —— 于是"周期任务"第一次不再是主循环里
+             * 的一个 if,而是一个真的会睡会醒的线程。
+             *
+             * 主循环这边要注意的是:**它是 idle**,所以它能在任何时候被抢占。
+             * 下面这些都不是原子的读改写,抢占只会让数字抖一下,不会坏。
+             */
         }
 
         /*

@@ -9,6 +9,7 @@
  */
 
 #include <arch/console.h>
+#include <arch/sched.h>
 #include <arch/uart_ps.h>
 
 static uintptr_t g_uart_base = 0;
@@ -30,6 +31,46 @@ void console_puts(const char *str)
 {
     if (g_uart_base != 0) {
         uart_puts(g_uart_base, str);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* ★ 排他输出(M4-8.4)★                                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 嵌套计数。**只在 0 → 1 时关调度,1 → 0 时恢复** ——
+ * 否则内层一退出就把外层的保护撤掉了,而那种失效是静默的:
+ * 输出照样出得来,只是偶尔被别的东西插进去。
+ */
+static u32 g_excl_depth;
+
+void console_excl_begin(void)
+{
+    if (g_excl_depth == 0u) {
+        /*
+         * 关调度而不是关中断:
+         *   - 关中断挡不住"另一个线程",因为线程切换发生在中断返回路径上,
+         *     而这里要防的正是别的线程插进来;
+         *   - 关调度之后没有别的上下文能跑起来,于是"谁在打印"唯一。
+         *
+         * ⚠ 不能换成自旋锁:一行 60~80ms,持锁者会被抢占,等锁者自旋
+         *   (且关中断)就再也没人放锁 ⇒ 死锁。见 console.h 的说明。
+         */
+        sched_disable();
+    }
+    g_excl_depth++;
+}
+
+void console_excl_end(void)
+{
+    if (g_excl_depth == 0u) {
+        return; /* 多退一次不把调度打开 —— 那会让外层失去保护 */
+    }
+
+    g_excl_depth--;
+    if (g_excl_depth == 0u) {
+        sched_enable();
     }
 }
 

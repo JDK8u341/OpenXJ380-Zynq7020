@@ -197,38 +197,49 @@ int main(void)
     CHECK(tb.status == WAIT);
     CHECK(!sched_wake_if_due(NULL, 1u, 1u));
 
-    /* ---- 8. 就绪队列:有序插入、查重、摘除、计数 ---- */
+    /* ---- 8. 就绪队列:★ 插入序 FIFO（照源 OS），查重、摘除、计数 ---- */
+    /*
+     * ⚠ 这一节在 M4-8.4 被**改写过**，因为 M4-8 的"按 deadline 有序插入、
+     *   队首就是应选者"是**我自己发明的**：
+     *
+     *     源 OS 的队列（`lock_queue`）是普通 FIFO 追加
+     *     （`queue_enqueue` → `queue_append_node`，`kernel/lock_queue.cpp:100`），
+     *     **选取靠全表扫描**（`select_next_task_safe`）：先算 avg_vruntime，
+     *     再要求 `candidate->vruntime <= avg`，在合格者里取 deadline 最小。
+     *
+     *   排序版不只是"不一样"，它还有个直接后果：**唤醒睡眠任务的那次扫描
+     *   在 `select_next_task_safe` 里**，取队首的写法里根本没有它 ⇒
+     *   睡下去的任务永远醒不过来。
+     */
     sched_queue_init(&q);
     CHECK(q.head == NULL && q.count == 0u);
-    CHECK(sched_pick(&q) == NULL);
 
+    /* deadline 故意给成**逆序**，这样"排序"与"追加"一眼可分 */
     mk(&ta, TASK_KERNEL_LEVEL, 100u, 3000u, SCHED_BASE_SLICE_NS);
     mk(&tb, TASK_KERNEL_LEVEL, 200u, 1000u, SCHED_BASE_SLICE_NS);
     mk(&tc, TASK_KERNEL_LEVEL, 300u, 2000u, SCHED_BASE_SLICE_NS);
 
-    CHECK(sched_queue_insert(&q, &ta));
-    CHECK(sched_queue_insert(&q, &tb));
-    CHECK(sched_queue_insert(&q, &tc));
+    CHECK(sched_queue_append(&q, &ta));
+    CHECK(sched_queue_append(&q, &tb));
+    CHECK(sched_queue_append(&q, &tc));
     CHECK(q.count == 3u);
-    /* 队首 = deadline 最小者 */
-    CHECK(sched_pick(&q) == &tb);
-    CHECK(q.head == &tb && tb.sched_next == &tc && tc.sched_next == &ta && ta.sched_next == NULL);
+    /* ★ 保持**插入序**，不按 deadline 排 ★ */
+    CHECK(q.head == &ta && ta.sched_next == &tb && tb.sched_next == &tc && tc.sched_next == NULL);
 
     /* ★ 重复插入必须被拒 —— 挂两次会把链表做成环,遍历就死循环了 ★ */
-    CHECK(!sched_queue_insert(&q, &tb));
-    CHECK(!sched_queue_insert(&q, &ta));
+    CHECK(!sched_queue_append(&q, &tb));
+    CHECK(!sched_queue_append(&q, &ta));
     CHECK(q.count == 3u);
-    CHECK(q.head == &tb);
+    CHECK(q.head == &ta);
 
     /* 摘中间一个 */
-    sched_queue_remove(&q, &tc);
+    sched_queue_remove(&q, &tb);
     CHECK(q.count == 2u);
-    CHECK(tb.sched_next == &ta);
-    CHECK(tc.sched_next == NULL);
-    /* 摘了再插:应当回到正确位置 */
-    tc.eevdf_deadline = 500u;
-    CHECK(sched_queue_insert(&q, &tc));
-    CHECK(sched_pick(&q) == &tc);
+    CHECK(ta.sched_next == &tc);
+    CHECK(tb.sched_next == NULL);
+    /* 摘了再插:追加到**尾部**(不是插回原位) */
+    CHECK(sched_queue_append(&q, &tb));
+    CHECK(q.head == &ta && ta.sched_next == &tc && tc.sched_next == &tb);
     CHECK(q.count == 3u);
 
     /* 摘不存在的,不动 */
@@ -246,21 +257,20 @@ int main(void)
     /* 重复摘除不会把计数减成负数 */
     sched_queue_remove(&q, &ta);
     CHECK(q.count == 0u);
-    CHECK(!sched_queue_insert(NULL, &ta));
-    CHECK(!sched_queue_insert(&q, NULL));
+    CHECK(!sched_queue_append(NULL, &ta));
+    CHECK(!sched_queue_append(&q, NULL));
 
     /* 空队列与 NULL 的边界 */
     sched_queue_init(NULL);
     sched_queue_remove(NULL, &ta);
     sched_queue_remove(&q, NULL);
-    CHECK(sched_pick(NULL) == NULL);
 
     /* ---- 9. 平均 vruntime(源 OS 用它给新线程定起点)---- */
     sched_queue_init(&q);
     mk(&ta, TASK_KERNEL_LEVEL, 1000u, 10u, SCHED_BASE_SLICE_NS);
     mk(&tb, TASK_KERNEL_LEVEL, 3000u, 20u, SCHED_BASE_SLICE_NS);
-    sched_queue_insert(&q, &ta);
-    sched_queue_insert(&q, &tb);
+    sched_queue_append(&q, &ta);
+    sched_queue_append(&q, &tb);
     CHECK(sched_queue_avg_vruntime(&q, NULL, 0u) == 2000u);
     CHECK(sched_queue_avg_vruntime(&q, &ta, 0u) == 3000u);   /* 排除自己 */
     CHECK(sched_queue_avg_vruntime(&q, &ta, 777u) == 3000u);
@@ -309,17 +319,28 @@ int main(void)
     mk(&tc, TASK_KERNEL_LEVEL, 200u, 20u, SCHED_BASE_SLICE_NS);
     tc.status = WAIT;                                           /* 挂起:不是候选 */
 
-    /* idle 的 deadline 最小(0),所以它在队首 —— 正是"不能让它占住队首"的场景 */
-    sched_queue_insert(&q, &tb);
-    sched_queue_insert(&q, &ta);
-    sched_queue_insert(&q, &tc);
-    CHECK(sched_pick(&q) == &tb); /* 队首确实是 idle —— 取队首的做法会错在这里 */
+    /* idle 的 deadline 最小(0)，排在队首 —— 正是"取队首"会错的地方 */
+    sched_queue_append(&q, &tb);
+    sched_queue_append(&q, &ta);
+    sched_queue_append(&q, &tc);
+    CHECK(q.head == &tb); /* 队首是 idle */
 
-    /* sched_pick_next 必须跳过 idle 与挂起的,挑到 ta */
-    CHECK(sched_pick_next(&q, NULL) == &ta);
-    /* current 自己也要跳过 */
-    CHECK(sched_pick_next(&q, &ta) == NULL);
-    CHECK(sched_pick_next(NULL, NULL) == NULL);
+    /*
+     * ★ `sched_select_next` 必须跳过 idle 与挂起的，挑到 ta ★
+     *
+     * 注意判据里带了 `now`：这个函数会**唤醒到点的睡眠任务**，
+     * 所以时间是个输入（纯逻辑层的纪律：宿主上要能构造"过了 3ms"）。
+     */
+    CHECK(sched_select_next(&q, NULL, 0u) == &ta);
+    /* current 自己不算候选;队列里没有别人可跑时兜底回 current */
+    CHECK(sched_select_next(&q, &ta, 0u) == &ta);
+    CHECK(sched_select_next(NULL, NULL, 0u) == NULL);
+    /*
+     * current = tc(WAIT,不可运行)：队列里还有可跑的 ta ⇒ 挑 ta。
+     * ⚠ idle **不是**第一顺位 —— 它只在"没有任何候选、current 也不能跑"
+     *   时才兜底（见 11c）。第一版这里写成了 `== &tb`(idle)，是判据写错了。
+     */
+    CHECK(sched_select_next(&q, &tc, 0u) == &ta);
 
     CHECK(!sched_task_schedulable(NULL, NULL));
     CHECK(!sched_task_schedulable(&tb, NULL)); /* idle 永不作为候选 */
@@ -333,6 +354,84 @@ int main(void)
     CHECK(sched_current_runnable(&ta));
     CHECK(!sched_current_runnable(&tc));
     CHECK(!sched_current_runnable(NULL));
+
+    /* ================================================================ */
+    /* 11b. ★ M4-8.4:扫描里的**唤醒** ★                                */
+    /* ================================================================ */
+
+    /*
+     * 这是 M4-8.4 最要紧的一条判据，也是"取队首"那一版**做不到**的事：
+     * 睡下去的任务留在队列里，靠 `sched_queue_scan()` 在**选取的过程中**
+     * 被扫到并唤醒。
+     *
+     * 判据分两半，缺一不可：
+     *   - 没到点：**不许**醒（早醒了就变成忙等，睡醒补偿也会失真）；
+     *   - 到点  ：**必须**醒，而且醒来后成为候选。
+     */
+    {
+        tcb_t fb = NULL;
+        tcb_t id = NULL;
+
+        sched_queue_init(&q);
+        /* 一个睡眠任务：wakeup_time = 5000 */
+        mk(&ta, TASK_KERNEL_LEVEL, 1000u, 1000u, SCHED_BASE_SLICE_NS);
+        ta.status      = WAIT;
+        ta.wakeup_time = 5000ull;
+
+        /* 一个就绪任务：vruntime 大一点，用来当 current 的参照 */
+        mk(&tb, TASK_KERNEL_LEVEL, 9000u, 9000u, SCHED_BASE_SLICE_NS);
+
+        sched_queue_append(&q, &ta);
+        sched_queue_append(&q, &tb);
+
+        /* --- 未到点：扫描不许把它弄醒 --- */
+        (void)sched_queue_scan(&q, &tb, 4999ull, &fb, &id);
+        CHECK(ta.status == WAIT);
+        CHECK(ta.wakeup_time == 5000ull);
+        CHECK(ta.eevdf_vruntime == 1000u); /* 补偿没被施加 */
+        /* 睡眠中 ⇒ 不是候选 */
+        CHECK(fb == NULL);
+
+        /* --- 到点：扫描必须唤醒，并给睡醒补偿 --- */
+        (void)sched_queue_scan(&q, &tb, 5000ull, &fb, &id);
+        CHECK(ta.status == START);
+        CHECK(ta.wakeup_time == 0ull);
+        /*
+         * ← `apply_eevdf_wakeup_credit(task, base=tb.vruntime=9000)`：
+         *     credit = 自己的片长（4ms）夹到 [4ms, 8ms] ⇒ 4000000
+         *     placed = 9000 - 4000000 ⇒ 下溢 ⇒ 0
+         *     ta.vruntime = min(1000, 0) = 0
+         */
+        CHECK(ta.eevdf_vruntime == 0u);
+        CHECK(ta.eevdf_deadline == 0u + SCHED_BASE_SLICE_NS);
+        /* 醒了就是候选 */
+        CHECK(fb == &ta);
+
+        /* --- 醒来的任务必须真的能被选中 --- */
+        CHECK(sched_select_next(&q, &tb, 5000ull) == &ta);
+    }
+    CHECK(sched_queue_scan(NULL, NULL, 0u, NULL, NULL) == 0u);
+    CHECK(sched_queue_scan(&q, NULL, 1u, NULL, NULL) == 0u || 1u); /* 不崩即可 */
+
+    /* ---- 11c. `sched_select_next` 的兜底链 ---- */
+    {
+        sched_queue_init(&q);
+        mk(&ta, TASK_KERNEL_LEVEL, 0u, 0u, SCHED_BASE_SLICE_NS);
+        ta.status = WAIT; /* 唯一的任务在睡，队列里没有候选 */
+        sched_queue_append(&q, &ta);
+
+        /* current 可运行 ⇒ 继续跑它 */
+        mk(&tb, TASK_KERNEL_LEVEL, 100u, 100u, SCHED_BASE_SLICE_NS);
+        CHECK(sched_select_next(&q, &tb, 0u) == &tb);
+        /* current 不可运行、也没有 idle ⇒ NULL */
+        tb.status = WAIT;
+        CHECK(sched_select_next(&q, &tb, 0u) == NULL);
+
+        /* 队列里放个 idle：兜底就该挑它 */
+        mk(&tc, TASK_IDLE_LEVEL, 0u, 0u, SCHED_BASE_SLICE_NS);
+        sched_queue_append(&q, &tc);
+        CHECK(sched_select_next(&q, &tb, 0u) == &tc);
+    }
 
     /* ================================================================ */
     /* 12. ★ M4-9:帧搬迁 ★                                             */
