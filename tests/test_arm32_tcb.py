@@ -204,9 +204,22 @@ int main(void)
          *   只要有人往里塞指针或 uintptr_t,宿主上这个数就会变大 ——
          *   而"宿主验的偏移就是目标偏移"这条前提随即失效。
          */
-        CHECK(sizeof(percpu_t) == 56u);
+        CHECK(sizeof(percpu_t) == 64u);
         CHECK(offsetof_arm(percpu_t, scheduler_ticks) == 48u);
         CHECK(sizeof(((percpu_t *)0)->scheduler_ticks) == 8u);
+
+        /*
+         * M4-9.5:浮点现场的两个指针也必须是 u32 地址(而且汇编按固定偏移
+         * 直接读它们 —— 见 arch/taskctx_asm.h 的 ARM_PERCPU_OFF_CUR_VFP_*)。
+         *
+         * 为什么不干脆让汇编去查 TCB 里的 vfp/fpscr:TCB 有指针字段,
+         * 宿主与目标的布局不同,它的偏移**不能**在宿主上验;而每核结构是
+         * "全 u32"的,偏移两边一致。所以 C 算好、汇编读。
+         */
+        CHECK(offsetof_arm(percpu_t, cur_vfp_d) == ARM_PERCPU_OFF_CUR_VFP_D);
+        CHECK(offsetof_arm(percpu_t, cur_vfp_f) == ARM_PERCPU_OFF_CUR_VFP_F);
+        CHECK(offsetof_arm(percpu_t, cpu_id) == ARM_PERCPU_OFF_CPU_ID);
+        CHECK(sizeof(((percpu_t *)0)->cur_vfp_d) == 4u);
         /* 地址字段是 u32,不是 uintptr_t —— 后者在宿主上是 8 字节 */
         CHECK(sizeof(((percpu_t *)0)->stack_top) == 4u);
         CHECK(sizeof(((percpu_t *)0)->current_task) == 4u);

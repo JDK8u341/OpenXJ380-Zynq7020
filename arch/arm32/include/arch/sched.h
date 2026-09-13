@@ -249,8 +249,6 @@ bool sched_cpsr_matches_kernel(u32 cpsr);
 /* 内核侧(M4-8.3,实现在 src/sched_kern.c)                            */
 /* ------------------------------------------------------------------ */
 
-#define SCHED_MAX_SWITCHES_TRACKED 4096u /* 切换次数计数上限(诊断用,不封顶)*/
-
 /*
  * 本核当前线程。**唯一真相在 percpu_t.current_task**;这里只做转换,
  * 不另存一份(存两份就会有"派生量忘了同步"的静默失真)。
@@ -310,19 +308,35 @@ void sched_yield(void);
 void sched_park_self(void);
 
 /*
- * ★ 破坏性 A/B 的对照组开关 ★
+ * ★ 两个破坏性 A/B 的开关 ★
  *
- * 置 1 时 `sched_tick` **照做完一切**(计费、挑下一个、改状态、挪队列、
- * 收现场、搭新帧),只在最后一步**不把新帧交出去** —— 仍旧从原来那个帧返回。
- * 也就是说:决策说"切走了 N 次",而执行流一步都没动。
+ * `g_reloc_skip`:置 1 时 `sched_tick` 照做完一切,只在最后一步
+ * **不把新帧交出去** —— 决策说切走了,而执行流一步没动。
+ * `g_vfp_skip`:置 1 时**跳过浮点现场的保存/恢复**,其余照做。
  *
- * 这就是 M4-9 之前的行为,也正是"搬帧"要证明承重的那一件事:
- *   同一段代码、同一个负载,只差这一步,两个不让出的线程
- *   从"一次都跑不起来"变成"真的交错执行"。
+ * 两者都只在自检报告**之后**短暂置 1,生产路径恒为 0。
+ * (定义与详细理由在 src/sched_kern.c。)
+ */
+extern u32 g_reloc_skip;
+
+/*
+ * ★ 第二个破坏性 A/B:跳过浮点现场的保存/恢复 ★
+ *
+ * 置 1 时 `_vec_irq` 里那两条 `arch_vfp_save_current` /
+ * `arch_vfp_restore_current` 变成空操作(它们自己在汇编里读这个变量 ——
+ * 见 boot/context.S 的说明),其余一切照做。
+ * 也就是 M4-9.5 之前的样子。
+ *
+ * 预期可观测的差别:两个都在用 `double` 的线程,**其中一个**会发现
+ * 自己的 d0-d31 变成了对方的图案(它跑在"另一个线程的浮点现场"上)。
+ * 这正是"浮点现场也是现场"这条判据承重的证明方式。
+ *
+ * ⚠ 它的**定义在汇编里**(`boot/context.S` 的 `.data`)—— 读者是必须待在
+ *   C 调用链之外的那两条 `bl`,不能为了问一句"跳不跳"再调进 C。
  *
  * 生产路径上恒为 0。
  */
-extern u32 g_reloc_skip;
+extern u32 g_vfp_skip;
 
 /*
  * 把**启动上下文**注册成 idle(照源 OS)。
@@ -342,12 +356,6 @@ extern u32 g_reloc_skip;
  */
 void  sched_register_boot_idle(void);
 tcb_t sched_boot_idle(void);
-
-/*
- * tick 里给 current 计费 ← `timer_handle()` `scheduler.cpp:437`。
- * 独立出来是为了能单独测"计费"这件事(它不涉及切换)。
- */
-void sched_tick_account(void);
 
 /*
  * ★ M4-9:tick 里的完整调度决策 —— 而且**真的搬帧** ★

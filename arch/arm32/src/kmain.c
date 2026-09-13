@@ -203,6 +203,13 @@ static u32 g_spin_ok;            /* 两个见证都成立 */
 static u32 g_spin_sp_isolated;   /* 两个线程的 sp 都没掉出自己栈区 */
 static u32 g_spin_both_done;
 static u32 g_preempt_switches_ok;
+/* M4-9.5:浮点现场 */
+static u32 g_fp_ok;
+static u32 g_fp_done;
+static u32 g_fp_bad;
+static u32 g_fp_rm_bad;
+static u32 g_vfp_ctl_bad;
+static u32 g_vfp_ctl_detected;
 /* 对照组(搬帧关掉)*/
 static u32 g_reloc_ctl_a;
 static u32 g_reloc_ctl_b;
@@ -409,6 +416,128 @@ static void acc_probe(void *arg)
     for (;;) {
         arch_wfi();
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* M4-9.5:浮点现场探针                                                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * ## 判据为什么长这样
+ *
+ * 要证明的是"**一个线程被切走再切回来,它的 d0-d31 与 FPSCR 还是原样**"。
+ * 最直接的做法不是找一个 `double` 局部变量来看着它(那要赌编译器把它
+ * 分配在寄存器里而不是栈上 —— 一旦它被溢出到栈,寄存器被踩了也看不出来),
+ * 而是**直接把整个 d0-d31 填成自己的图案,然后反复读回来核对**:
+ *
+ *     d0-d31 <- 我的图案(只做一次)
+ *     循环 { 读回 d0-d31;逐个与我的图案比;记录不符次数 }
+ *     还要核对 FPSCR 的舍入模式(我的值还在吗)
+ *
+ * ⚠ "只填一次"是**判据成立的关键**,不是随手写的:
+ *   如果每一轮都重填,那么这个线程被切回来时会**先把自己的图案写回去**,
+ *   于是"寄存器被对方改过"这件事会被它自己抹掉 —— 判据永远通过,
+ *   等于没判。只填一次,别人的图案一旦进来就再也出不去,必被检出。
+ *
+ * ⚠ 两个线程因此**不是对称的**:被换下之后又换回来的那一个会发现自己的
+ *   寄存器变成了对方的(它读到了对方的图案);而对方因为从没读过、
+ *   只是"自己的图案还在",往往是干净的。
+ *   ⇒ 判据是"**至少有一个检出**",不是"两个都检出"。这一点写清楚,
+ *     免得后人看到"只有一个 bad"以为判据不对。
+ *
+ * 探针自己也用 `arch_vfp_save` / `arch_vfp_restore`(生产函数)来读写
+ * d0-d31 —— 于是这段自检顺带把这两个汇编原语也跑了一遍。
+ */
+#define FP_TAG_WORDS (ARM_VFP_D_REGS * 2u) /* 64 个 u32 = 32 个双字 = d0-d31 */
+#define FP_BUDGET_US 20000u
+
+typedef struct
+{
+    u32          pat[FP_TAG_WORDS];  /* 我的图案(要写进 d0-d31 的)*/
+    u32          snap[FP_TAG_WORDS]; /* 读回来的一次快照 */
+    u32          rmode;              /* 我的舍入模式(两个线程取不同值)*/
+    volatile u32 bad;                /* 快照与图案不符的次数(正常恒为 0)*/
+    volatile u32 rmode_bad;          /* 舍入模式不对的次数(正常恒为 0)*/
+    volatile u32 done;
+} fp_probe_t;
+
+static fp_probe_t g_fp[2];
+static fp_probe_t g_fp_ctl[2]; /* 对照组的两个 */
+
+static void fp_reset(fp_probe_t *pair)
+{
+    u32 i;
+    u32 j;
+
+    for (i = 0u; i < 2u; i++) {
+        for (j = 0u; j < FP_TAG_WORDS; j++) {
+            /* 两个线程的图案必须**一眼可分**,否则"读到对方的"看不出来 */
+            pair[i].pat[j]  = ((i == 0u) ? 0xA5A50000u : 0x5A5A0000u) + j;
+            pair[i].snap[j] = 0u;
+        }
+        pair[i].rmode     = (i == 0u) ? 0u : 3u; /* 0 = 就近舍入,3 = 向零舍入 */
+        pair[i].bad       = 0u;
+        pair[i].rmode_bad = 0u;
+        pair[i].done      = 0u;
+    }
+}
+
+static void fp_probe(void *arg)
+{
+    fp_probe_t *p  = (fp_probe_t *)arg;
+    u64         t0;
+    u32         fpscr_dummy;
+    u32         j;
+
+    /* d0-d31 <- 我的图案;FPSCR <- 干净值,再设成我的舍入模式 */
+    arch_vfp_restore(p->pat, 0u);
+    arch_vfp_set_rmode(p->rmode);
+
+    t0 = timer_read_us();
+    while ((timer_read_us() - t0) < (u64)FP_BUDGET_US) {
+        arch_vfp_save(p->snap, &fpscr_dummy);
+
+        for (j = 0u; j < FP_TAG_WORDS; j++) {
+            if (p->snap[j] != p->pat[j]) {
+                p->bad++;
+                break;
+            }
+        }
+
+        if (arch_vfp_get_rmode() != p->rmode) {
+            p->rmode_bad++;
+        }
+    }
+
+    p->done = 1u;
+    sched_park_self();
+    for (;;) {
+        arch_wfi();
+    }
+}
+
+static void fp_probe_a(void *arg)
+{
+    fp_probe((void *)&g_fp[0]);
+    (void)arg;
+}
+
+static void fp_probe_b(void *arg)
+{
+    fp_probe((void *)&g_fp[1]);
+    (void)arg;
+}
+
+static void fp_ctl_a(void *arg)
+{
+    fp_probe((void *)&g_fp_ctl[0]);
+    (void)arg;
+}
+
+static void fp_ctl_b(void *arg)
+{
+    fp_probe((void *)&g_fp_ctl[1]);
+    (void)arg;
 }
 
 /* M4-7:异常帧是否落在 SVC 栈区(1 = 在,0 = 不在)*/
@@ -2063,6 +2192,39 @@ void kmain(void)
                                g_spin_ok ? "PASS" : "FAIL");
             }
         }
+
+        /* ---- 相 3:★ M4-9.5 的验收 —— 浮点现场 ★ ---- */
+        /*
+         * 两个线程各自把 d0-d31 填成自己的图案(只填一次),然后反复核对;
+         * 还要核对 FPSCR 的舍入模式。切换时若不换浮点现场,后一个把寄存器
+         * 改掉之后,先被换下的那个再回来就会读到对方的图案。
+         *
+         * 判据见 fp_probe_t 上面的说明(尤其是"只填一次"与"至少一个检出")。
+         */
+        sched_disable();
+        fp_reset(g_fp);
+        {
+            tcb_t fa = sched_kthread_create(fp_probe_a, NULL, "fa");
+            tcb_t fb = sched_kthread_create(fp_probe_b, NULL, "fb");
+
+            sched_enable();
+
+            if (fa == NULL || fb == NULL) {
+                console_puts(" Sched fp    : kthread_create FAILED\n");
+            } else {
+                timer_delay_ms(FP_BUDGET_US / 1000u + 300u);
+
+                g_fp_done   = (g_fp[0].done && g_fp[1].done) ? 1u : 0u;
+                g_fp_bad    = g_fp[0].bad + g_fp[1].bad;
+                g_fp_rm_bad = g_fp[0].rmode_bad + g_fp[1].rmode_bad;
+                g_fp_ok     = ((g_fp_bad == 0u) && (g_fp_rm_bad == 0u) && g_fp_done) ? 1u : 0u;
+
+                console_printf(" Sched fp    : bad=(%u,%u) rmode_bad=(%u,%u) done=%u\n", g_fp[0].bad,
+                               g_fp[1].bad, g_fp[0].rmode_bad, g_fp[1].rmode_bad, g_fp_done);
+                console_printf(" Sched fp    : VFP context across switches = %s\n",
+                               g_fp_ok ? "PASS" : "FAIL");
+            }
+        }
     }
 
     /* ---- 10. 启动自检总账 ---- */
@@ -2289,6 +2451,19 @@ void kmain(void)
      * 完整经过见 arch/taskctx.h 的 ARM_CPSR_KERNEL。
      */
     selftest_report("sched_cpsr_kernel", g_cpsr_kernel_ok, 1u, SELFTEST_EQ);
+
+    /*
+     * ---- ★ M4-9.5:浮点现场随切换保存/恢复 ★ ----
+     *
+     * 三项分开:
+     *   fp_vfp_context  两个线程的 d0-d31 与 FPSCR 舍入模式都没被对方改过
+     *   fp_done         两个线程都真的跑完了(否则上面那条可能只是因为
+     *                   "根本没被抢占过" —— 那就什么也证明不了)
+     *   fp_switch       期间真的发生过切换(同上,防"没切所以没错")
+     */
+    selftest_report("sched_fp_vfp_context", g_fp_ok, 1u, SELFTEST_EQ);
+    selftest_report("sched_fp_done", g_fp_done, 1u, SELFTEST_EQ);
+    selftest_report("sched_fp_switched", (g_tick_preempted >= 2u) ? 1u : 0u, 1u, SELFTEST_EQ);
     /*
      * `invalid_ctx` 必须恒为 0:它不是"发生过多少件坏事"的计数,
      * 而是"调度器有没有挑到过不可切换的上下文"。挑了就是有 bug ——
@@ -2506,19 +2681,96 @@ void kmain(void)
             console_printf(" Preempt A/B : 未搬帧 -> %s(这就是「决策说切了、执行流没动」的样子)\n",
                            g_reloc_ctl_detected ? "检出" : "未检出 —— 判据不承重!");
             /*
-             * ⚠ 一条**没有查清**的观察,如实记下来而不是编个解释:
+             * ⚠ 一个曾经留痕、现在有结果的观察:
              *
-             *   窗口内 `switched` 只涨 2(第 1 次 idle→ca、第 2 次 ca→cb),
-             *   而 `invalid` 一次都没涨。按代码推演,第 2 次之后 ca 的 ctx 已经
-             *   被收成了 kmain 的现场,`sched_ctx_switchable(ca)` 应当开始
-             *   持续拒绝它 —— 也就是说 `invalid` 应当在窗口内就涨起来。
-             *   **实测是 0**,原因未查清。
+             *   早先几轮里这一行打出过 `invalid=0->0` —— 窗口内 `switched`
+             *   涨了 2 而 `invalid` 一次都没涨,与"第 2 次之后 ca 的 ctx
+             *   被收成 kmain 的现场、于是持续被拒绝"的推演不符。
              *
-             *   它不影响任何判据:检出的两个条件(线程一次没跑、决策确实发生过)
-             *   都由实测值支撑,而且对照组窗口内的 `switched=2 > 0` 是真的。
-             *   但"推演与实测不符"这件事本身要留痕,交给 M4-10(每核队列 +
-             *   负载均衡会重写这一片)去查,别让它悄悄消失。
+             *   **加入 M4-9.5 的浮点现场切换之后,它变成 `0->53`** ——
+             *   与推演一致(窗口 220ms ÷ 4 tick 片长 ≈ 55)。
+             *   先前那次为什么是 0 我没有查明,现象现在也不复现了。
+             *   记在这里是因为"当时的推演与实测不符"本身是信息:
+             *   它说明这条路径的时序对代码改动**敏感**,而敏感点还没定位。
+             *   交给 M4-10(每核队列会重写这一片)时一并看。
+             *
+             * ⚠ 无论取哪个值,都不影响检出判据:判据是
+             *   "两个探针计数**都是 0**"且"这段时间**确实搬过帧**",
+             *   两件事都由实测值直接支撑。
              */
+        }
+    }
+
+    /* ---- 9.76 浮点现场的破坏性对照组(同样必须在报告**之后**)---- */
+    /*
+     * 同一段切换代码、同一对浮点探针,**只把"存/取浮点现场"关掉**
+     * (`g_vfp_skip = 1`,那两条汇编里的 `bl` 变成空操作)。
+     *
+     *   存/取开:两个线程的 d0-d31 与 FPSCR 各自保持  → bad = 0
+     *   存/取关:其中一个会读到对方的图案            → bad > 0
+     *
+     * ⚠ 判据是"**检出**"(bad > 0),不是"没有错"。与 9.7 的"不换栈"
+     *   和 9.75 的"不搬帧"一样:这里是**预期它坏**。
+     *
+     * ⚠ 必须放在报告之后:这一相同样会把 `current_task` 与 `idle->ctx`
+     *   搅歪(线程真的跑起来了,而且 `g_reloc_skip` 是关的)。
+     */
+    {
+        tcb_t ca;
+        tcb_t cb;
+
+        fp_reset(g_fp_ctl);
+
+        sched_disable();
+        ca = sched_kthread_create(fp_ctl_a, NULL, "fca");
+        cb = sched_kthread_create(fp_ctl_b, NULL, "fcb");
+
+        if (ca == NULL || cb == NULL) {
+            sched_enable();
+            console_puts(" VFP A/B     : kthread_create FAILED\n");
+        } else {
+            arm_task_ctx_t idle_ctx_backup = sched_boot_idle()->ctx;
+
+            g_vfp_skip = 1u; /* ★ 对照组:不换浮点现场 ★ */
+            sched_enable();
+            timer_delay_ms(FP_BUDGET_US / 1000u + 300u);
+            g_vfp_skip = 0u;
+
+            console_printf(" VFP A/B     : bad=(%u,%u) rmode_bad=(%u,%u) done=%u\n", g_fp_ctl[0].bad,
+                           g_fp_ctl[1].bad, g_fp_ctl[0].rmode_bad, g_fp_ctl[1].rmode_bad,
+                           (g_fp_ctl[0].done && g_fp_ctl[1].done) ? 1u : 0u);
+
+            /*
+             * ⚠ 检出条件是"**至少一个**线程发现自己的寄存器被换了",
+             *   不是两个都发现 —— 理由见 fp_probe_t 上面那段说明:
+             *   只有"被换下又换回来"的那一个读得到对方的图案;
+             *   对方只是"自己的图案还在",自然干净。
+             *
+             * ⚠ 还要确认两个线程**都真的跑过**(done):否则"没检出"
+             *   可能只是因为它们压根没被调度进来。
+             */
+            g_vfp_ctl_bad      = g_fp_ctl[0].bad + g_fp_ctl[1].bad +
+                                 g_fp_ctl[0].rmode_bad + g_fp_ctl[1].rmode_bad;
+            g_vfp_ctl_detected = ((g_vfp_ctl_bad > 0u) && g_fp_ctl[0].done && g_fp_ctl[1].done)
+                                     ? 1u
+                                     : 0u;
+
+            console_printf(" VFP A/B     : 未换浮点现场 -> %s(这就是「寄存器被对方改掉」的样子)\n",
+                           g_vfp_ctl_detected ? "检出" : "未检出 —— 判据不承重!");
+
+            /* 收拾:与 9.75 同一套(挂起两个线程、复位 current / 队列 / idle 现场)*/
+            ca->status      = WAIT;
+            ca->wakeup_time = 0u;
+            ca->sched_next  = NULL;
+            cb->status      = WAIT;
+            cb->wakeup_time = 0u;
+            cb->sched_next  = NULL;
+            g_vfp_skip      = 0u;
+
+            sched_set_current(sched_boot_idle());
+            sched_boot_idle()->status = RUNNING;
+            sched_boot_idle()->ctx    = idle_ctx_backup;
+            sched_kern_init();
         }
     }
 

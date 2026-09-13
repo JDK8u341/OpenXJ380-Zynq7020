@@ -311,3 +311,31 @@
  *   ARM 侧由 percpu.h 的 _Static_assert 钉住。
  */
 #define ARM_PERCPU_OFF_CURRENT_TASK 0x28u
+
+/*
+ * VFP 现场的两个指针(M4-9.5),同样是 u32 地址。
+ *
+ * ★ 为什么要放进每核结构,而不是让汇编自己去算 TCB 的偏移 ★
+ *
+ * 存/取浮点现场必须在**任何 C 代码之前**和**所有 C 代码返回之后**做 ——
+ * 否则就要依赖"这段 C 不会用 VFP"这个编译器说了算的前提。
+ * 而那个前提**在本内核里已经被证伪过一次**:GCC 会用
+ * `vldr d16,[pc]; vstr d16,[rN]` 这个 **64 位清零惯用法**,
+ * 本内核里 `palloc_selftest` / `percpu_table_reset` / `sched_entity_init` /
+ * `smp_release_cpu1` 四处都在用它。`sched_tick` 里那句
+ * `pc->scheduler_ticks = 0u` 正是"64 位存零",今天编成两条整数 store,
+ * 换个版本就可能变成上面那个惯用法 —— 那时它就会**在恢复之后**
+ * 把目标线程的 d16 踩掉,而现场里其余部分全是对的。
+ *
+ * 所以:汇编只认**每核结构**的偏移(它已经是"全 u32 字段、宿主与目标
+ * 布局一致"的,这一条由 percpu.h 的 _Static_assert 保证),
+ * 而"TCB 里 vfp/fpscr 在哪"由 **C 侧算好**存进下面这两个字段。
+ */
+#define ARM_PERCPU_OFF_CUR_VFP_D 0x38u
+#define ARM_PERCPU_OFF_CUR_VFP_F 0x3Cu
+
+/*
+ * 核号字段的偏移。`arch_vfp_*` 用它做"只有 CPU0 参与调度"的守卫 ——
+ * 否则 CPU1 的一发中断会去消费 CPU0 布下的状态。
+ */
+#define ARM_PERCPU_OFF_CPU_ID 0x00u

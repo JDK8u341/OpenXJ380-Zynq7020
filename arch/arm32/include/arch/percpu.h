@@ -116,6 +116,25 @@ typedef struct
      *    累计量是 `percpu_t.ticks`。)
      */
     u64 scheduler_ticks;
+
+    /*
+     * ---- 当前线程的浮点现场在哪(M4-9.5)----
+     *
+     * ★ 为什么由 C 算好放进这里,而不是让汇编去查 TCB 的偏移 ★
+     *
+     * 存/取浮点现场必须在**任何 C 代码之前**与**所有 C 代码返回之后**做,
+     * 因为 `sched_tick` 这类函数会不会碰 VFP 是**编译器说了算**的
+     * (本内核里 GCC 已经用 `vldr d16,[pc]; vstr d16,[rN]` 做 64 位清零,
+     *  见 arch/taskctx_asm.h 的说明)。于是那段汇编必须绕开 C 调用链,
+     * 也就只能读**每核结构**的固定偏移。
+     *
+     * 而"TCB 里 `vfp`/`fpscr` 在哪"是本结构体**不允许**承担的知识
+     * (TCB 有指针字段,宿主与目标布局不同)。两头一对,答案就是:
+     * **C 侧在 `sched_set_current()` 里把地址算好写进来**,
+     * 汇编只按下面两个固定偏移取。仍然是 u32 地址,不是指针。
+     */
+    u32 cur_vfp_d; /* → 当前线程 TCB 里的 vfp[ARM_VFP_D_REGS * 2],0 = 不处理 */
+    u32 cur_vfp_f; /* → 同一 TCB 里的 fpscr */
 } percpu_t;
 
 /* 把 current_task 取成 tcb_t。集中在一处,避免散落的强制转换 */
@@ -132,6 +151,12 @@ struct arm_thread_control_block;
  */
 _Static_assert(offsetof_arm(percpu_t, current_task) == ARM_PERCPU_OFF_CURRENT_TASK,
                "current_task 的偏移变了 —— 同步改 arch/taskctx_asm.h 的 ARM_PERCPU_OFF_CURRENT_TASK");
+_Static_assert(offsetof_arm(percpu_t, cpu_id) == ARM_PERCPU_OFF_CPU_ID,
+               "cpu_id 的偏移变了 —— 同步改 arch/taskctx_asm.h 的 ARM_PERCPU_OFF_CPU_ID");
+_Static_assert(offsetof_arm(percpu_t, cur_vfp_d) == ARM_PERCPU_OFF_CUR_VFP_D,
+               "cur_vfp_d 的偏移变了 —— 同步改 arch/taskctx_asm.h 的 ARM_PERCPU_OFF_CUR_VFP_D");
+_Static_assert(offsetof_arm(percpu_t, cur_vfp_f) == ARM_PERCPU_OFF_CUR_VFP_F,
+               "cur_vfp_f 的偏移变了 —— 同步改 arch/taskctx_asm.h 的 ARM_PERCPU_OFF_CUR_VFP_F");
 
 /*
  * ★ 布局不变式:本结构体里**不能出现指针宽度的字段** ★
@@ -143,8 +168,8 @@ _Static_assert(offsetof_arm(percpu_t, current_task) == ARM_PERCPU_OFF_CURRENT_TA
  */
 _Static_assert(offsetof_arm(percpu_t, scheduler_ticks) == 48u,
                "scheduler_ticks 应当 8 字节对齐到 48");
-_Static_assert(sizeof(percpu_t) == 56u,
-               "sizeof(percpu_t) 不是 56 —— 多半是有人加了指针/uintptr_t 字段,"
+_Static_assert(sizeof(percpu_t) == 64u,
+               "sizeof(percpu_t) 不是 64 —— 多半是有人加了指针/uintptr_t 字段,"
                "那会让宿主与目标的布局分叉");
 
 extern percpu_t g_percpu[PERCPU_MAX_CPUS];

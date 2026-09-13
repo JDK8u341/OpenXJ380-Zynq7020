@@ -230,9 +230,11 @@ _vec_undefined:
     .global _vec_svc
 _vec_svc:
     EXC_FRAME_ENTER ARM_EXC_RET_FIX_SVC
+    bl      arch_vfp_save_current   /* ★ 任何 C 之前 ★ 见 context.S 的长说明 */
     mov     r0, sp
     bl      c_svc_handler
     mov     sp, r0                  /* ★ 返回值即"从哪个帧离开" ★ */
+    bl      arch_vfp_restore_current /* ★ 所有 C 返回之后 ★ */
     EXC_FRAME_LEAVE
 
 /*
@@ -286,6 +288,19 @@ _vec_reserved:
     .global _vec_irq
 _vec_irq:
     EXC_FRAME_ENTER ARM_EXC_RET_FIX_IRQ
+    /*
+     * ★ M4-9.5:浮点现场 —— 存必须在**任何 C 之前** ★
+     *
+     * 理由写在 context.S(`arch_vfp_save_current` 上面):C 代码会不会用
+     * VFP 是编译器说了算的,而本内核里 GCC 已经在用 `vldr d16/vstr d16`
+     * 做 64 位清零 —— 那种指令出现在下面这段 C 里,就会把"要保存的
+     * 现场"本身改掉,或者在恢复之后把目标的现场踩掉。
+     * 卡在 C 的两端,判据里就没有这个前提了。
+     *
+     * ⚠ `bl` 会踩 LR —— 而 LR 已经在 `EXC_FRAME_ENTER` 里存进帧的
+     *   `svc_lr` 槽了,所以这里是安全的(这也是那个槽存在的理由之一)。
+     */
+    bl      arch_vfp_save_current
     mov     r0, sp                  /* 帧指针作为第一个参数传给 C */
     bl      c_irq_handler
     /*
@@ -300,6 +315,17 @@ _vec_irq:
      * 这正是 M4-7 把现场帧建在**任务的栈**上的用处:帧在谁的栈上,谁就被恢复。
      */
     mov     sp, r0
+    /*
+     * ★ 所有 C 都返回了,现在才换浮点现场 ★
+     *
+     * 这一句之后只剩 `EXC_FRAME_LEAVE`(纯整数:`ldmia` / `ldr` / `add` /
+     * `rfeia`),没有任何东西能再碰 d0-d31。
+     *
+     * ⚠ 恢复的是**新的 current**(`sched_tick` 里已经 `sched_set_current(next)`,
+     *   而那一步会同时把每核结构里的两个指针改成 next 的)—— 所以这里
+     *   不需要参数,也不需要"布防/撤防"这类跨核共享的状态。
+     */
+    bl      arch_vfp_restore_current
     EXC_FRAME_LEAVE
 
 /*

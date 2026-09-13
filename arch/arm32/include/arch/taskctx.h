@@ -379,6 +379,55 @@ void arch_ctx_switch(arm_task_ctx_t *from, arm_task_ctx_t *to);
 extern u32 g_ctx_skip_sp;
 
 /* ------------------------------------------------------------------ */
+/* VFP 上下文(M4-9.5,实现在 boot/context.S)                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * ← x86 的 `save_fpu_context()` / `restore_fpu_context()`
+ * (`include/cpu/fpu.h`;`scheduler.cpp:121-122` 每次切换都调)。
+ *
+ * `d32` 指向 TCB 里的 `vfp[ARM_VFP_D_REGS * 2]`(64 个 u32 = 32 个双字),
+ * 必须是 4 字节对齐的 —— TCB 的自然对齐是 8,天然满足。
+ *
+ * ★ 这两条是"补账"★:README 的 M4-6 那节早就写明"M4-7 的切换点调用",
+ *   而实现一直是零(`TCB.vfp[]`/`fpscr` 是死字段)。M4-9 把切换从罕见的
+ *   主动行为变成每 4ms 一次的非自愿抢占之后,缺它的后果是
+ *   **线程的浮点寄存器被别的线程悄悄改掉 ⇒ 算出错的数,而不是崩溃**。
+ */
+void arch_vfp_save(u32 *d32, u32 *fpscr_out);
+void arch_vfp_restore(const u32 *d32, u32 fpscr);
+
+/*
+ * ★ 切换浮点现场 —— 由 `_vec_irq` / `_vec_svc` 调用,必须在 C 调用链之外 ★
+ *
+ * 两条都不需要参数:它们读**每核结构**里的 `cur_vfp_d` / `cur_vfp_f`
+ * (由 `sched_set_current()` 用 C 算好写进去),因此拿到的是"**当前**
+ * 那个线程的浮点现场在哪" —— 存的时候当前还是 cur,恢复的时候
+ * `sched_tick` 已经把当前改成了 next。
+ *
+ * ⚠ 为什么不能放在 `sched_tick` 里:恢复之后还要经过那段 C 的收尾,
+ *   而"收尾会不会碰浮点寄存器"是编译器说了算的(本内核里 GCC 已经在用
+ *   `vldr d16/vstr d16` 做 64 位清零)。完整理由见 boot/context.S。
+ *
+ * 两条都会被 `g_vfp_skip`(破坏性 A/B)短路,并且只在 CPU0 上生效。
+ */
+void arch_vfp_save_current(void);
+void arch_vfp_restore_current(void);
+
+/* `sched_set_current()` 与汇编之间的那一半:当前线程的 `&fpscr`。
+ * 定义在 boot/context.S。⚠ 与 `percpu_t.cur_vfp_f` 同生同死,不是第二份真相。 */
+extern u32 g_vfp_save_f;
+
+/*
+ * FPSCR 的舍入模式(bit[23:22])。**只给自检用。**
+ *
+ * 挑这两位是因为 FPSCR 其余大多是**累积状态标志**,任何一次浮点运算都能
+ * 置位,拿它们当"我的值还在吗"的地标会误判;RMode 只有软件会改。
+ */
+void arch_vfp_set_rmode(u32 mode);
+u32  arch_vfp_get_rmode(void);
+
+/* ------------------------------------------------------------------ */
 /* 陷阱式让出(M4-9,实现在 boot/context.S)                            */
 /* ------------------------------------------------------------------ */
 

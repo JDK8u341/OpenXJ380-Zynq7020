@@ -318,3 +318,234 @@ arch_svc_yield:
     svc     #ARM_SVC_YIELD
     bx      r12                         /* r12 由异常帧保存/恢复,穿过陷阱 */
     .size   arch_svc_yield, . - arch_svc_yield
+
+/* ==================================================================== */
+/* VFP 上下文(M4-9.5)                                                  */
+/* ==================================================================== */
+/*
+ * ← x86 侧的 `save_fpu_context()` / `restore_fpu_context()`
+ *   (`include/cpu/fpu.h`),每次 `change_proccess` 都做(`scheduler.cpp:121-122`)。
+ *
+ * ★ 这一段是**补账**,不是新功能 ★
+ *
+ * README 的 M4-6 那节早就写明"M4-7 的切换点调用",而实现是零 ——
+ * 全树搜 `vstmia|vldmia|vmrs|vmsr` 一条都没有,`TCB.vfp[64]`/`fpscr`
+ * 是纯粹的**死字段**。M4-9 之前切换罕见,暴露面小;M4-9 之后是每 4ms
+ * 一次的非自愿抢占 —— 任何线程里一个 `double` 就会被别的线程悄悄改掉,
+ * 而症状是**算出错的数,不是崩溃**。
+ *
+ * ## 为什么要 .fpu vfpv3
+ *
+ * `.arch armv7-a` 隐含的是 VFPv3-**D16**(只有 d0-d15)。本内核用
+ * `-mfpu=vfpv3`(32 个双字寄存器),要访问 d16-d31 必须显式声明,
+ * 否则汇编器会直接拒绝那两条 `vstmia`。C 侧是编译器自己处理的,
+ * 所以这个坑只有手写汇编会碰到。
+ *
+ * ## 对齐
+ *
+ * `vstmia`/`vldmia` 要求地址**4 字节对齐**。`TCB.vfp[64]` 在结构体里
+ * 是 8 字节对齐的(TCB 的自然对齐是 8),所以天然满足。
+ *
+ * ## 寄存器约定
+ *
+ * 四个函数都只用 r0/r1/r2(r2 是 caller-saved 的临时寄存器),
+ * 不动 r4-r11,也不碰条件码之外的状态 —— 于是它们可以在 `sched_tick`
+ * 的中途安全调用。
+ */
+    .fpu    vfpv3
+
+/*
+ * void arch_vfp_save(u32 *d32, u32 *fpscr_out)
+ *   d32[0..63] <- d0..d31   (32 个双字 = 64 个字 = 256 字节)
+ *   *fpscr_out <- FPSCR
+ *
+ * ⚠ 一次 `vstmia` 最多搬 16 个双字(imm8 以"字"计数,上限 32 字),
+ *   所以 d0-d31 要两条。
+ */
+    .global arch_vfp_save
+    .type   arch_vfp_save, %function
+arch_vfp_save:
+    vstmia  r0!, {d0-d15}
+    vstmia  r0!, {d16-d31}
+    vmrs    r2, fpscr
+    str     r2, [r1]
+    bx      lr
+    .size   arch_vfp_save, . - arch_vfp_save
+
+/*
+ * void arch_vfp_restore(const u32 *d32, u32 fpscr)
+ *   d0..d31 <- d32[0..63]
+ *   FPSCR   <- fpscr
+ */
+    .global arch_vfp_restore
+    .type   arch_vfp_restore, %function
+arch_vfp_restore:
+    vldmia  r0!, {d0-d15}
+    vldmia  r0!, {d16-d31}
+    vmsr    fpscr, r1
+    bx      lr
+    .size   arch_vfp_restore, . - arch_vfp_restore
+
+/*
+ * FPSCR 的舍入模式(bit[23:22],RMode)。**只给自检用。**
+ *
+ * 为什么单独挑这两位来验:FPSCR 的绝大多数位是**累积状态标志**
+ * (IOC/DZC/OFC/UFC/IXC),任何一次浮点运算都可能置位 —— 拿它们做
+ * "我的值还在吗"的判据会误判。而 RMode 只有软件会改,是干净的地标。
+ */
+    .global arch_vfp_set_rmode
+    .type   arch_vfp_set_rmode, %function
+arch_vfp_set_rmode:
+    mov     r2, #3
+    vmrs    r1, fpscr
+    bic     r1, r1, r2, lsl #22
+    orr     r1, r1, r0, lsl #22
+    vmsr    fpscr, r1
+    bx      lr
+    .size   arch_vfp_set_rmode, . - arch_vfp_set_rmode
+
+    .global arch_vfp_get_rmode
+    .type   arch_vfp_get_rmode, %function
+arch_vfp_get_rmode:
+    vmrs    r0, fpscr
+    lsr     r0, r0, #22
+    and     r0, r0, #3
+    bx      lr
+    .size   arch_vfp_get_rmode, . - arch_vfp_get_rmode
+
+/* ==================================================================== */
+/* ★ 切换浮点现场 —— 必须在 C 调用链**之外** ★(M4-9.5)                */
+/* ==================================================================== */
+/*
+ * ★★ 为什么不放在 `sched_tick` 里 ★★
+ *
+ * 直觉做法是在 `sched_tick` 的搬帧那一段调 `arch_vfp_save/restore`。
+ * **不行**,而且理由是实测出来的:
+ *
+ * 恢复完 `next` 的 d0-d31 之后,还要经过 `sched_tick` 的收尾、
+ * `c_irq_handler` 的收尾、以及各自函数序言/尾声里可能存在的
+ * `vpush/vpop {d8-d15}`。**只要那条链上任何一处碰了浮点寄存器,
+ * 刚恢复的现场就被踩掉了。**
+ *
+ * 而"这条链会不会碰浮点"是**编译器说了算**的 —— 本内核里 GCC 已经在用
+ * `vldr d16,[pc]; vstr d16,[rN]` 这个 **64 位清零惯用法**
+ * (`palloc_selftest` / `percpu_table_reset` / `sched_entity_init` /
+ *  `smp_release_cpu1` 四处),而 `sched_tick` 里那句
+ * `pc->scheduler_ticks = 0u` 正是"64 位存零",今天编成两条整数 store,
+ * 换个版本/改一行就可能变成上面那个惯用法。
+ *
+ * ⇒ 所以存与取都放进汇编,并且**卡在 C 的两端**:
+ *
+ *     _vec_irq:
+ *         EXC_FRAME_ENTER …          @ 帧已建好
+ *         bl  arch_vfp_save_current  @ ★ 任何 C 之前 ★
+ *         mov r0, sp
+ *         bl  c_irq_handler          @ 这一整段爱怎么用 VFP 就怎么用
+ *         mov sp, r0
+ *         bl  arch_vfp_restore_current  @ ★ 所有 C 返回之后 ★
+ *         EXC_FRAME_LEAVE            @ 之后只剩纯整数指令
+ *
+ * 于是判据里**不再包含任何"编译器不会…"的前提**。
+ *
+ * ## 那两个指针从哪来
+ *
+ * 汇编不去算 TCB 的偏移(那要求 TCB 布局宿主与目标一致,而它有指针字段),
+ * 而是读**每核结构**里的 `cur_vfp_d` / `cur_vfp_f` —— 那两个字段由
+ * `sched_set_current()` 用 C 算好写进去。每核结构是"全 u32 字段"的
+ * (percpu.h 有断言),所以它的偏移在宿主与目标上一致,汇编可以放心用。
+ *
+ * ## 为什么两个函数都要查 cpu_id
+ *
+ * 目前只有 CPU0 参与调度。CPU1 的 1kHz 定时器同样会走 `_vec_irq`,
+ * 如果它去消费 CPU0 布下的状态,就会把 CPU0 的现场搬到 CPU1 上 ——
+ * 两个核同时用一份 d0-d31。
+ *
+ * ## 为什么用 `ldmia` 而不是 `vldmia`
+ *
+ * 这里要读的是**每核结构里的普通内存**(不是 VFP 寄存器),所以是整数
+ * `ldr`。下面 `vldmia`/`vstmia` 才是真的搬 d0-d31。
+ */
+    .global arch_vfp_save_current
+    .type   arch_vfp_save_current, %function
+arch_vfp_save_current:
+    ldr     r3, =g_vfp_skip
+    ldr     r3, [r3]
+    cmp     r3, #0
+    bxne    lr                          /* 破坏性 A/B:跳过 */
+
+    mrc     p15, 0, r0, c13, c0, 4      /* r0 = TPIDRPRW = 本核 percpu_t* */
+    cmp     r0, #0
+    bxeq    lr
+    ldr     r1, [r0, #ARM_PERCPU_OFF_CPU_ID]
+    cmp     r1, #0
+    bxne    lr                          /* 只有 CPU0 参与调度 */
+    ldr     r0, [r0, #ARM_PERCPU_OFF_CUR_VFP_D]
+    cmp     r0, #0
+    bxeq    lr                          /* 还没有 current,或已声明不处理 */
+
+    ldr     r1, =g_vfp_save_f
+    ldr     r1, [r1]                    /* r1 = &cur->fpscr */
+    vstmia  r0!, {d0-d15}
+    vstmia  r0!, {d16-d31}
+    vmrs    r2, fpscr
+    str     r2, [r1]
+    bx      lr
+    .size   arch_vfp_save_current, . - arch_vfp_save_current
+
+    .global arch_vfp_restore_current
+    .type   arch_vfp_restore_current, %function
+arch_vfp_restore_current:
+    ldr     r3, =g_vfp_skip
+    ldr     r3, [r3]
+    cmp     r3, #0
+    bxne    lr
+
+    mrc     p15, 0, r0, c13, c0, 4
+    cmp     r0, #0
+    bxeq    lr
+    ldr     r1, [r0, #ARM_PERCPU_OFF_CPU_ID]
+    cmp     r1, #0
+    bxne    lr
+    ldr     r0, [r0, #ARM_PERCPU_OFF_CUR_VFP_D]
+    cmp     r0, #0
+    bxeq    lr
+
+    ldr     r1, =g_vfp_save_f
+    ldr     r1, [r1]
+    ldr     r1, [r1]                    /* r1 = fpscr 的值 */
+    vldmia  r0!, {d0-d15}
+    vldmia  r0!, {d16-d31}
+    vmsr    fpscr, r1
+    bx      lr
+    .size   arch_vfp_restore_current, . - arch_vfp_restore_current
+
+/*
+ * C 侧把"当前线程的浮点现场在哪"写进每核结构,汇编读的是同一对地址。
+ *
+ * `g_vfp_save_f` 是给 C 用的便利变量:`sched_set_current()` 一次写两个
+ * 指针,而 `_vec_irq` 里那两条 `bl` 之间**不会有别的写者**
+ * (中断全程 I=1,而且只有 CPU0 走这条路),所以一个全局量够了。
+ * 换成两个每核字段也可以,但那就多两个偏移要维护、换不来什么。
+ *
+ * ⚠ 它不是"第二份真相":真值在 `percpu_t.cur_vfp_d`(汇编直接读),
+ *   这里只放同一对象的 `&fpscr` 一半,而且与前者同生同死
+ *   (`sched_set_current()` 一起写、一起清)。
+ */
+    .global g_vfp_save_f
+    .data
+    .align  2
+g_vfp_save_f:
+    .word   0
+
+/*
+ * ★ 破坏性 A/B 的开关:置 1 时**完全跳过**浮点现场的存与取 ★
+ *
+ * 定义在汇编里(而不是像 `g_reloc_skip` 那样在 C 里),是因为它的读者是
+ * 上面两个汇编函数 —— 它们必须在 C 调用链之外,"先调一个 C 函数问一句
+ * 跳不跳"就等于又把 C 拉回了窗口里。C 侧用 `extern` 声明它来置位。
+ */
+    .global g_vfp_skip
+    .data
+    .align  2
+g_vfp_skip:
+    .word   0

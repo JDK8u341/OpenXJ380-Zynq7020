@@ -97,6 +97,29 @@ void sched_set_current(tcb_t t)
     }
 
     pc->current_task = (t == NULL) ? 0u : (u32)(uintptr_t)t;
+
+    /*
+     * ★ 顺带把"这个线程的浮点现场在哪"算好,交给汇编 ★
+     *
+     * 存/取浮点现场要卡在 C 调用链的两端(`_vec_irq` 里的两条 `bl`),
+     * 所以那段汇编不能去查 TCB 的偏移 —— TCB 有指针字段,宿主与目标的
+     * 布局不一样,而每核结构是"全 u32"的,它的偏移两边一致。
+     * ⇒ 偏移在 C 里算,结果放进每核结构;见 arch/percpu.h 的说明。
+     *
+     * ⚠ `t == NULL` 时两个指针必须清 0 —— 汇编拿它当"没有 current,
+     *   别碰浮点"的判据(`arch_vfp_save_current` 里的 `bxeq lr`)。
+     *   留着上一次的地址会让 CPU1 或启动早期去写一个不相干的 TCB。
+     */
+    if (t == NULL) {
+        pc->cur_vfp_d = 0u;
+        pc->cur_vfp_f = 0u;
+        g_vfp_save_f  = 0u;
+        return;
+    }
+
+    pc->cur_vfp_d = (u32)(uintptr_t)t->vfp;
+    pc->cur_vfp_f = (u32)(uintptr_t)&t->fpscr;
+    g_vfp_save_f  = pc->cur_vfp_f;
 }
 
 /* ------------------------------------------------------------------ */
@@ -281,6 +304,19 @@ tcb_t sched_kthread_create(void (*entry)(void *), void *arg, const char *name)
 u32 g_reloc_skip;
 
 /*
+ * ★ 第二个破坏性 A/B 开关:跳过浮点现场的保存/恢复 ★
+ *
+ * ⚠ 它的**存储**在汇编里(boot/context.S 的 `.data`),这里只是声明 ——
+ *   因为读者是 `_vec_irq` 那两条必须待在 C 调用链之外的 `bl`:
+ *   "先调一个 C 函数问一句跳不跳"就等于把 C 又拉回了窗口里。
+ *
+ * 置 1 时两个线程的 d0-d31 不再随切换而换,于是**其中一个**会发现自己的
+ * 寄存器变成了对方的图案。见 include/arch/sched.h 的说明。
+ * 生产路径上恒为 0。
+ */
+extern u32 g_vfp_skip;
+
+/*
  * 让出 CPU —— **走陷阱**,与"被抢占"是同一条路径。
  *
  * ← `scheduler_yield()` `scheduler.cpp:460-465`:
@@ -431,29 +467,18 @@ tcb_t sched_boot_idle(void)
 /* ------------------------------------------------------------------ */
 
 /*
- * ← `timer_handle()` `scheduler.cpp:437`:
- *      charge_current_eevdf_runtime(current, EEVDF_TICK_NS);
+ * ⚠ 这里原本有一个 `sched_tick_account()`(M4-8):它只做"给 current 计费",
+ *   因为那时 `sched_tick` 还只做决策、不做切换,M4-8 想把"计费"单独测。
  *
- * **这是 M4-8 里唯一会让策略在板上"活起来"的地方**,而且它不做任何切换 ——
- * 切换是 M4-9 的事。所以本步的板级判据可以是:
- * 跑 N 个 tick 之后,current(启动上下文)的 vruntime 正好涨了 N 毫秒。
- *
- * ⚠ 只在 current 确实在跑、且不是 idle 时才计费 —— 与源 OS 的三条早退一致
- *   (idle / 非 RUNNING / runtime 为 0),那些早退在 sched_account_run 里。
+ *   M4-9 把计费并进了 `sched_tick` 的第一步之后,它**没有任何调用者**了 ——
+ *   而"声明 + 定义都在、就是没人调"这种东西会让人以为功能还在,
+ *   所以按退化清单 D10 删掉,而不是留着。
+ *   (板级自检里那一项叫 `sched_tick_account`,那是**检查项的名字**,
+ *    由 `acc_probe` 线程给出结论,与本函数无关。)
  */
-void sched_tick_account(void)
-{
-    tcb_t cur = sched_current();
-
-    if (cur == NULL) {
-        return;
-    }
-
-    sched_account_run(cur, SCHED_TICK_NS);
-}
 
 /* (sched_tick / sched_tick_switched / sched_tick_preempted / sched_tick_invalid_ctx
- *  实现在文件末尾 —— 它们是完整的决策路径,而本函数只是其中的计费部分。) */
+ *  实现在文件末尾 —— 它们是完整的决策路径。) */
 
 /* ------------------------------------------------------------------ */
 /* M4-9:tick 里的调度决策 —— 真的搬帧                                  */
@@ -557,6 +582,16 @@ arm_exc_frame_t *sched_tick(arm_exc_frame_t *frame)
     if (cur->status == RUNNING && cur->task_level != TASK_IDLE_LEVEL) {
         pc->scheduler_ticks++;
         sched_account_run(cur, SCHED_TICK_NS);
+        /*
+         * ← `timer_handle()` `scheduler.cpp:398`:
+         *       __atomic_fetch_add(&current->runtime_ticks, 1ULL, __ATOMIC_RELAXED);
+         *
+         * 「这个线程实际占了多少 tick」—— 与 `eevdf_vruntime` 不同:
+         * 后者是**策略量**(将来有权重时会与真实时间脱钩),
+         * 前者是**记账量**。现在还没有读者,但空着会让人以为它已经在工作,
+         * 所以照源 OS 补上(退化清单 D9)。
+         */
+        cur->runtime_ticks++;
 
         if (pc->scheduler_ticks < SCHED_TIME_SLICE) {
             return frame; /* 时间片没到 */
@@ -638,7 +673,24 @@ arm_exc_frame_t *sched_tick(arm_exc_frame_t *frame)
 
     /* ---- 5. ★★★ 搬帧 ★★★ ---- */
     /*
-     * 5a. 把 current 的现场收进它的 ctx。
+     * ★ 浮点现场**不在这里换** ★
+     *
+     * 这里只改"谁是这个线程"的账;真正的 d0-d31 存/取由 `_vec_irq`
+     * 在**这段 C 的前后两端**做(见 boot/context.S 的
+     * `arch_vfp_save_current` 那段长说明)。
+     *
+     * 为什么不在这儿顺手做:恢复完 next 的 d0-d31 之后还要经过本函数与
+     * `c_irq_handler` 的收尾,而"那些收尾会不会碰浮点寄存器"是**编译器
+     * 说了算**的 —— 本内核里 GCC 已经在用 `vldr d16/vstr d16` 做 64 位
+     * 清零,而下面那句 `pc->scheduler_ticks = 0u` 正是"64 位存零"。
+     * 卡在 C 的两端,判据里就不含这个前提。
+     *
+     * 唯一需要在这里配合的是**破坏性 A/B**:`g_reloc_skip` 置 1 时执行流
+     * 留在 cur,于是要让 `_vec_irq` 的恢复也跳过 —— 否则它会把 next 的
+     * 现场装到正在跑的 cur 身上,对照组就同时改了两件事。
+     */
+
+    /* 5a. 收整数现场。
      *
      *     ⚠ cur 是 idle 时**照样要收** —— 那个 0 标记只是"还没被切走过",
      *       收完它就是一个可恢复的普通上下文了。这正是启动流程能回来的原因。
@@ -663,8 +715,15 @@ arm_exc_frame_t *sched_tick(arm_exc_frame_t *frame)
      * 回到**原线程被打断的地方**,执行流一步没动。
      * 于是同一段代码、同一个负载,行为从"两个线程真的交错"
      * 变成"两个线程一次都没跑起来" —— 那是"搬帧承重"的唯一证明方式。
+     *
+     * ⚠ 浮点现场也必须**跟着不换**:执行流留在 cur,而 `_vec_irq` 的
+     *   恢复是照"新的 current"来的 —— 所以这里把每核结构里那两个指针
+     *   一起清掉,让那一句变成空操作。对照组于是**只改了搬帧这一件事**。
      */
     if (g_reloc_skip != 0u) {
+        pc->cur_vfp_d = 0u;
+        pc->cur_vfp_f = 0u;
+        g_vfp_save_f  = 0u;
         return frame;
     }
 
