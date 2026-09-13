@@ -16,7 +16,8 @@
 **M0–M3 全部完成并板上验证；AM3 五个子阶段实现完成；
 M4-1/2/3/4/5 全部完成并板上验证（当前 **41 passed / 0 failed**）。
 M4-5 的 guard page 已经拿到**第三级证据**（破坏性 A/B 成立）。
-下一步是 M4-6：PCB/TCB 结构 —— 但它的第一步不是写代码，是读源 OS。**
+**M4-6 的第一步（调研源 OS、产出三份清单）已经做完并写进 §4.7。**
+下一步是 M4-6 的第二步：按 §4.7 的结论设计 ARM 侧的 PCB/TCB 与寄存器帧。**
 
 ### 0.5.2 分支与提交
 
@@ -37,7 +38,8 @@ M4-5 的 guard page 已经拿到**第三级证据**（破坏性 A/B 成立）。
 | M4-2 页分配器 | `6642292` | 29 passed / 0 failed（顺带炸出 FPU 雷）|
 | M4-3 内核堆 | `273c2cc` | 32 passed / 0 failed |
 | M4-4 细粒度映射 | `fb0c3d9` `051d712` `65b2061` `8bde8aa` | 35 passed / 0 failed |
-| M4-5 内核栈池 + guard page | `d78798a` | **41 passed / 0 failed**；`guard_trip.py` 的 A/B 成立（关掉 guard 就变成静默损坏）|
+| M4-5 内核栈池 + guard page | `d78798a` `47820fb` | **42 passed / 0 failed**；`guard_trip.py` 的**两组** A/B 都成立：不映射（FS 0x07）+ AP=0b000（FS 0x0F，顺带证明 M2-4 的 DACR=client 真的在生效）|
+| M4-6 第一步:调研源 OS | `1bef1ed` `5e7826c` + §4.7 | 产出三份清单 + 硬约束；抽查复核过（全库确实只有 2 条 static_assert、`include/cpu/gdt.h` 确实不存在）|
 
 ### 0.5.3 构建与验证命令（照抄即可）
 
@@ -126,24 +128,32 @@ AM3(不释放 CPU1 → 5 项 SMP 检查全 FAIL)、MIO 电压(来回切 `[11:9]`
   `vmap_err_t` 压成了布尔 `split_ok`,于是只知道"失败了",**白白多花一整轮上板时间**。
   改成打印错误码 + `l1_before/after` 后,两个 bug 一次全部暴露。
 
-### 0.5.7 续接点:M4-6 PCB / TCB 结构
+### 0.5.7 续接点:M4-6 第二步(设计 ARM 侧 PCB/TCB 与寄存器帧)
 
-**M4-5 已完成**(提交 `d78798a`)。它的三级证据、炸出来的 FSR 译码 bug、
-以及两条已知限制都写在 `arch/arm32/README.md` 的「M4-5」一节,不在这里重复。
+**M4-5 已全部完成**(提交 `d78798a` `47820fb`)。它的三级证据(两组 A/B)、
+炸出来的 FSR 译码 bug、以及已知限制都写在 `arch/arm32/README.md` 的「M4-5」一节。
 
-**下一步 M4-6 的第一步不是写代码,而是调研源 OS:**
+**M4-6 的第一步(调研源 OS)也已完成**,产出在 **§4.7**,不要重新调研。
+那份清单里有几条会直接改变设计的结论,开工前必读:
 
-    读 include/task/pcb.h 与 kernel/task/pcb.cpp(90.8 KB),
-    产出三份清单:架构无关 / 架构相关 / 源 OS 有而我们暂不需要。
-
-已经确认、直接可用的两条结论(见 §0.5.9):
-
-- 源 OS **每任务两个内核栈**:`kernel_stack` + `syscall_stack`,各 1MB
-  (`include/proto.hpp` 的 `CONFIG_KERNEL_TASK_STACK_SIZE`)。
-  M4-5 的栈池已按"32 栈 = 16 任务"的口径开好。
-- 源 OS 有**每任务 FP 上下文**:`fpu_context_t {uint8_t fxsave_area[512]}` 放进 PCB,
-  `scheduler.cpp:121-122` 每次切换都 `save/restore`。ARM 侧对应
-  **d0–d31(256B)+ FPSCR(4B)** 放进 TCB,M4-7 做。
+1. **x86 有两套寄存器帧,不是一个** —— `registers_t`(`pcb.h:17-44`,调度帧)
+   与 `struct X64_REGS`(`longm.h:9-35`,异常/系统调用帧),同为 192B 但
+   `rbx..rdi` 与 `r8..r15` 段位置**互换**,指针不可互换。
+   ARM 侧同样要区分"异常帧"与"调度帧";现有 `arm_irq_frame_t` 做中断够、做切换不够。
+2. **ARM 的帧必须无条件包含 SP 与 SPSR** —— x86 的 `rsp/ss` 压不压
+   取决于是否跨特权级,ARM 没有这个分支,不要照抄那个条件性形状。
+3. **`save_registers` 的"返回值即新栈指针"协议是接口**
+   (`scheduler.cpp:68-69` 的 `call timer_handle; mov rsp, rax`):
+   C 侧通过返回栈指针**就地改写现场**。ARM 应照抄,不要另发明"汇编查表跳转"。
+4. **`change_proccess` 的动作顺序即接口**(`scheduler.cpp:95-169`),
+   顺序两架构一致,只有每一步的实现分叉。
+5. **不要照搬** GDT/TSS/IDT/syscall MSR/`swapgs`/CR3/`PTE_*`。
+   两条因果:x86 的 TSS 唯一理由是"硬件不知道内核栈在哪",
+   而 **ARMv7-A 的 SP 是按模式 banked 的,硬件自动切**;
+   x86 的 `swapgs` 是因为 `%gs` 基址两态不同,而 **ARM 的 `TPIDRPRW` 是 PL1 专属 banked 的**。
+6. **已知的 ARM 侧接口缺口**:`spin_t` 没有 CPSR 字段、缺
+   `spin_lock_no_irqsave`/`spin_unlock_no_irqstore`/`spin_init`/`barrier`、
+   `percpu_t` 缺 `current_task`/调度队列/`scheduler_ticks`、缺 `arch_read_sp()`。
 
 **M4-5 留给 M4-7 的一笔账**:`kstack_tlb_flush_range` 只失效**本核** TLB。
 现在栈只由 CPU0 用;等任务真跑在 CPU1 上时,CPU1 那边可能还留着启动阶段的
@@ -1471,11 +1481,16 @@ D3（FP 上下文）那一次的经历值得作为规程固定下来：
 
 这份清单同时是 B5「驱动接口兼容旧 XJ380」在进程/线程层面的输入。
 
+> ✅ **这份清单已经产出了 —— 见 §4.7。** 那一节就是 M4-6 的"第一步"的正式产出:
+> 三份清单 + 硬约束(含 x86 侧**被汇编硬编码却零编译期保护**的偏移)+ 未确认项。
+> 读 M4-6 之前先读 §4.7,不要重新调研一遍。
+
 #### 第二组：调度器（M4-6 .. M4-11）
 
 | # | 内容 | 依赖 |
 |---|---|---|
-| **M4-6** | PCB / TCB 与寄存器帧（含"架构无关/相关"的切分，见下）| M4-5 |
+| **M4-6** | PCB / TCB 与寄存器帧（含"架构无关/相关"的切分）| M4-5 |
+| ~~M4-6 第一步~~ | ~~调研源 OS 的 PCB/TCB 契约,产出三份清单~~ | ✅ **已完成,见 §4.7** |
 | **M4-7** | 上下文切换（ARM 汇编，per-CPU）| M4-6 |
 | **M4-8** | 就绪队列 + 调度策略 + idle（WFI）| M4-7 |
 | **M4-9** | **tick 抢占**（复用 AM3-5 的每核 1kHz）| M4-8 |
@@ -1617,6 +1632,147 @@ FDT 解析器 + 回退 → 驱动接口对齐旧 XJ380 → 受控 A/B）。
 
 **M4A-1.5 的 `dev` 文件系统同时是 B5 的第一个真实用户** ——
 它是块设备与字符设备对上 `device_t` 的地方。
+
+---
+
+### 4.7 M4-6 前置调研:源 OS 的 PCB/TCB 契约(三份清单)
+
+> **这一节是 M4-6 的"第一步"的产出,不是代码。** 计划里写明:M4-6 的第一步
+> 不是写代码,而是把 x86 的 `include/task/pcb.h` 与 `kernel/task/pcb.cpp` 读一遍,
+> 产出三份清单(架构无关 / 架构相关 / 源 OS 有而我们暂不需要)。
+> 已完成(2026-09-13)。每条结论都带 `file:line`,便于复核。
+
+#### 4.7.1 先记三个"前提被推翻"
+
+| 原以为 | 实际 |
+|---|---|
+| `include/cpu/gdt.h` 存在 | **不存在**。`include/cpu/` 只有 6 个头:`fpu.h fsgsbase.h lock.h longm.h msr.h regio.h`。GDT/IDT 在 `include/pctable/` |
+| TSS 有独立头文件 | **没有**。定义在 `include/smp/smp.h:20-29` |
+| 上下文切换在一个 `.S` 里 | **不是**。`kernel/task/` 下没有任何 `.S`(全库 `.asm` 也是 0 个)。切换点是 `kernel/task/scheduler.cpp:42-93` 一个 `__attribute__((naked))` 的 C++ 函数 `save_registers` + 同文件 `:95-169` 的 `change_proccess`,加 `kernel/intr/handler.S` |
+
+#### 4.7.2 第一份清单:架构无关(ARM 必须**逐字段一致**)
+
+- **`scheduler.h` 本身就是架构无关的** —— 它只 `include <stdint.h>`(`include/task/scheduler.h:1`),
+  5 个函数声明 + `tcb_t` typedef,**没有任何结构体**。可以直接复用,不用改。
+- **`pcb_t` / `tcb_t` 都是指针 typedef**(`include/task/pcb.h:46-47`),且在
+  `scheduler.h:4`、`signal.h:188-189` 重复 typedef。全部 API **按指针传参,无按值传递**。
+- PCB 里**只有 `pagedir` 是架构相关**;TCB 里架构相关的是
+  `context0` / `fpu_context` / `fs_base` / `fs` / `tid_directory`
+  / `syscall_stack` / `syscall_user_rsp`。
+- **其余全部是架构无关的**,ARM 侧要逐字段一致:`pid`、`status`、`task_level`、`name`、
+  `thread_queue`、`ppid`、`child_pcb`、`vfork`、`file_open`、`file_open_shared_refs`、
+  `virt_queue`、`ipc_queue`、`tty`、`envc/envp`、`cmdline`、`brk_start/brk_end/brk_current`、
+  `mmap_start`、`argv/argc`、`user_info`、EEVDF 相关、`tid`、`group_index`、`sched_node`、
+  `cwd`、`str_cwd`、`user_stack/user_stack_top/owns_user_stack`、统计字段……
+- **沿用的约定**(不是字段,但同样是契约):
+  - fd = `file_open` 队列下标 + 0/1/2 标准流硬编码(`pcb.cpp:788-790`),fd 表带
+    `file_open_shared_refs` 引用计数(fork 语义 `pcb.cpp:1998-2008`);
+  - `kernel_stack` 存的是**栈顶上界**(`base + KERNEL_STACK_SIZE`,`pcb.cpp:1202`);
+  - 内核线程的 `fs_base` = **自身 TCB 指针**(`pcb.cpp:2241`)。
+
+#### 4.7.3 第二份清单:架构相关(按设计不同,只共享名字与角色)
+
+| x86 | 定义 | 大小 | ARM 对应物 |
+|---|---|---|---|
+| `TaskContext context0` | `pcb.h:61-82` | 176B | ARM 的任务上下文(r0-r12/sp/lr/pc/cpsr) |
+| `fpu_context_t` | `include/cpu/fpu.h:5-8` | 512B | VFP:d0–d31(256B)+ FPSCR(4B),见 §0.5.9 |
+| `registers_t`(**调度帧**) | `pcb.h:17-44` | 192B | ARM 调度帧 —— ⚠ 见下面 4.7.4 |
+| `struct X64_REGS`(**异常/syscall 帧**) | `include/cpu/longm.h:9-35` | 192B | ARM 异常帧 —— ⚠ 见下面 4.7.4 |
+| `pagedir` | `pcb.h` | — | TTBR0 + L1 表指针 |
+| `fs` / `fs_base` | `pcb.h:190,191` | — | ARM **无分段**:`fs`(选择子)字段在 ARM 上**不应存在** |
+| `syscall_stack` / `syscall_user_rsp` | `pcb.h:182,183` | — | 对应 ARM 的 SVC 路径专用栈 |
+
+#### 4.7.4 ★★ 最该照抄的一条:**x86 有两套寄存器帧,不是一个** ★★
+
+两条路径的帧**字段顺序不同、指针不可互换**:
+
+| 帧 | 结构体 | 帧布局的依据 | 使用者 |
+|---|---|---|---|
+| **调度帧** | `registers_t`(`pcb.h:17-44`)| `scheduler.cpp:46-92` 的 push/pop 序列 | timer 门 32 → `change_proccess` |
+| **异常/系统调用帧** | `struct X64_REGS`(`longm.h:9-35`)| `handler.S:5-28` 的偏移常量 | 异常入口 + `syscall_handler` |
+
+两者**同为 192 字节**,但 `rbx..rdi` 段与 `r8..r15` 段的位置**互换**。
+把它们当成同一个东西用,会得到一套"看着能跑、改一个字段就全错位"的代码。
+
+**⇒ ARM 侧同样要区分"异常帧"与"调度帧"。** 现有的 `arm_irq_frame_t`
+(`arch/arm32/include/arch/irq.h:70-74`)只有 `r[13] + pc`,**做中断够、做切换不够**。
+
+**并且有一处 ARM 比 x86 更干净,值得写明:**
+
+> x86 的 `registers_t` 里 `rip/cs/rflags/rsp/ss` 是**CPU 进中断门时压的**,
+> 而压不压 `rsp/ss` **取决于是否发生了特权级变化** —— 也就是说这张帧
+> 的形状是**条件性的**。ARM 的 `SPSR`/`LR` 一定被存、banked SP 一定切换,
+> **不存在这个分支**。所以 **ARM 的帧必须无条件包含 SP 与 SPSR**,
+> 不需要、也不应该照抄 x86 的"有时有 rsp/ss、有时没有"。
+
+#### 4.7.5 第三份清单:源 OS 有、我们暂不需要
+
+信号、`pty`、`tty/vt`、X3TP 窗口、IPC 消息、`procfs`、EEVDF 调度策略、
+Linux ABI(`futex` / `ZOMBIE` / `aux_*`)、`poll`/`epoll`、`vfork`、
+`notify_pcor` 通知管道、用户权限体系、`MAX_CPU_NUM=256` 的大预留。
+
+⚠ **修正一处:** 计划里曾写"cgroup 之类",但**仓库里不存在 cgroup 子系统**
+(唯一命中是 `include/syscall/syscall.h:430` 的 `clone_args.cgroup` 字段)。
+
+#### 4.7.6 硬约束:必须照抄或**显式替代**
+
+1. **全库只有 2 条 `static_assert`** —— `kernel/task/pcb.cpp:84-87`,锁的是
+   TCB 的 `syscall_stack == 0xb48` 与 `syscall_user_rsp == 0xb50`,
+   对应 `kernel/intr/handler.S:32-33`。**这就是 x86 侧全部的编译期 ABI 保护。**
+2. ★ **最高风险项:被汇编硬编码却零保护** ★
+   `handler.S:29-31` 的 `CPU_CURRENT_TASK=0x4c0` / `CPU_SYSCALL_USER_RSP=0x4e0` /
+   `CPU_SYSCALL_USER_RAX=0x4e8` 是 `PROCESSOR_INFO`(`include/smp/smp.h:35-49`)的
+   **`%gs` 相对偏移**,全靠算术偶然对上,**没有任何 static_assert**。
+   改一次字段顺序就会静默错位。
+   **⇒ ARM 侧不要重复这个疏漏**:凡是给汇编用的偏移,一律配 `_Static_assert`。
+   (好消息:ARM 侧现在已经有 10 条 `_Static_assert`,比 x86 多。)
+3. **TCB 必须 16 字节对齐**:`aligned_alloc(16, (sizeof+15)&~15)`(`pcb.cpp:89-90`),
+   因为 `fpu_context_t` 带 `aligned(16)`(`cpu/fpu.h:7`)。
+   `sizeof(struct thread_control_block) = 0xC20`(离线复刻编译验证)。
+4. **每个任务两个内核栈**,各 1MB:`kernel_stack`(`pcb.h:174`)+
+   `syscall_stack`(`pcb.h:182`),大小来自 `include/proto.hpp:15` 的
+   `CONFIG_KERNEL_TASK_STACK_SIZE = 1048576`。
+   ⇒ M4-5 的栈池已按"32 栈 = 16 任务"的口径开好(见 §0.5.7)。
+5. **`kernel_stack` 存栈顶**(`base + size`),销毁时按
+   `kernel_stack - KERNEL_STACK_SIZE` 反推栈底(`pcb.cpp:488-490`)。
+6. `save_registers` 的**"返回值即新栈指针"协议**(`scheduler.cpp:68-69`:
+   `call timer_handle` 然后 `mov rsp, rax`)是一条**接口** ——
+   C 侧通过返回一个栈指针来**就地改写现场**。
+   **ARM 应照抄这个协议,不要另发明"汇编查表跳转"。**
+7. `change_proccess` 的**动作顺序即接口**(`scheduler.cpp:95-169`):
+   ①存 fs base → ②切地址空间 → ③装内核栈 → ④装 per-CPU 基址 →
+   ⑤按特权级处理段寄存器 → ⑥FPU → ⑦搬寄存器。
+   顺序两架构一致,只有每一步的实现分叉。
+
+#### 4.7.7 未确认项(不猜,留到 M4-6/M4-7 开工时确认)
+
+| # | 未确认的事 | 为什么重要 |
+|---|---|---|
+| 1 | x86 `ring0→ring0` 时 `iretq` **不**弹 RSP/SS,而 `change_proccess` **无条件**读写 `reg->rsp/ss`(`scheduler.cpp:141-142,164-165`)—— 内核线程的 `context0.rsp` 是否真的生效 | ARM 的 SP 是 banked 且显式的,不存在这个分支,但前提是**切换代码必须显式保存恢复 SP** |
+| 2 | `switch_to_kernel_stack()`(`pcb.cpp:2697`)在全库**找不到调用者** | 是否留给 `.sys` 模块按符号解析 |
+| 3 | AP 的 idle 线程(`smp.cpp:152-167`)没有 `save_fpu_context`,其 FXSAVE 区是全 0 | 被恢复时是否出问题 |
+| 4 | `jump_to_message` 用 `SS=0x23`(`pcb.cpp:856`)而 `switch_task_to_user_mode` 用 `SS=0x1B`(`pcb.cpp:815`) | 是否有意为之 |
+| 5 | `scheduler_tick()`(`scheduler.h:13`)声明但全库无定义 | 悬空声明,顺带修 |
+| 6 | 除那 2 条断言外,所有 `sizeof`/`offsetof` 都只做过离线推算 | 所以上面那些数字都标注了推算来源 |
+
+#### 4.7.8 给 ARM 侧的直接结论
+
+**不要照搬的(x86 实现细节,ARM 上根本不存在)**:
+GDT/段描述符/选择子、TSS、IDT(256 门)、`syscall`/`sysret` + `EFER/STAR/LSTAR`、
+`swapgs` + `IA32_GS/KERNEL_GS_BASE`、`%fs/%gs` 段基址、CR3/4 级页表、`PTE_*` 位语义、
+`rdmsr/wrmsr`、`fxsave64/fxrstab64`、`pushfq/popfq/iretq` 这些指令细节。
+
+**两条最容易搞错的因果**:x86 的 TSS 唯一理由是"硬件在特权级变化时不知道内核栈在哪";
+**ARMv7-A 的 SP 是按模式 banked 的,硬件自动切,不需要任何表**。
+x86 的 `swapgs` 存在是因为 `%gs` 基址在用户态和内核态是不同的值;
+**ARM 的 `TPIDRPRW` 是 PL1 专属的 banked 寄存器,根本不需要 swap**。
+
+**必须补的 ARM 侧接口缺口**(现状核对):
+`spin_t`(`arch/arm32/include/arch/cpu.h:421-424`)只有 `locked`,**没有 CPSR 字段** ——
+x86 的 `spin_t` 用 `rflags` 保存中断状态(`include/cpu/lock.h:7-10`),
+且 ARM 侧缺 `spin_lock_no_irqsave` / `spin_unlock_no_irqstore` / `spin_init` / `barrier`。
+`percpu_t` 缺 `current_task` / 调度队列 / `scheduler_ticks`(`include/smp/smp.h:43-46`)。
+`arch_read_sp()` 也没有(用于给 idle 线程初始化上下文,`kernel/main.cpp:527`)。
 
 ---
 
