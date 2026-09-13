@@ -359,40 +359,108 @@ const irq_stats_t *irq_get_stats(void)
  */
 
 /*
- * 译码 FSR(DFSR/IFSR)的故障状态。
+ * ====================================================================
+ * ★ DFSR / IFSR 都不能用 `fsr & 0x1F` 取状态 ★
+ * ====================================================================
  *
- * 用 [4:0] 而不是 [3:0] —— 这一点很容易搞错:
- * 例如 0x08 在 [3:0] 下看着像"域故障",而 [4:0]=0b01000 实际是
- * "Synchronous external abort"(访问了没有从设备的地址,
- * AXI 事务失败,正是本板故障注入触发的那种)。
+ * 这是板上实测抓出来的,不是推演出来的。
  *
- * 上一版就写错了这个提示,反而误导排障,故此处写成显式查表。
+ * 权威位域(ARMv7-A ARM,TTBCR.EAE==0 即**短描述符格式**,本内核用的就是它):
+ *
+ *   DFSR                          IFSR
+ *   ---------------------------   ---------------------------
+ *   bits[3:0]  FS[3:0]            bits[3:0]  FS[3:0]
+ *   bits[7:4]  **Domain**         bits[8:4]  RES0
+ *   bit[9]     LPAE               bit[9]     LPAE
+ *   bit[10]    FS[4]              bit[10]    FS[4]
+ *   bit[11]    WnR                bit[11]    RES0
+ *   bit[12]    ExT                bit[12]    ExT
+ *   bit[13]    CM                 bit[13]    RES0
+ *   bit[16]    FnV                bit[16]    FnV
+ *
+ * DFSR 的 **Domain 正好压在状态位上面**(bits[7:4]),于是
+ * `dfsr & 0x1F` 会把 Domain[0] 当成 FS[4]:
+ *
+ *   真实 FS            本内核 domain=15 时的 `& 0x1F`      译出来
+ *   0x07 translation   0x17                              保留/未知
+ *   0x05 translation   0x15                              保留/未知
+ *
+ * ★ 为什么这个错一直没暴露 ★
+ *   以前只触发过三类 Data Abort,它们的 L1 描述符**都是 fault 项**
+ *   (比如 0x50000000 没有映射),而 fault 项的 Domain 位是 0 ——
+ *   于是 `& 0x1F` 碰巧等于真值。**取指路径(IFSR)完全没有 Domain 字段**,
+ *   所以 XN 那一路也一直是对的。
+ *
+ *   直到 guard page 出现:它的 L1 项是**页表描述符**,
+ *   而 vmap 从 `MMU_ATTR_NORMAL_WB` 里解出来的 domain 是 **15**
+ *   (见 mmu.h:bits[8:5]=0b1111),Domain[0]=1 ——
+ *   实测 DFAR=0x02497FFC 时打印出 `DFSR = 0x000008F7 (reserved / unknown)`,
+ *   而正确译码是 FS=0b00111 = **translation fault, level 2**。
+ *
+ * 所以这里把 FS[4:0] 按位域取出来,而不是切一段。
+ */
+#define FSR_FS_LOW_MASK  0x0000000Fu
+#define FSR_FS4_BIT      0x00000400u /* FS[4] 在 DFSR 与 IFSR 里都在 bit10 */
+#define DFSR_DOMAIN_SHIFT 4u
+#define DFSR_DOMAIN_MASK 0x0000000Fu
+#define DFSR_WNR_BIT     0x00000800u
+#define DFSR_LPAE_BIT    0x00000200u
+
+static u32 fsr_status_of(u32 fsr)
+{
+    u32 fs = fsr & FSR_FS_LOW_MASK;
+
+    if ((fsr & FSR_FS4_BIT) != 0u) {
+        fs |= 0x10u;
+    }
+
+    return fs;
+}
+
+/*
+ * 状态码表。按短描述符格式。
+ *
+ * ⚠ DFSR 与 IFSR 的表**几乎但不完全相同**,两处差异:
+ *     0b00001 —— 取指路径是 "PC alignment fault",数据路径是 "alignment fault";
+ *     0b00100 —— 只有数据路径有("Fault on instruction cache maintenance")。
+ *   本内核两条都碰不到,所以共用一张表,差异写在这里而不是分成两份。
+ *
+ * ⚠ "level 1 / level 2" 的含义是**在哪一级查找时失败**:
+ *     level 1 = L1 描述符本身是 fault 项(短描述符下 L1 覆盖 1MB);
+ *     level 2 = L1 是页表项没问题,而是 **L2 小页项**出了问题。
+ *   所以 guard page(取消映射 = L2 项清零)报的是 **level 2**,
+ *   而"整个段没有映射"报的是 level 1。这两个不能混。
  */
 static const char *fsr_status_text(u32 fsr)
 {
-    switch (fsr & 0x1Fu) {
-    case 0x01: return "alignment fault";
+    switch (fsr_status_of(fsr)) {
+    case 0x01: return "alignment fault (PC alignment fault for IFSR)";
     case 0x02: return "debug event";
-    case 0x04: return "instruction cache maintenance fault";
-    case 0x05: return "translation fault, section";
-    case 0x06: return "translation fault, page";
-    case 0x07: return "translation fault, level 3 (LPAE)";
-    case 0x08: return "synchronous external abort";
-    case 0x09: return "domain fault, section";
-    case 0x0A: return "domain fault, page";
-    case 0x0B: return "domain fault, level 2 (LPAE)";
-    case 0x0C: return "synchronous external abort on translation table walk";
-    case 0x0D: return "permission fault, section";
-    case 0x0E: return "permission fault, page";
-    case 0x0F: return "permission fault, level 3 (LPAE)";
-    case 0x10: return "synchronous parity or ECC error";
-    case 0x16: return "asynchronous external abort";
-    case 0x19: return "synchronous parity or ECC error on translation table walk";
-    case 0x1C: return "synchronous external abort on translation table walk (LPAE)";
-    case 0x1E: return "asynchronous external abort on translation table walk";
+    case 0x03: return "access flag fault, level 1";
+    case 0x04: return "fault on instruction cache maintenance (DFSR only)";
+    case 0x05: return "translation fault, level 1";
+    case 0x06: return "access flag fault, level 2";
+    case 0x07: return "translation fault, level 2";
+    case 0x08: return "synchronous external abort, not on translation table walk";
+    case 0x09: return "domain fault, level 1";
+    case 0x0A: return "reserved";
+    case 0x0B: return "domain fault, level 2";
+    case 0x0C: return "synchronous external abort on translation table walk, level 1";
+    case 0x0D: return "permission fault, level 1";
+    case 0x0E: return "synchronous external abort on translation table walk, level 2";
+    case 0x0F: return "permission fault, level 2";
+    case 0x10: return "TLB conflict abort";
+    case 0x14: return "implementation defined fault (lockdown)";
+    case 0x15: return "implementation defined fault (unsupported exclusive access)";
+    case 0x16: return "SError exception";
+    case 0x18: return "SError exception from parity or ECC error";
+    case 0x19: return "synchronous parity or ECC error on memory access";
+    case 0x1C: return "synchronous parity or ECC error on translation table walk, level 1";
+    case 0x1E: return "synchronous parity or ECC error on translation table walk, level 2";
     default:   return "reserved / unknown";
     }
 }
+
 
 /*
  * 只打寄存器,不打标题 —— 标题由调用方打。
@@ -484,6 +552,22 @@ void c_data_abort_handler(arm_irq_frame_t *frame)
     console_puts("\n!!! Data Abort !!!\n");
     console_printf("  DFAR     = 0x%08X   (address that faulted; x86 equivalent is CR2)\n", dfar);
     console_printf("  DFSR     = 0x%08X   (%s)\n", dfsr, fsr_status_text(dfsr));
+    /*
+     * Domain 与 WnR 单独打出来。
+     *
+     * 不是为了好看:Domain 在 DFSR 里占 bits[7:4],**紧压在状态位上面** ——
+     * 只打状态文本的话,一个"域号不对"的故障和"状态码不对"的故障
+     * 在串口上长得一模一样。本项目的 FSR 译码就因为这个布局错了很久,
+     * 直到 guard page 的 Data Abort 报出 0x8F7 才露出来(见上面的说明)。
+     *
+     * WnR(bit11)同样值得单列:"读崩了"和"写崩了"对应的越界方向相反,
+     * 而栈溢出只可能是写。
+     */
+    console_printf("  domain   = %u   WnR = %u (%s)   LPAE = %u\n",
+                   (dfsr >> DFSR_DOMAIN_SHIFT) & DFSR_DOMAIN_MASK,
+                   (dfsr & DFSR_WNR_BIT) != 0u ? 1u : 0u,
+                   (dfsr & DFSR_WNR_BIT) != 0u ? "write" : "read",
+                   (dfsr & DFSR_LPAE_BIT) != 0u ? 1u : 0u);
     dump_regs(frame);
     dump_halt();
 }

@@ -10,6 +10,7 @@
 #include <arch/console.h>
 #include <arch/fault_test.h>
 #include <arch/io.h>
+#include <arch/kstack.h>
 #include <arch/platform.h>
 #include <arch/timer.h>
 
@@ -112,6 +113,91 @@ void fault_test_trigger(u32 selector)
                          :
                          :
                          : "r0", "lr", "memory");
+        break;
+    }
+
+    /*
+     * ---- 栈溢出进 guard 页(M4-5)----
+     *
+     * 这三件是一组受控 A/B,单独看任何一件都不构成证据:
+     * 6/7 证明"这样访问会报错",8 证明"报错的原因确实是 guard"。
+     * 详见 arch/fault_test.h 的说明。
+     */
+    case FAULT_SEL_STACK_GUARD:
+    case FAULT_SEL_STACK_GUARD_AP:
+    case FAULT_SEL_STACK_GUARD_OFF: {
+        const kstack_t *probe = kstack_probe_stack();
+
+        if (probe == NULL) {
+            console_puts("    no stack registered for probing (kstack_probe_register)\n");
+            break;
+        }
+
+        if (selector == FAULT_SEL_STACK_GUARD_OFF) {
+            /*
+             * ★ 对照组:把 guard 页变成普通可读写页 ★
+             *
+             * 之后跑的是**完全相同**的一段代码、完全相同的地址。
+             * 唯一的差别就是这一页映射与否 —— 这正是"受控"的含义。
+             */
+            kstack_err_t e = kstack_probe_guard_disable();
+
+            console_puts("    guard page temporarily MAPPED (control group)\n");
+            console_printf("      stack base=0x%08X top=0x%08X guard=0x%08X\n", probe->base, probe->top,
+                           probe->guard);
+            console_printf("      guard_disable=%u\n", (u32)e);
+
+            timer_delay_ms(50);
+
+            {
+                u32 written = kstack_probe_overflow();
+
+                /*
+                 * 走到这里就是结果本身:guard 关掉之后,同一段溢出
+                 * **不再有异常**,写下去的内容还静默地留在了那里。
+                 */
+                console_printf("    overflow wrote %u words past the stack bottom\n", written);
+                console_printf("      clobbered region readable back = %s\n",
+                               kstack_probe_clobbered() ? "YES (silent corruption)" : "NO");
+                console_puts("    !!! CONTROL GROUP: no exception, as expected !!!\n");
+            }
+
+            /* 恢复,别把池留在被改过的状态里 */
+            if (kstack_probe_guard_enable() != KSTACK_OK) {
+                console_puts("    WARN: failed to restore the guard page\n");
+            } else {
+                console_puts("    guard page restored\n");
+            }
+            return;
+        }
+
+        if (selector == FAULT_SEL_STACK_GUARD_AP) {
+            /*
+             * AP=0b000 的 guard 需要**另一个池实例**(guard_kind 是池级配置)。
+             * 板级只建了 KSTACK_GUARD_UNMAPPED 那一个,所以这里如实说明,
+             * 而不是悄悄退化成"不映射"那一种 —— 那会让 6 和 7 看起来
+             * 都验证过了。
+             */
+            console_puts("    NOTE: the board pool uses KSTACK_GUARD_UNMAPPED\n");
+            console_puts("      the AP=0b000 variant is covered by kstack_selftest\n");
+            console_puts("      (its hardware trip needs a second pool - not built yet)\n");
+            return;
+        }
+
+        console_printf("    stack base=0x%08X top=0x%08X guard=0x%08X\n", probe->base, probe->top,
+                       probe->guard);
+        console_puts("    writing downwards past the stack bottom\n");
+        console_puts("      -> expect Data Abort with DFAR = base-4\n");
+        console_puts("         and FS[4:0]=0x07 (translation fault, level 2)\n");
+        console_puts("         (take FS as (dfsr&0xF)|((dfsr>>10)&0x10) - NOT dfsr&0x1F:\n");
+        console_puts("          bits[7:4] of DFSR are the Domain field, domain=15 here)\n");
+        timer_delay_ms(50);
+
+        /*
+         * 正常情况下**不会返回**:第一个字就落在 guard 页里,
+         * 而那一页没有映射,于是 Translation fault。
+         */
+        (void)kstack_probe_overflow();
         break;
     }
 

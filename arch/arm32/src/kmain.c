@@ -25,6 +25,7 @@
 #include <arch/heap.h>
 #include <arch/io.h>
 #include <arch/irq.h>
+#include <arch/kstack.h>
 #include <arch/led.h>
 #include <arch/mmu.h>
 #include <arch/palloc.h>
@@ -85,6 +86,52 @@ static vmap_t g_vmap;
 static u32 g_vmap_selftest;
 static u32 g_vmap_split_ok;
 static u32 g_vmap_live_ok;
+
+/*
+ * M4-5:内核栈池。
+ *
+ * ====================================================================
+ * 每个栈 1MB —— **照搬源 OS**,不是拍脑袋定的
+ * ====================================================================
+ *
+ *   include/proto.hpp:  #define CONFIG_KERNEL_TASK_STACK_SIZE 1048576
+ *   kernel/task/pcb.cpp: 每个任务成对分配 kernel_stack 与 syscall_stack,
+ *                        两个栈都用这个大小。
+ *
+ * 所以一个任务实占 2MB 栈,32 个栈 = 16 个任务。
+ * 任务真要用**两个**栈这件事在 M4-6/M4-7 落地(那时 kstack_alloc 会被
+ * 连着调两次);这里先把池按这个口径开出来,免得池小到要用时才返工。
+ * "等用到再说"在这里的代价是改一个常量,而代价不在常量本身 ——
+ * 在于池的分区方式一旦被别的代码依赖,改起来就不是改常量了。
+ *
+ * ====================================================================
+ * 为什么单独一个 vmap 实例
+ * ====================================================================
+ *
+ * `vmap_t` 的 va_begin/va_end 是一个**连续区间**,而 M4-4 那个演示实例
+ * 已经把它的区间(测试区)用掉了。栈池的区间来自 palloc,地址与它无关,
+ * 所以必须另开一个实例、另给一份 L2 表池。
+ *
+ * L2 表需求:池 32.125MB,最多跨 34 个 1MB 段,每段一张表,留 40 张。
+ */
+#define KSTACK_SLOTS       32u
+#define KSTACK_STACK_PAGES 256u /* 1MB */
+#define KSTACK_POOL_PAGES  (KSTACK_SLOTS * (KSTACK_STACK_PAGES + 1u))
+#define KSTACK_L2_TABLES   40u
+
+static u32    g_l2_pool_stack[KSTACK_L2_TABLES * VMAP_L2_ENTRIES] __attribute__((aligned(1024)));
+static vmap_t g_vmap_stack;
+static u32    g_kstack_bitmap[KSTACK_BITMAP_WORDS];
+
+static kstack_pool_t g_kstack;
+static kstack_t      g_kstack_probe;
+
+static u32 g_kstack_selftest;
+static u32 g_kstack_slots_ok;
+static u32 g_kstack_guard_ok;
+static u32 g_kstack_usable_ok;
+static u32 g_kstack_adjacent_ok;
+static u32 g_kstack_reuse_ok;
 
 /* 物理页分配器的自检与冒烟结果,供自检报告使用 */
 static u32 g_palloc_selftest;
@@ -967,6 +1014,146 @@ void kmain(void)
         }
     }
 
+    /* ---- 9.46 内核栈池 + guard page(M4-5) ---- */
+    /*
+     * 位置:在 palloc(M4-2)与 vmap(M4-4)之后。
+     *
+     * 这里做完的只是"栈池可用 + guard 页确实不可访问"这一级的证据
+     * (读回页表)。**真正证明 guard 是承重的**要靠第三级证据 ——
+     * 故意写溢出,见 fault_test 的两个新选择器与 tmp-test/guard_trip.py。
+     * 分成两处是刻意的:溢出会让内核停在 Data Abort 现场,
+     * 而"停在现场"这件事不该发生在每次上板都要跑的自检里。
+     */
+    g_kstack_selftest = kstack_selftest();
+
+    {
+        uintptr_t    pool   = 0;
+        palloc_err_t pe     = palloc_alloc_pages(&g_palloc, KSTACK_POOL_PAGES, &pool);
+        vmap_err_t   ve     = VMAP_ERR_NOT_INIT;
+        kstack_err_t ke     = KSTACK_ERR_NOT_INIT;
+
+        if (pe == PALLOC_OK) {
+            /*
+             * ⚠ L1 表是**共用**的那一张(g_mmu_l1_table,链接脚本保证 16KB 对齐),
+             *   两个 vmap 实例只是各自负责其中一段地址范围。
+             *   分成两个实例的理由见上面"为什么单独一个 vmap 实例"。
+             */
+            ve = vmap_init(&g_vmap_stack, g_mmu_l1_table, g_l2_pool_stack, (u32)(uintptr_t)g_l2_pool_stack,
+                           KSTACK_L2_TABLES, (u32)pool,
+                           (u32)pool + (u32)(KSTACK_POOL_PAGES * PALLOC_PAGE_SIZE));
+        }
+
+        if (ve == VMAP_OK) {
+            ke = kstack_pool_init(&g_kstack, &g_vmap_stack, (u32)pool,
+                                  (u32)(KSTACK_POOL_PAGES * PALLOC_PAGE_SIZE), KSTACK_STACK_PAGES,
+                                  KSTACK_GUARD_UNMAPPED, g_kstack_bitmap, KSTACK_BITMAP_WORDS,
+                                  kstack_tlb_flush_range);
+        }
+
+        if (ke == KSTACK_OK) {
+            console_printf(" Kernel stack: %u slots x %u KB (+%u KB guard) at 0x%08X\n",
+                           g_kstack.slot_count, (KSTACK_STACK_PAGES * KSTACK_PAGE_SIZE) >> 10,
+                           KSTACK_PAGE_SIZE >> 10, (u32)pool);
+
+            g_kstack_slots_ok = (g_kstack.slot_count == KSTACK_SLOTS) ? 1u : 0u;
+        } else {
+            console_printf(" Kernel stack: FAILED palloc=%u vmap=%u kstack=%u\n", (u32)pe, (u32)ve,
+                           (u32)ke);
+        }
+
+        if (ke == KSTACK_OK) {
+            kstack_t a;
+            kstack_t b;
+
+            if (kstack_alloc(&g_kstack, &a) == KSTACK_OK && kstack_alloc(&g_kstack, &b) == KSTACK_OK) {
+                u32 i;
+
+                /*
+                 * 1. guard 页在页表里确实是"没有映射"。
+                 *
+                 * ⚠ 这是**第二级证据**(读回页表),它证明不了硬件真的会拦住
+                 *   访问 —— 那要等 guard_trip。但反过来,这一项失败时
+                 *   guard 一定不生效,所以它是必要不充分条件,值得留下。
+                 */
+                g_kstack_guard_ok =
+                    ((vmap_lookup(&g_vmap_stack, a.guard) == 0u) &&
+                     (vmap_lookup(&g_vmap_stack, b.guard) == 0u))
+                        ? 1u
+                        : 0u;
+
+                /*
+                 * 2. 栈区真的能读写。
+                 *
+                 * 抽三页来写:最底一页、中间一页、最顶一页 ——
+                 * 少刷了 TLB 的话最可能先在这里炸,而不是等到任务真的跑起来。
+                 */
+                g_kstack_usable_ok = 1u;
+                {
+                    const u32 offsets[3] = {0u, (KSTACK_STACK_PAGES / 2u) * KSTACK_PAGE_SIZE,
+                                            (KSTACK_STACK_PAGES - 1u) * KSTACK_PAGE_SIZE};
+
+                    for (i = 0; i < 3u; i++) {
+                        volatile u32 *w = (volatile u32 *)(uintptr_t)(a.base + offsets[i]);
+
+                        *w = 0x5AA50000u ^ offsets[i];
+                    }
+                    for (i = 0; i < 3u; i++) {
+                        volatile u32 *w = (volatile u32 *)(uintptr_t)(a.base + offsets[i]);
+
+                        if (*w != (0x5AA50000u ^ offsets[i])) {
+                            g_kstack_usable_ok = 0u;
+                        }
+                    }
+                }
+                /* 栈顶也写一下:那里是初始 SP 所在,必须可用 */
+                {
+                    volatile u32 *top = (volatile u32 *)(uintptr_t)(a.top - 4u);
+
+                    *top = 0xC0DE0000u;
+                    if (*top != 0xC0DE0000u) {
+                        g_kstack_usable_ok = 0u;
+                    }
+                }
+
+                /* 3. 两个槽无缝相邻:b 的 guard 正好是 a 的栈顶 */
+                g_kstack_adjacent_ok = (b.guard == a.top && b.base == a.top + KSTACK_PAGE_SIZE) ? 1u : 0u;
+
+                /*
+                 * 4. 释放-再分配的真实往返。
+                 *
+                 * 自检是在合成实例上跑的;这一步才证明**真实的 palloc 页 +
+                 * 真实的页表**上这条路径也对 —— 尤其是"释放之后 guard
+                 * 重新生效"这一条:漏了它,下一个拿到这个槽的任务就没有 guard。
+                 */
+                if (kstack_free(&g_kstack, &b) == KSTACK_OK &&
+                    kstack_alloc(&g_kstack, &g_kstack_probe) == KSTACK_OK) {
+                    g_kstack_reuse_ok = ((g_kstack_probe.slot == b.slot) &&
+                                         (g_kstack_probe.guard == b.guard) &&
+                                         (vmap_lookup(&g_vmap_stack, g_kstack_probe.guard) == 0u))
+                                            ? 1u
+                                            : 0u;
+                }
+
+                console_printf(" Kernel stack: slot0 base=0x%08X top=0x%08X guard=0x%08X\n", a.base, a.top,
+                               a.guard);
+                console_printf(" Kernel stack: guard=%s usable=%s adjacent=%s reuse=%s\n",
+                               g_kstack_guard_ok ? "PASS" : "FAIL", g_kstack_usable_ok ? "PASS" : "FAIL",
+                               g_kstack_adjacent_ok ? "PASS" : "FAIL", g_kstack_reuse_ok ? "PASS" : "FAIL");
+            }
+        }
+
+        /*
+         * 登记破坏性验证的目标栈。
+         *
+         * 必须在主循环之前 —— fault_test_poll() 在主循环里,而它要能拿到
+         * 一个有效的句柄。没登记时 kstack_probe_* 一律返回"未初始化",
+         * 不会去解引用空指针。
+         */
+        if (g_kstack_reuse_ok != 0u) {
+            kstack_probe_register(&g_kstack, &g_kstack_probe);
+        }
+    }
+
     /* ---- 9.5 第二个核(AM3-1/2/3) ---- */
     /*
      * 位置:MMU 与缓存都已就绪之后。
@@ -1118,6 +1305,25 @@ void kmain(void)
     selftest_report("palloc_smoke", g_palloc_smoke, 1u, SELFTEST_EQ);
     /* 池至少要有 100000 页(约 390MB)—— 数字写小了等于没判 */
     selftest_report("palloc_pages_ok", (g_palloc.page_count >= 100000u) ? 1u : 0u, 1u, SELFTEST_EQ);
+
+    /*
+     * ---- 内核栈与 guard page(M4-5)----
+     *
+     * ⚠ 这几项都是**第二级证据**(读回页表 / 写回读),它们证明不了
+     *   "guard 真的会拦住越界访问"。那要第三级证据:故意写溢出,
+     *   看 DFAR 是否落在 guard 页里 —— 见 fault_test 的选择器 6/7/8
+     *   与 tmp-test/guard_trip.py。
+     *
+     *   "guard 页在页表里是 0"与"访问它会产生 Data Abort"是两件事:
+     *   前者在 TLB 里还留着拆段之前的段表项时照样成立,
+     *   而那正是最可能出的错(改完页表忘了失效 TLB)。
+     */
+    selftest_report("kstack_selftest", g_kstack_selftest, 0u, SELFTEST_EQ);
+    selftest_report("kstack_slots", g_kstack_slots_ok, 1u, SELFTEST_EQ);
+    selftest_report("kstack_guard_unmapped", g_kstack_guard_ok, 1u, SELFTEST_EQ);
+    selftest_report("kstack_usable", g_kstack_usable_ok, 1u, SELFTEST_EQ);
+    selftest_report("kstack_adjacent", g_kstack_adjacent_ok, 1u, SELFTEST_EQ);
+    selftest_report("kstack_free_reuse", g_kstack_reuse_ok, 1u, SELFTEST_EQ);
 
     selftest_report("smp_cpu1_online", g_percpu[1].online, 1u, SELFTEST_EQ);
     selftest_report("smp_cpu1_stage", HB[HB_SLOT_CPU1_STAGE], HB_CPU1_STAGE_ONLINE, SELFTEST_EQ);
