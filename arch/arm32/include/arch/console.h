@@ -50,7 +50,7 @@ void console_put_dec32(u32 value);
  *
  * ## 它怎么做到互斥(以及为什么不是自旋锁)
  *
- * 实现是"进入时关掉调度、退出时按计数恢复"(`sched_disable`/`sched_enable`)。
+ * 实现是"进入时关掉调度、退出时按计数恢复"。
  * 关键在于:**调度关着的时候没有别的上下文能跑起来**,于是"谁在打印"
  * 天然唯一 —— 不需要锁。
  *
@@ -61,6 +61,22 @@ void console_put_dec32(u32 value);
  * ⚠ 代价:排他期间**整个系统停摆**(状态线程醒不过来、别的线程不推进)。
  *   所以只包"必须成段"的输出,别包住会等很久的东西。
  *   也正因如此,它**不是**通用的 printf 锁,而是一个"这一段我说了算"的作用域。
+ *
+ * ## ★ 为什么是钩子,而不是直接调 `sched_disable()` ★
+ *
+ * 直接调会让**低层输出模块依赖调度器** —— 宿主单测编译 `console.c` 时
+ * 会因为 `sched_disable` 未定义而链接失败(实测就是这样)。
+ * 本项目对同类问题已有先例:`kstack` 的 TLB 维护也是做成函数指针由调用方
+ * 传进来(见 `arch/kstack.h`),好处两头都占 —— 模块内部不会漏做,
+ * 纯逻辑部分又能在宿主上编译,而且宿主单测能**断言钩子被调用过**。
+ *
+ * 没装钩子时(`begin == NULL`)排他**退化成空操作** —— 启动早期只有一个
+ * 写者,那正是对的。
  */
+typedef void (*console_excl_fn)(void);
+
+/* 装入排他钩子。内核在调度器就绪之后装 `sched_disable` / `sched_enable` */
+void console_set_excl_hooks(console_excl_fn begin, console_excl_fn end);
+
 void console_excl_begin(void);
 void console_excl_end(void);

@@ -9,7 +9,6 @@
  */
 
 #include <arch/console.h>
-#include <arch/sched.h>
 #include <arch/uart_ps.h>
 
 static uintptr_t g_uart_base = 0;
@@ -39,25 +38,33 @@ void console_puts(const char *str)
 /* ------------------------------------------------------------------ */
 
 /*
- * 嵌套计数。**只在 0 → 1 时关调度,1 → 0 时恢复** ——
+ * 嵌套计数。**只在 0 → 1 时叫钩子,1 → 0 时叫另一个** ——
  * 否则内层一退出就把外层的保护撤掉了,而那种失效是静默的:
  * 输出照样出得来,只是偶尔被别的东西插进去。
  */
-static u32 g_excl_depth;
+static console_excl_fn g_excl_begin;
+static console_excl_fn g_excl_end;
+static u32             g_excl_depth;
+
+void console_set_excl_hooks(console_excl_fn begin, console_excl_fn end)
+{
+    g_excl_begin = begin;
+    g_excl_end   = end;
+}
 
 void console_excl_begin(void)
 {
-    if (g_excl_depth == 0u) {
-        /*
-         * 关调度而不是关中断:
-         *   - 关中断挡不住"另一个线程",因为线程切换发生在中断返回路径上,
-         *     而这里要防的正是别的线程插进来;
-         *   - 关调度之后没有别的上下文能跑起来,于是"谁在打印"唯一。
-         *
-         * ⚠ 不能换成自旋锁:一行 60~80ms,持锁者会被抢占,等锁者自旋
-         *   (且关中断)就再也没人放锁 ⇒ 死锁。见 console.h 的说明。
-         */
-        sched_disable();
+    /*
+     * 钩子由内核在调度器就绪之后装入(`sched_disable` / `sched_enable`)。
+     *
+     * ⚠ 为什么做成钩子而不是直接调:`console.c` 是低层输出模块,
+     *   直接依赖调度器会让宿主单测链接不过(实测过),而且层次反了。
+     *   本项目对同类问题已有先例 —— `kstack` 的 TLB 维护也是函数指针。
+     *
+     * 没装钩子时退化成空操作:启动早期只有一个写者,那正是对的。
+     */
+    if (g_excl_depth == 0u && g_excl_begin != NULL) {
+        g_excl_begin();
     }
     g_excl_depth++;
 }
@@ -65,12 +72,12 @@ void console_excl_begin(void)
 void console_excl_end(void)
 {
     if (g_excl_depth == 0u) {
-        return; /* 多退一次不把调度打开 —— 那会让外层失去保护 */
+        return; /* 多退一次不把保护撤掉 —— 那会让外层失去保护 */
     }
 
     g_excl_depth--;
-    if (g_excl_depth == 0u) {
-        sched_enable();
+    if (g_excl_depth == 0u && g_excl_end != NULL) {
+        g_excl_end();
     }
 }
 

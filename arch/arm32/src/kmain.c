@@ -228,6 +228,34 @@ static u32 g_reloc_ctl_detected;
 #define YIELD_ROUNDS 8u
 
 /*
+ * ★ 探针线程的"干完活了" ★
+ *
+ * ← 源 OS `pcb.cpp:501-504`:
+ *       kill_thread(get_current_task());
+ *       open_interrupt;
+ *       while (true) __asm__ volatile("hlt");
+ *   也就是"把线程回收掉,然后在 `hlt` 上永久停住"。
+ *   ARM 侧的对应物就是 `park` + `wfi` 死循环 —— **`wfi` 在这里是对的**
+ *   (它的正当用途是"永久停住",不是"idle 省电";见 arch/cpu.h 的说明)。
+ *
+ * ⚠ 但本函数**目前不可达**(退化清单 D14):
+ *   M4-11 之前没有线程退出机制,`sched_park_self()` 对一条真实线程
+ *   **不会返回**(状态置 WAIT、`wakeup_time = 0`,再也不会被挑中)。
+ *   所以下面那个循环是"到不了的第二道保险",留着是为了**语义完整**
+ *   (线程不能从入口返回),而不是因为它有用。
+ *
+ *   ⇒ 它看起来像一项策略,其实不是。等 M4-11 有了 `kill_thread` 的对应物,
+ *     这个函数才真的会被执行到。
+ */
+static void thread_finish(void)
+{
+    sched_park_self();
+    for (;;) {
+        arch_wfi();
+    }
+}
+
+/*
  * 让出探针:各累加一个计数,然后主动让出。
  *
  * ★ M4-9 起"让出"不再是自己实现的一套切换 ★
@@ -251,10 +279,7 @@ static void yield_probe_a(void *arg)
         sched_yield();
     }
 
-    sched_park_self(); /* 不再可调度 —— 这是启动流程能回来的前提 */
-    for (;;) {
-        arch_wfi();
-    }
+    thread_finish(); /* 不再可调度 —— 这是启动流程能回来的前提 */
 }
 
 static void yield_probe_b(void *arg)
@@ -267,10 +292,7 @@ static void yield_probe_b(void *arg)
         sched_yield();
     }
 
-    sched_park_self();
-    for (;;) {
-        arch_wfi();
-    }
+    thread_finish();
 }
 
 /* ------------------------------------------------------------------ */
@@ -352,10 +374,7 @@ static void spin_probe(void *arg)
     }
 
     p->done = 1u;
-    sched_park_self();
-    for (;;) {
-        arch_wfi();
-    }
+    thread_finish();
 }
 
 static void spin_probe_a(void *arg)
@@ -414,20 +433,14 @@ static void acc_probe(void *arg)
     (void)arg;
 
     if (self == NULL) {
-        sched_park_self();
-        for (;;) {
-            arch_wfi();
-        }
+        thread_finish();
     }
 
     t0 = self->eevdf_vruntime;
     timer_delay_us(20000u);
     g_tick_acc_delta = self->eevdf_vruntime - t0;
 
-    sched_park_self();
-    for (;;) {
-        arch_wfi();
-    }
+    thread_finish();
 }
 
 /* ------------------------------------------------------------------ */
@@ -522,10 +535,7 @@ static void fp_probe(void *arg)
     }
 
     p->done = 1u;
-    sched_park_self();
-    for (;;) {
-        arch_wfi();
-    }
+    thread_finish();
 }
 
 static void fp_probe_a(void *arg)
@@ -2148,6 +2158,15 @@ void kmain(void)
 
         sched_kern_bind(&g_kstack, &g_heap);
         sched_kern_init();
+        /*
+         * ★ 把排他输出的钩子装上 ★
+         *
+         * `console_excl_begin/end` 用"关调度"实现互斥(见 arch/console.h),
+         * 但 `console.c` **不认识调度器** —— 它只持一对函数指针。
+         * 装在这里是因为从这一刻起才会有第二个写者(周期状态线程)。
+         * 在此之前没装钩子,排他是空操作 —— 那正是对的:只有一个写者。
+         */
+        console_set_excl_hooks(sched_disable, sched_enable);
 
         g_yield_a        = 0u;
         g_yield_b        = 0u;

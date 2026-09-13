@@ -22,14 +22,49 @@
 /* 低功耗与让出                                                         */
 /* ------------------------------------------------------------------ */
 
-/* 自旋等待提示。Cortex-A9 无 pause 指令,用 yield 提示流水线 */
+/*
+ * 自旋等待提示。
+ *
+ * ★ `yield` 正是 x86 `pause` 的 ARM 对应物 ★ —— 两者都是**提示**指令
+ *   (让出流水线 / 给 SMT 兄弟线程),**都不会让核心停下来**。
+ *   源 OS 的 idle 用的就是 `pause`(见下面 `arch_wfi` 的说明)。
+ */
 static inline void cpu_relax(void)
 {
     __asm__ volatile("yield" ::: "memory");
 }
 
-/* 低功耗等待(x86 的 hlt 对应物)。本文件顶部的对照表里写着有 WFE/WFI,
- * 但一直没有实现 —— M4-8 的 idle 线程需要它。 */
+/*
+ * 停下来等中断。**不是 idle 用的。**
+ *
+ * ## ★ 这个注释原先写错了,已按源 OS 改正 ★
+ *
+ * 原文是:"低功耗等待(**x86 的 hlt 对应物**)。…… **M4-8 的 idle 线程需要它**"。
+ * 两句都不成立,而且第二句里的那个 idle 线程**已经被按源 OS 拆掉了**:
+ *
+ *   1. **源 OS 的 idle 不是 `hlt`,是 `pause` 忙等** ——
+ *      BSP:`kernel/main.cpp:622-631` 的收尾循环体是 `__asm__ volatile("pause")`;
+ *      AP :`kernel/smp/smp.cpp:178-183` 同样是 `while (true) asm volatile("pause")`
+ *          (它下面那句 `hlt` 是不可达的防御:注释写着"AP 若意外返回启动路径才停")。
+ *      ⇒ **源 OS 里没有任何"让 CPU 停下来等中断"的机制**,WFI 在那儿没有对应物。
+ *
+ *   2. `hlt` 在源 OS 里的含义是**"永久停住"**,全部出现在终结路径上:
+ *      `driver/power.cpp:250`/`:310`(关机/重启兜底)、`kernel/memory/page.cpp:477`(OOM)、
+ *      `kernel/smp/smp.cpp:98`/`:310`(启动失败)、`kernel/main.cpp:524`(idle 分配失败)、
+ *      `kernel/task/pcb.cpp:503-504`(**内核线程退出**后的兜底)。
+ *
+ * ⇒ 所以 `wfi` 的**正当用途只有一个**:一条线程真的结束了、要永久停在那里 ——
+ *   那对应的是源 OS 的 `pcb.cpp:503-504`(`kill_thread` 之后 `while (true) hlt`),
+ *   **不是 idle**。
+ *
+ * ⚠ 至于"要不要让 idle 进 WFI":那不是"加一条指令",而是**引入一个源 OS 没有的
+ *   低功耗机制**。而且 BSP 的 idle **没有实体循环**(idle 就是启动流程自己,
+ *   `ctx.pc = 0`,只被切走、不被切进去),在那儿加 WFI 等于**改 idle 的模型** ——
+ *   正是 M4-8 造过、后来按源 OS 拆掉的那个东西。
+ *   唯一"不改模型"的落点是**每核 idle 的实体循环**(ARM 侧 CPU1 已有:
+ *   `smp.c:219-223` 的 `for(;;){ loops++; …; cpu_relax(); }`),把它换成 `wfi`
+ *   是一次局部、可 A/B 的偏离 —— 要做得单独拍板并记进偏离清单。
+ */
 static inline void arch_wfi(void)
 {
     __asm__ volatile("wfi" ::: "memory");
@@ -40,7 +75,15 @@ static inline void arch_wfe(void)
     __asm__ volatile("wfe" ::: "memory");
 }
 
-/* 等待事件:进入低功耗直到 SEV/中断。等价于 x86 的 hlt */
+/*
+ * 等事件:进入低功耗直到 SEV/中断。
+ *
+ * ⚠ 原文写的是"等价于 x86 的 hlt" —— 也不准。`hlt` 在源 OS 里是**永久停住**
+ *   (终结路径),而 `wfe` 是**等到有人发事件就继续**,两者语义相反。
+ *   `wfe` 在源 OS 里的真正对应物是**启动握手时的忙等轮询**
+ *   (`kernel/main.cpp:581-585` 的 `while (true) { pause; if (scheduler_is_ready ==
+ *   xsi->cpu_count) break; }`)—— 那边用 `pause` 反复查,这边用 `wfe` 被 SEV 叫醒。
+ */
 static inline void cpu_wfe(void)
 {
     __asm__ volatile("wfe" ::: "memory");

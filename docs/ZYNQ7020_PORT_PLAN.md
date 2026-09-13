@@ -253,7 +253,7 @@ Preempt A/B  : skip_frame -> a=0 b=0 switched=2 invalid=0   → 检出
 | 启动阶段 ~67ms 的 tick 跳变 | 预先存在，已用受控 A/B 证明与缓存无关，原因未明 |
 | PL310 勘误 775420 | 尚未处理 |
 | SXAH 57 位系统调用号 | ARM 侧需要重新编号；代价实际为零 |
-| **WFI 要不要加** | x86 那边是 `hlt` 且只在 `process_exit` 里；"idle 进 WFI"**不是源 OS 的行为**。要不要给 ARM 加，**需要用户单独拍板** |
+| **WFI 要不要加** | ★ **原来的说法是错的，已按源 OS 改正（2026-09）** ★ 原文写的是"x86 那边是 `hlt` 且只在 `process_exit` 里；'idle 进 WFI' **不是源 OS 的行为**" —— **两半都不成立**。查证结果：<br>① **源 OS 的 idle 是 `pause` 忙等，不是 `hlt`**：BSP `kernel/main.cpp:622-631` 的收尾循环体是 `__asm__ volatile("pause")`；AP `kernel/smp/smp.cpp:178-183` 同样是 `while (true) asm volatile("pause")`（紧跟其后的 `hlt` 不可达，注释写着"AP 若意外返回启动路径才停"）。x86 的 `pause` 是**自旋提示**，CPU 仍在跑 ⇒ **源 OS 里没有任何"让 CPU 停下来等中断"的机制**。<br>② **`hlt` 在源 OS 里 = "永久停住"**，出现在全部终结路径：`driver/power.cpp:250`/`:310`、`kernel/memory/page.cpp:477`、`kernel/smp/smp.cpp:98`/`:310`、`kernel/main.cpp:524`、`kernel/task/pcb.cpp:503-504`（线程退出兜底）—— 不止 `process_exit`。<br>⇒ **`wfi` 的正当用途只有"线程真的结束了、永久停住"**（对应 `pcb.cpp:503-504`），**不是 idle**。<br>⇒ 于是这一项性质变了：不是"照不照源 OS"，而是**要不要主动引入一个源 OS 没有的低功耗机制**。而 **BSP 的 idle 没有实体循环**（idle 就是启动流程自己，`ctx.pc = 0`，只被切走、不被切进去），在那儿加 WFI **等于改 idle 的模型** —— 正是 M4-8 造过、后来按源 OS 拆掉的那个东西。唯一"不改模型"的落点是**每核 idle 的实体循环**（ARM 侧 CPU1 已有：`smp.c:219-223` 的 `for(;;){ loops++; …; cpu_relax(); }`）。<br>**当前决定：保持空转，与源 OS 一致。** 真要省电，M4-10 定型后单独做一次带 A/B 的偏离并记进清单 |
 | `sched_pick` 仍是"取队首" | 源 OS 的 `select_next_task_safe` 还有 avg_vruntime 闸门、fallback 扫描、`mark_task_dispatched`。等权负载下结果相同，但**那是简化，不是等价**。M4-10 一起补 |
 | 就绪队列无锁 | 单核、只有 CPU0 碰它。源 OS 用带自旋锁的 `lock_queue`；M4-10 再定每核一把还是无锁 |
 | `spin_t` 的宿主编译器 `#include <stdint.h>` | 无 |

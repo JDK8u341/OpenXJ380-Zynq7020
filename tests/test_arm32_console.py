@@ -30,6 +30,20 @@ HARNESS = r"""
 #include <arch/uart_ps.h>
 
 /* ------------------------------------------------------------------ */
+/* 桩:排他钩子(M4-8.4)                                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 产品里这两个钩子是 `sched_disable` / `sched_enable`(由内核装入)。
+ * 这里只数调用次数 —— 要验的是"成对、按嵌套深度",不是调度器本身。
+ */
+static int hook_begin_calls;
+static int hook_end_calls;
+
+static void stub_excl_begin(void) { hook_begin_calls++; }
+static void stub_excl_end(void)   { hook_end_calls++; }
+
+/* ------------------------------------------------------------------ */
 /* 桩:替代真实 UART,把输出收进缓冲区                                  */
 /* ------------------------------------------------------------------ */
 
@@ -91,10 +105,20 @@ static void expect(const char *what, const char *want)
     }
 }
 
+/* 整数形式的判据(排他钩子那几个用它 —— 它们不看输出,看调用次数) */
+static void check(const char *what, int cond)
+{
+    if (!cond) {
+        printf("FAIL %-22s\n", what);
+        failures++;
+    }
+}
+
 int main(void)
 {
     /* 任意非 0 基址即可,uart_init 是桩不会碰硬件 */
     console_init((uintptr_t)1, 100000000u, 9600u);
+    console_set_excl_hooks(stub_excl_begin, stub_excl_end);
 
     /* ---- 普通文本 ---- */
     reset(); console_printf("hello");                 expect("plain", "hello");
@@ -141,6 +165,44 @@ int main(void)
     reset(); console_put_hex32(0xDEADBEEFu);          expect("put_hex32", "0xDEADBEEF");
     reset(); console_put_dec32(0u);                   expect("put_dec32 zero", "0");
     reset(); console_put_dec32(123456u);              expect("put_dec32", "123456");
+
+    /*
+     * ---- 排他输出(M4-8.4):钩子必须**成对、按嵌套深度**调用 ----
+     *
+     * 这条判据的由来:排他区里 9600 波特下要传几十毫秒,而别的上下文随时
+     * 可能插进来把机器可读的自检报告劈成两半。互斥靠"关调度"实现,而
+     * `console.c` 只持一对钩子(不直接认识调度器 —— 否则宿主单测链接不过)。
+     *
+     * ⚠ 判据的重点在**嵌套**:
+     *   - 进两次只该叫一次 begin(否则内层退出时会把外层的保护撤掉);
+     *   - 出到 0 才叫 end;
+     *   - 多退一次**不许**再叫 end(那同样会让外层失去保护)。
+     *   这三点里任何一点错了,失效都是**静默的** —— 输出照样出得来,
+     *   只是偶尔被插进去。
+     */
+    {
+        int before_calls = hook_begin_calls;
+        int ebefore_calls = hook_end_calls;
+
+        console_excl_begin();
+        check("excl begin calls begin", hook_begin_calls == before_calls + 1);
+        console_excl_begin(); /* 嵌套:不该再叫一次 */
+        check("excl nested no extra begin", hook_begin_calls == before_calls + 1);
+        console_excl_end();   /* 还没到 0:不该叫 end */
+        check("excl inner end no hook", hook_end_calls == ebefore_calls);
+        console_excl_end();
+        check("excl outer end calls hook", hook_end_calls == ebefore_calls + 1);
+
+        /* 多退一次:计数已经是 0,不许再叫 end */
+        console_excl_end();
+        check("excl over-end no hook", hook_end_calls == ebefore_calls + 1);
+
+        /* 多退之后仍然能正常配对(计数没被弄成负数) */
+        console_excl_begin();
+        check("excl still works after over-end", hook_begin_calls == before_calls + 2);
+        console_excl_end();
+        check("excl still pairs", hook_end_calls == ebefore_calls + 2);
+    }
 
     if (failures == 0) {
         printf("ALL PASS\n");
