@@ -90,9 +90,11 @@ git diff --name-only 08e5c9c HEAD -- kernel include driver user lib boot kmod re
 > 完整步骤（要改哪几个值、去哪找、怎么自检、怎么排错）见
 > **[`docs/BUILD_ARM32.md`](docs/BUILD_ARM32.md)**。★
 >
-> ⚠ **硬件工程那一节（指南 §2）建议先读**：PS 配置（`ps7_init`）与 PL 比特流
-> **现在来自两个不同的工程**，两边各有一个"看起来能用、其实不能用"的文件 ——
-> 拿错了分别是"串口一个字节都没有"和"LED 不亮"，而且都不像配置问题。★
+> ★ **如果你是拿自己的板复现这套东西**（同一套设计、换一块板）：
+> 照着指南 **§2** 走一遍 —— **自己导出 XSA → 解包 → 放到对应路径 → 改 `config.py`**。
+> ⚠ 那一节有一条防误导：**PS 配置（`ps7_init`）与 PL 比特流来自两个不同的工程**，
+> 两边各有一个"看起来能用、其实不能用"的文件 —— 拿错了分别是
+> "**串口一个字节都没有**"和"**LED 不亮**"，而且都不像配置问题。★
 
 **环境**：Windows + Vitis 2025.2（自带 GNU ARM 工具链，文件名是 `arm-none-eabi-gcc.exe`；
 `--version` 自报 `arm-xilinx-eabi-gcc` 13.3.0）+ Python 3 + Ninja。

@@ -11,7 +11,7 @@
 ## 0. 一句话流程
 
 ```bash
-# ① 准备硬件工程(XSA/比特流/ps7_init,见 §2) → ② 改 config.py → ③ 自检
+# ① 导出/解包 XSA 并放好文件(见 §2) → ② 改 config.py → ③ 自检
 # → ④ 构建 → ⑤ 上板
 python config.py                       # 自检 + 生成 Tcl 要用的 paths.tcl
 python tools/gen_ninja.py --out build-arm.ninja --arch arm32
@@ -19,8 +19,9 @@ ninja -f build-arm.ninja arm32         # 产物 out/kernel-arm.elf
 python tmp-test/verify_board.py --load --seconds 75
 ```
 
-> 第 ① 步（`ps7_init` / 比特流从哪来、BD 里要配什么、解包后哪个文件是哪个）
-> 见 **§2**。如果你手上已有一个能跑通的工程，直接从第 ② 步开始。
+> 第 ① 步（**前提是「同一套设计、你自己的板」**：自己导出 XSA → 解包 →
+> 放到对应路径 → 改 `config.py`）见 **§2**。
+> 如果这两样文件你已经有了，直接从第 ② 步开始。
 
 ---
 
@@ -34,7 +35,7 @@ python tmp-test/verify_board.py --load --seconds 75
 | Ninja | 任意较新版本 | |
 | pyserial | `pip install pyserial` | 只有串口脚本用 |
 | 硬件 | Zynq-7020 板 + JTAG 下载器 + 串口线 | 本移植是照 AC880-CB / AC850-CORE 调的 |
-| 硬件工程 | **带 PL 设计**的那个 XSA/平台导出（`hw\sdt\System_wrapper.bit`），**外加**一份 UART1 已使能、MIO bank1 = 1.8V 的 `ps7_init.tcl` |★ **见 §2** —— PS 配置与 PL 比特流来自**两个不同工程**，别顺着目录拿文件 |
+| 硬件工程 | 从**同一套设计**导出并解包出来的两样东西：**带 PL 设计**那个工程的 `hw\sdt\System_wrapper.bit`，**外加** UART1 已使能、MIO bank1 = 1.8V 那个工程的 `ps7_init.tcl` |★ **见 §2** —— 这两样来自**两个不同工程**，别顺着目录拿文件 |
 
 > `xsdb` 的用法：加载 PS 配置、烧比特流、下载 ELF、读寄存器，全部走 JTAG。
 >
@@ -43,40 +44,60 @@ python tmp-test/verify_board.py --load --seconds 75
 
 ---
 
-## 2. ★ 准备硬件工程（XSA / 比特流 / `ps7_init`）★
+## 2. ★ 硬件工程：导出 XSA → 解包 → 放路径 → 改 `config.py` ★
 
-> ⚠ 这一节是**对照检查表**，不是"从零建 Vivado 工程的分步教程"。
-> 下面每条事实都来自**对现有工程的实测**（解包 XSA 读 `.hwh`、比对 `ps7_init.tcl`、
-> 板上读回 `MIO_PIN_*` 寄存器），**我没有从零走过一遍 GUI 流程**。
+### 2.1 这一节适用于什么情况
 
-### 2.1 ★★ 最容易搞错的一件事：PS 与 PL 来自**两个不同的工程** ★★
+> **✅ 适用：同一套硬件设计，你自己的板 / 你自己的机器。**
+> 设计（PS 的 BD 配置 + PL 的 AXI GPIO）**不用你重新发明**。你要做的是把**这套设计**
+> 在你自己的 Vivado/Vitis 里**导出成 XSA**、**解包**、把文件**放到对应路径**、
+> 再改 `config.py` 指过去。
+>
+> **❌ 不适用：改设计本身**（换 IP、改地址、改 MIO 复用）。
+> 那会连带改内核侧的 `arch/arm32/board/xparameters.h` 与设备描述表，超出这份指南。
 
-这套移植现在是把两个工程**交叉组合**起来用：
+要做的就四步：
 
-| 哪一半 | 内容 | 来自 | 落地成哪个文件 |
+| # | 做什么 | 产出 | 落到哪 |
 |---|---|---|---|
-| **PS 配置** | PLL / 时钟 / DDR / MIO 复用 / MIO bank 电压 | `opjtmp.xsa` | `tmp-test/zynq/ps7_init_uart1.tcl`（**在仓库里**） |
-| **PL 比特流** | AXI GPIO → LED 流水灯 | `AXI_GPIO_1` 平台 | `<平台>\hw\sdt\System_wrapper.bit`（`config.BITSTREAM`） |
+| ① | 从**两个工程**各导出一次 XSA | `*.xsa`（其实是个 ZIP） | 你自己的目录，随便放 |
+| ② | 解包，挑出真正要用的两个文件 | `*.bit`、`ps7_init.tcl` | 见 **§2.5** |
+| ③ | 按 §2.5 的对照表放到对应路径 | — | 一个进仓库，一个留本地 |
+| ④ | 改 `config.py` 指向它们，再 `python config.py` 自检 | — | 见 **§3** |
 
-**它们不是同一个 XSA**，而且**两边都各有一个"看起来能用、其实不能用"的文件**：
+**§2.3 / §2.4 是「要求」** —— 你的导出物必须满足这些，用来判断"我导出的对不对"，
+**不是**"怎么在 Vivado 里搭 BD"的教程。
+**§2.6 是「核对」**（两段脚本 + 一条板上硬校验）。
 
-| 陷阱文件 | 为什么不能用 |
-|---|---|
-| `opjtmp.xsa` 里的 `opxjtmp.bit` | 它的 `.hwh` 里**只有 `processing_system7`、没有任何 PL IP** ⇒ 烧下去 PL 是空的，AXI GPIO 流水灯没了 |
-| `AXI_GPIO_1` 里的 `ps7_init.tcl` | 它**不把 MIO48/49 复用成 UART1** ⇒ 内核照常启动（心跳/MMU/LED 自检全对），但**串口一个字节都没有** —— 看起来就像"内核没跑起来" |
+下面每条事实都来自**对现有两个工程的实测**（解包 XSA 读 `.hwh`、逐字节比对
+三份 `ps7_init.tcl`、板上读回 `MIO_PIN_*` 寄存器）。
+
+### 2.2 ★★ 前提：PS 与 PL 来自**两个不同的工程** ★★
+
+这套移植是把两个工程**交叉组合**起来用的：
+
+| 哪一半 | 内容 | 来自哪个工程 | 落地成什么 |
+|---|---|---|---|
+| **PS 配置** | PLL / 时钟 / DDR / MIO 复用 / MIO bank 电压 | **`opjtmp`**（只要 PS、没有 PL） | `tmp-test/zynq/ps7_init_uart1.tcl`（**进仓库**） |
+| **PL 比特流** | AXI GPIO → LED 流水灯 | **`AXI_GPIO_1`**（有 PL 设计） | `<工程>\hw\sdt\System_wrapper.bit`（只填进 `config.py`） |
+
+**它们不是同一个 XSA**，所以**两边各有一个"看起来能用、其实不能用"的文件**：
+
+| 陷阱文件 | 谁最容易拿到它 | 用了会怎样 |
+|---|---|---|
+| `opjtmp.xsa` 里的 `opxjtmp.bit` | "顺手把 XSA 里的 bit 烧了" | 它的 `.hwh` 里**只有 `processing_system7`、没有任何 PL IP** ⇒ PL 是空的，**LED 流水灯不亮** |
+| `AXI_GPIO_1` 里的 `ps7_init.tcl` | "bit 就在这儿，ps7_init 也在旁边，一起拿" | 它的 BD 里 `PCW_EN_UART1 = 0` ⇒ **不把 MIO48/49 复用成 UART1** ⇒ 内核照常启动（心跳/MMU/LED 自检全对）但**串口一个字节都没有** —— 看起来就像"内核没跑起来" |
 
 > ⚠⚠ **所以不要"顺着目录拿文件"。** 判断一个 `.bit` / `ps7_init.tcl` 能不能用，
 > 要看**它来自哪个工程**，不要看它放在哪、叫什么名字、多大 ——
 > 那两个 `.bit` 的大小只差 **2 字节**（`4,045,692` vs `4,045,690`）。
 
-补充一句原理（这也是"交叉组合"能成立的原因）：`ps7_init` 管 **PS**（时钟/MIO/DDR），
+原理（也是"交叉组合"能成立的原因）：`ps7_init` 管 **PS**（时钟/MIO/DDR），
 比特流管 **PL**，两者相互独立，所以可以来自不同工程。
 
-### 2.2 PS 侧：BD 里要配什么
+### 2.3 要求一：PS 侧（`opjtmp` 那个工程）的 BD 必须长这样
 
-在 Vivado 的 Block Design 里加一个 `processing_system7`，然后：
-
-| 项 | 要设成 | `.hwh` 里的参数名 | 实测值（`opjtmp.xsa`） |
+| 项 | 必须是 | `.hwh` 里的参数名 | 实测值（`opjtmp.xsa`） |
 |---|---|---|---|
 | **UART1 使能** | ✅ 开 | `PCW_EN_UART1` / `PCW_UART1_PERIPHERAL_ENABLE` | `1` / `1` |
 | **UART0** | 关掉（不用） | `PCW_EN_UART0` | `0` |
@@ -85,69 +106,84 @@ python tmp-test/verify_board.py --load --seconds 75
 | **MIO49 = UART1 RX** | 复用给 UART1 | 同上 | `MIO49 -> UART 1`、`rx` |
 | ★ **MIO bank 1 电压** | **LVCMOS 1.8V** | `PCW_PRESET_BANK1_VOLTAGE` | `LVCMOS 1.8V` |
 | MIO bank 0 电压 | LVCMOS 3.3V | `PCW_PRESET_BANK0_VOLTAGE` | `LVCMOS 3.3V` |
+| **不要有 PL IP** | 这个工程**只出 PS 配置**，PL 用另一个工程 | — | `.hwh` 里只有 `processing_system7` |
 
-**bank 1 这一条是最容易配错、也最难查的**：本板（AC850-CORE + AC880-CB）的
-`VCCIO_BANK1` 实际接的是 **1.8V**。如果 XSA 把它声明成 3.3V，`ps7_init` 会给
+**bank 1 这一条最容易配错、也最难查**：本板（AC850-CORE + AC880-CB）的
+`VCCIO_BANK1` 实际接的是 **1.8V**。如果导出的 XSA 把它声明成 3.3V，`ps7_init` 会给
 MIO16-53 写下 `[11:9]=3`（LVCMOS33），于是 **MIO49（UART1 RX）的输入阈值变成约 2.0V，
 1.8V 的高电平收不进来** —— 现象是"寄存器全对、但一个字节都收不到"，**没有任何报错**。
 这个坑当期绕了一大圈（详见 `arch/arm32/README.md` §8 与计划文档坑表）。
 
 > ★ **别被 XSA 里的波特率误导**：`PCW_UART1_BAUD_RATE` 写的是 `115200`，
-> 但**实际用的是 9600** —— 波特率由**内核自己重编程**（还会做闭环自校准，
-> 报告里的 `Baud : requested=... actual=... err=... ppm` 就是这件事）。
-> `config.py` 里的 `SERIAL_BAUD` 是**主机这一侧**的值，两边都要是 9600 才对得上。
+> 但**实际用的是 9600** —— 波特率由**内核自己重编程**（还有闭环自校准，
+> 报告里 `Baud : requested=... actual=... err=... ppm` 就是这件事）。
+> `config.py` 里的 `SERIAL_BAUD` 是**主机这一侧**的值，两边都是 9600 才对得上。
 
-### 2.3 PL 侧：要配什么
+### 2.4 要求二：PL 侧（`AXI_GPIO_1` 那个工程）必须长这样
 
 PL 里只需要一个 **AXI GPIO** 直接驱动 LED：
 
-| 项 | 值 | 出处 |
+| 项 | 必须是 | 出处 / 怎么认 |
 |---|---|---|
 | IP | `axi_gpio`（双通道、8 位、**无中断**） | `IS_DUAL=1`、`GPIO_WIDTH=8`、`INTERRUPT_PRESENT=0` |
-| 基地址 | `0x41200000` – `0x4120FFFF` | `arch/arm32/board/xparameters.h` 的 `XPAR_AXI_GPIO_0_BASEADDR` |
-| 连接 | PS 的 `M_AXI_GP0` → AXI SmartConnect → `axi_gpio` | `.hwh` 里有 `smartconnect` |
-| 复位 | `proc_sys_reset`（由 PS 的 FCLK_RESET0_N 驱动） | `.hwh` 里有 `proc_sys_reset` |
+| 基地址 | `0x41200000` – `0x4120FFFF` | 与内核侧 `XPAR_AXI_GPIO_0_BASEADDR` 必须一致 |
+| 连接 | PS 的 `M_AXI_GP0` → AXI SmartConnect → `axi_gpio` | `.hwh` 里找得到 `smartconnect` |
+| 复位 | `proc_sys_reset`（由 PS 的 `FCLK_RESET0_N` 驱动） | `.hwh` 里找得到 `proc_sys_reset` |
 | PL→PS 中断 | **不需要**（GPIO 不产中断） | `INTERRUPT_PRESENT=0` |
 
-内核侧对应的是 `arch/arm32/board/xparameters.h`（从 XSA 导出后固化进仓库）。
-**换板子/换 PL 设计时，这个文件要跟着更新**，否则内核会去点一个不存在的寄存器。
+**这条"必须一致"是硬要求**：内核侧的地址写在 `arch/arm32/board/xparameters.h` 里
+（从 XSA 导出后**固化进仓库**）。地址对不上，内核就会去点一个不存在的寄存器。
 
-### 2.4 解包以后，哪个是哪个
+> ⚠ **同配置的前提在这里有个推论**：既然是"同一套设计"，你导出的 `xparameters.h`
+> 应当与仓库里那份 `arch/arm32/board/xparameters.h` **一致**。
+> 不一致 = 设计变了 ⇒ 那要连带重新生成设备表
+> （`python tools/gen_board_desc.py arch/arm32/board/xparameters.h --out-c ... --out-h ...`），
+> **这已经超出本节范围**，别只改 `config.py`。
 
-**XSA 其实是个 ZIP**。以实测的两个为例，里面是这样：
+### 2.5 解包以后：哪个文件、放到哪
 
-| XSA 内的文件 | 是什么 | 我们用它吗 |
+**XSA 其实是个 ZIP。** 解开以后按用途分三类：
+
+| XSA 内的文件 | 是什么 | 要吗 |
 |---|---|---|
-| `design_1.hwh` / `System.hwh` | **BD 描述（XML）**。判断"有没有 PL IP"就看它 | 看，用作检查 |
-| `opxjtmp.bit` / `System_wrapper.bit` | 比特流 | 用 `System_wrapper.bit`（`AXI_GPIO_1` 的）；`opxjtmp.bit` 不用 |
-| `ps7_init.tcl` | PS 初始化（**Tcl 版**；JTAG 加载器用的就是这种） | 用 `opjtmp.xsa` 里那份（已进仓库） |
-| `ps7_init.c` / `.h` / `ps7_init_gpl.c` / `.h` | 同一份配置的 **C 版**（给 BSP 编译用） | 不用 |
-| `ps7_init.html` | 寄存器说明（1–3 MB） | 不用 |
-| `xsa.json` / `xsa.xml` / `sysdef.xml` / `*.bda` | 元数据 | 不用 |
+| `*.hwh`（`design_1.hwh` / `System.hwh`） | **BD 描述（XML）**。判断"有没有 PL IP"就看它 | 用来核对（§2.6），不用拷 |
+| `*.bit` | 比特流 | ✅ **要**（只从**有 PL 设计**那个工程拿） |
+| `ps7_init.tcl` | PS 初始化（**Tcl 版**；JTAG 加载器用的就是这种） | ✅ **要**（只从**UART1 已使能**那个工程拿） |
+| `ps7_init.c` / `.h` / `ps7_init_gpl.c` / `.h` | 同一份配置的 **C 版**（给 BSP 编译用） | ❌ 不用 |
+| `ps7_init.html` | 寄存器说明（1–3 MB） | ❌ 不用 |
+| `xsa.json` / `xsa.xml` / `sysdef.xml` / `*.bda` | 元数据 | ❌ 不用 |
 
-Vitis 工程里的**平台导出目录**（`<工程>\hw\sdt\`）是 XSA 解开后的形态，实际用到的文件都在这：
+Vitis 工程里的**平台导出目录**（`<工程>\hw\sdt\`）是 XSA 解开后的形态：
 
 ```
 <工程>\hw\
 ├─ System_wrapper.xsa          ← 导出的 XSA（ZIP）
 └─ sdt\                        ← 解开后的目录（Vitis 生成，给 BSP 用）
-   ├─ System_wrapper.bit       ← ★ 这个才是 config.BITSTREAM
-   ├─ ps7_init.tcl             ← ★ 就在旁边，但**不是**串口流程要的那份（不路由 UART1）
-   ├─ ps7_init.c / .h / _gpl.* ← 同一份配置的 C 版
+   ├─ System_wrapper.bit       ← ★ 这个才是 BITSTREAM
+   ├─ ps7_init.tcl             ← ★ 就在旁边，但多半**不是**串口流程要的那份
+   ├─ ps7_init.c / .h / _gpl.* ← C 版
    ├─ ps7_init.html            ← 寄存器说明
    ├─ pcw.dtsi / pl.dtsi / system-top.dts / zynq-7000.dtsi   ← 设备树
    ├─ include\                 ← BSP 头文件
    └─ .Xil\ 、extracted\        ← 中间产物，别管
 ```
 
-**"哪个是我们用的"一句话**：
+**放到哪 / 填进哪 —— 就这一张表**：
 
-| 要填进 `config.py` 的东西 | 从哪来 |
-|---|---|
-| `BITSTREAM` | **有 PL 设计那个工程**的 `hw\sdt\System_wrapper.bit` |
-| `PS7_INIT`（`tmp-test/zynq/ps7_init_uart1.tcl`） | **UART1 已使能、bank1=1.8V 那个 XSA** 里的 `ps7_init.tcl` |
+| 文件 | 放到哪 | 然后改 `config.py` 里哪个 |
+|---|---|---|
+| 比特流（`System_wrapper.bit`） | **留在你自己的目录就行**（几 MB，**不要提交**） | `BITSTREAM` = 它的**绝对路径** |
+| `ps7_init.tcl`（UART1 那份） | **放进仓库**：`tmp-test/zynq/ps7_init_uart1.tcl` | `PS7_INIT`（默认就指这里，通常不用改） |
+| `xparameters.h` | 只在你**改了设计**时才动 `arch/arm32/board/`（见 §2.4 的提醒） | — |
 
-### 2.5 拿到一个新 XSA，先跑这三步检查
+放好之后：
+
+```bash
+python config.py          # 自检:逐项告诉你哪个路径不存在 / 哪个还是占位值
+                          # 顺手刷新 tmp-test/jtag/paths.tcl(Tcl 脚本从那里取路径)
+```
+
+### 2.6 导出后怎么核对（三条）
 
 **① 它有没有 PL 设计？**（没有就只能当 PS 配置用，别指望 LED）
 
@@ -180,18 +216,14 @@ for i in (48, 49):
 要看到 `PCW_EN_UART1 = 1`、`PCW_PRESET_BANK1_VOLTAGE = LVCMOS 1.8V`，
 以及 `MIO48 -> UART 1 / tx`、`MIO49 -> UART 1 / rx`。
 
-**实测对照**（这段就是 §2.1 那个坑的直接证据）：
+**实测对照**（这段就是 §2.2 那个坑的直接证据 —— 两个工程本来就不同用途）：
 
 | XSA | `PCW_EN_UART1` | `MIO48` / `MIO49` |
 |---|---|---|
 | `opjtmp.xsa`（PS 配置源） | **`1`** | `UART 1 / tx`、`UART 1 / rx` |
 | `System_wrapper.xsa`（PL 比特流源） | **`0`** | `unassigned / unassigned` |
 
-⇒ 第二行正是"**它那份 `ps7_init.tcl` 不路由 UART1**"的原因：它的 BD 里 UART1
-本来就是关的。**这不是谁配错了，是两个工程本来就有不同用途** —— 所以更要按
-§2.4 那张表去取文件，而不是顺着目录拿。
-
-**③ 上板后由加载器**硬校验**（不靠人眼）：
+**③ 上板后由加载器硬校验**（不靠人眼）：
 `tmp-test/jtag/run_kernel_uart.tcl` 在 `ps7_init` 之后会数 MIO16-53 里
 `[11:9] != 1`（即不是 LVCMOS18）的引脚，只要有一个就 **exit 1** 并列出具体引脚：
 
@@ -203,27 +235,23 @@ FAIL:有 38 个 MIO16-53 不是 LVCMOS18(bank 1 应为 1.8V):
   MIO bank 1 的电压设成 1.8V。
 ```
 
-在这块板上，配对了的读数是 `MIO_PIN_48 = 0x000012E0`、`MIO_PIN_49 = 0x000012E1`
-（`UART1 MR` 非 0、心跳槽 `uartok = 1`）。
+**换完之后，用这三样确认换对了**（`python tmp-test/verify_board.py --load --seconds 75`）：
 
-> ⚠ **别把 `0x16E0/0x16E1` 当成"期望值"。** `0x16E0/0x16E1` 正是**旧的、
-> bank1 声明成 3.3V 的 XSA** 产生的值（`[11:9] = 3`）；现在能用的值是
-> **`0x12E0/0x12E1`**（`[11:9] = 1`），两者只差这一位。
-> 加载器脚本以前把那对**错值**印成"(期望 ...)"，已改正 ——
-> 但真正该信的是 `uartok` 与 MIO bank1 硬校验，不是任何"期望"注释。
+| 看什么 | 正确的值 |
+|---|---|
+| `MIO_PIN_48` / `MIO_PIN_49` | `0x000012E0` / `0x000012E1` |
+| `UART1 MR` | 非 0（说明外设活了） |
+| 心跳槽 `uartok` | `1` |
 
-### 2.6 换成自己导出的 `ps7_init`
+任一条不对，**先别怀疑内核**，回去查 XSA（就是 ①②③）。
 
-1. 从你的 XSA 里取出 `ps7_init.tcl`；
-2. 放进 `tmp-test/zynq/`（**文件名里带上 `uart1`**，方便一眼看出它路由了 UART1）；
-3. 改 `config.py` 的 `PS7_INIT` 指向它；
-4. `python config.py` 刷新 `tmp-test/jtag/paths.tcl`；
-5. 上板 `python tmp-test/verify_board.py --load --seconds 75` —— 用三件事确认换对了：
-   `MIO_PIN_48/49` 是 `0x12E0/0x12E1`、`UART1 MR != 0`、`uartok = 1`。
-   任一条不对就先别看内核，回去查 XSA（这就是 §2.5 那三步的用处）。
+> ⚠ **别把 `0x16E0/0x16E1` 当成"期望值"。** 那正是**旧的、bank1 声明成 3.3V 的 XSA**
+> 产生的值（`[11:9] = 3`）；能用的值是 **`0x12E0/0x12E1`**（`[11:9] = 1`），
+> 两者只差这一位。加载器脚本以前把这对**错值**印成"(期望 ...)"，已改正 ——
+> 但真正该信的永远是 `uartok` 与那条 MIO bank1 硬校验，不是任何"期望"注释。
 
-> 如果新 XSA 只是换了 PS 配置、PL 设计没变，**`BITSTREAM` 不用动**；
-> 反之如果只是重做了 PL，`PS7_INIT` 也不用动。这正是 §2.1 那个"交叉组合"的好处。
+> 最后：**`BITSTREAM` 与 `PS7_INIT` 是各自独立的**。只换 PS 配置 ⇒ 不用动 `BITSTREAM`；
+> 只重做 PL ⇒ 不用动 `PS7_INIT`。
 
 ---
 
@@ -236,7 +264,7 @@ FAIL:有 38 个 MIO16-53 不是 LVCMOS18(bank 1 应为 1.8V):
 | `VITIS_DIR` | Vitis / Vivado 安装目录 | 安装时选的路径 | `C:\AMDDesignTools\2025.2`（AMD 统一安装器）<br>`C:\Xilinx\Vitis\2025.2`（Xilinx 安装器） |
 | `SERIAL_PORT` | 板子 PS UART1 接到 PC 的哪个串口 | Windows 设备管理器 → 端口 | `"COM4"`、`"COM7"`（Linux 上是 `/dev/ttyUSB0`） |
 | `SERIAL_BAUD` | 波特率 | 固定是 9600 8N1 | `9600`（一般不用改） |
-| `BITSTREAM` | PL 比特流（**必须是带 PL 设计那个工程**的，见 §2.1） | Vitis/Vivado 工程导出的目录 | `<你的平台>\hw\sdt\System_wrapper.bit` |
+| `BITSTREAM` | PL 比特流（**必须是带 PL 设计那个工程**的，见 §2.2） | Vitis/Vivado 工程导出的目录 | `<你的平台>\hw\sdt\System_wrapper.bit` |
 | `SCHEMATIC_PDF` | 原理图 PDF（可选） | 只有 `tmp-test/sch_render.py` 用 | 留空 `""` 表示不用 |
 
 `VITIS_DIR` 会被派生出这些，**不用手写**：
@@ -362,15 +390,19 @@ python config.py          # 生成/刷新 tmp-test/jtag/paths.tcl
 
 | Tcl | 用途 | 用的 ps7_init |
 |---|---|---|
-| `run_kernel_uart.tcl` | 串口流程（内核自检/命令通道） | **仓库里那份**，已启用 UART1 |
-| `run_kernel.tcl` | 只关心心跳、不用串口 | 平台自带那份 |
-| `run_led.tcl` | 加载 `tmp-test/led/out/led.elf`（PL LED 演示） | 平台自带那份 |
+| `run_kernel_uart.tcl` | 串口流程（内核自检/命令通道） | **仓库里那份** `ps7_init_uart1.tcl`（已启用 UART1） |
+| `run_kernel.tcl` | 只关心心跳、不用串口 | `AXI_GPIO_1` 那份（**不路由 UART1**） |
+| `run_led.tcl` | 加载 `tmp-test/led/out/led.elf`（PL LED 演示） | 同上 |
 
-> ★ **串口流程必须用仓库里那份 `ps7_init_uart1.tcl`。** 平台自带的 `ps7_init.tcl`
-> **不把 MIO48/49 配成 UART1**。误用它时的现象极具误导性：内核**照常启动**
-> （心跳、MMU、LED 自检全对），但串口**一个字节都没有** —— 看起来就像"内核没跑起来"。
-> `config.py` 里的 `PS7_INIT` 已经指向正确的那一份；`run_kernel_uart.tcl` 加载前
-> 还会检查文件身份，不对就 `FAIL` 退出。
+> ★ **串口流程必须用仓库里那份 `ps7_init_uart1.tcl`。** `AXI_GPIO_1` 旁边那份
+> `ps7_init.tcl` **不把 MIO48/49 配成 UART1**。误用它时的现象极具误导性：内核
+> **照常启动**（心跳、MMU、LED 自检全对），但串口**一个字节都没有** ——
+> 看起来就像"内核没跑起来"。`config.py` 里的 `PS7_INIT` 已经指向正确的那一份。
+>
+> ⚠ **注意：脚本目前**没有**"这份 ps7_init 是不是 UART1 版"的自检。**
+> 它加载前只做一件事：`source` 那份文件、`ps7_init`、然后**硬校验 MIO bank1**
+> （见 §2.6 第 ③ 条）。**串口对不对由 `uartok` 说了算** —— 拿错了不会当场报错，
+> 只会静默。这条是已知的粗糙处，别指望脚本拦住你。
 
 ---
 
@@ -420,9 +452,9 @@ import config                     # noqa: E402
 |---|---|
 | `python config.py` 报 `jtag.xsdb 不存在` | `VITIS_DIR` 不对（注意有的安装是 `C:\Xilinx\Vitis\2025.2`） |
 | 构建报 `ARM toolchain not found` | 同上；或想用别的工具链就设 `ARM_CC` |
-| 上板后**串口一个字节都没有**，但 JTAG 读到心跳正常 | ① `ps7_init` 用错（那份不路由 UART1，见 §2.1/§2.4）—— 检查 `paths.tcl` 里的 `PS7`；② 串口号不对（`config.py` 的 `SERIAL_PORT`） |
-| 加载器报 `FAIL:有 N 个 MIO16-53 不是 LVCMOS18` | **XSA 把 MIO bank1 声明成 3.3V 了**（§2.2 那条）—— 重新导出 XSA 并设成 1.8V；**这不是内核问题** |
-| 上板后 LED 流水灯不亮，但串口/自检都正常 | 比特流拿错了（用了**没有 PL IP** 那个工程的 `.bit`，见 §2.1） |
+| 上板后**串口一个字节都没有**，但 JTAG 读到心跳正常 | ① `ps7_init` 用错（那份不路由 UART1，见 §2.2/§2.5）—— 检查 `paths.tcl` 里的 `PS7`；② 串口号不对（`config.py` 的 `SERIAL_PORT`） |
+| 加载器报 `FAIL:有 N 个 MIO16-53 不是 LVCMOS18` | **XSA 把 MIO bank1 声明成 3.3V 了**（§2.3 那条）—— 重新导出 XSA 并设成 1.8V；**这不是内核问题** |
+| 上板后 LED 流水灯不亮，但串口/自检都正常 | 比特流拿错了（用了**没有 PL IP** 那个工程的 `.bit`，见 §2.2） |
 | `MIO_PIN_48/49` 读到 `0x16E0/0x16E1` 而不是 `0x12E0/0x12E1` | 同上：`[11:9]` = 3 而不是 1，即 bank1 被声明成 3.3V |
 | `验证失败: 串口输出里找不到 '=== SELF-TEST BEGIN ==='` 且日志断在半行 | `--seconds` 太短，用 75 |
 | `FAIL: cannot find .../paths.tcl` | 还没跑过 `python config.py` |
@@ -445,8 +477,11 @@ import config                     # noqa: E402
   但只有一台机器的证据；
 * 宿主单元测试基线是 **9 failed / 74 passed**，那 9 项预先存在、与本移植无关
   （busybox 合规 / 许可清单 / DMA 计划 / QEMU 固件），已在基点 `08e5c9c` 上复现过。
-* **§2（XSA / 比特流 / `ps7_init`）是「对照检查表」，不是「从零建工程教程」**：
-  里面每条事实都来自**实测**（解包 `opjtmp.xsa` 与 `AXI_GPIO_1/System_wrapper.xsa` 读 `.hwh`、
-  逐字节比对三份 `ps7_init.tcl`、板上读回 `MIO_PIN_48/49`），
-  但我**没有从零走过一遍 Vivado GUI**，也没有在第二块板/第二个工程上验证过这份检查表。
-  §2.5 那两段 Python 片段在本机对这两个 XSA 跑过；换 XSA 后请自己再跑一遍。
+* **§2 的适用范围是「同一套设计、你自己的板」** —— 它讲的是「导出 → 解包 → 放路径 →
+  改 `config.py`」，**不是**「怎么在 Vivado 里搭 BD」的教程；§2.3/§2.4 是**验收要求**。
+  设计本身要改（换 IP / 改地址）会连带改 `arch/arm32/board/xparameters.h` 与设备表，
+  **超出这份指南**。
+* §2 里每条事实都来自**实测**（解包 `opjtmp.xsa` 与 `AXI_GPIO_1/System_wrapper.xsa` 读 `.hwh`、
+  逐字节比对三份 `ps7_init.tcl`、板上读回 `MIO_PIN_48/49`），但我**没有从零走过一遍
+  Vivado GUI**，也没在第二块板 / 第二个工程上验证过。§2.6 那两段 Python 在本机对这两个
+  XSA 跑过；换 XSA 后请自己再跑一遍。
