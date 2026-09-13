@@ -10,6 +10,10 @@
 拾取顺序、睡醒补偿、队列不变量这些只有在这里才判得动。
 (这条分工是 M4-8 开工前拍板时定下来的,见计划 §4.5。)
 
+★ 第 13 节(M4-8.5 无饥饿)是这条分工的**第二个实例**,而且分工在这里
+格外清楚:板上那半证的是"K=4 时时间片到点真的换人",这里证的是
+"**任何** K 与任何片长下都不会漏掉" —— 那只能穷尽扫。
+
 顺带钉住一条**源 OS 的既有事实**:`vruntime_delta()` 是
 `(ns * 1024) / 1024` —— 乘除同一个常数,恒等于原值。TCB 里也没有权重字段。
 也就是源 OS 的调度器**没有权重**,它的 "EEVDF" 实际是
@@ -69,6 +73,118 @@ static tcb_t mk(struct arm_thread_control_block *t, u32 level, u64 vruntime, u64
     t->eevdf_deadline = deadline;
     t->eevdf_slice    = slice;
     return t;
+}
+
+/* ------------------------------------------------------------------ */
+/* ★ M4-8.5:无饥饿判据的模拟器 ★                                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * ## 判据是一句话
+ *
+ *     一个**可运行**的线程,永远不会被无限期地漏掉。
+ *
+ * 这里把它落成一个**可测量的二值量**:
+ *
+ *     把时间切成 N = 64 tick 的窗口;每个窗口里,每个可运行线程的
+ *     **自己的计数器**都必须至少涨过一次。整段观测里一次都不许违反。
+ *
+ * ⚠ 它**不是**公平性/比率判据 —— 计划里明写"任何策略在等权 + 纯占用
+ *   负载下都会通过",所以"公平份额 ≈ 理论值"与"EEVDF 与 round-robin 有别"
+ *   两条**列为不验**。窗口判据有区分能力,而份额判据没有。
+ *
+ * ⚠ N 取 64 的算法:`SCHED_TIME_SLICE = 4`,K 个等权纯占用线程每个约每
+ *   `4K` tick 轮到一次;K=4 时是 16,取 **4 倍余量**。
+ *   写成"刚好够"不会更严,只会**更脆**(负载抖一下就误报)。
+ *
+ * ## 模拟的是什么(以及故意不模拟什么)
+ *
+ * `sched_tick` 的骨架:每个 tick 给 current 计数并计费;时间片到点就调
+ * `sched_select_next`;换人就把片计数清零。时间以参数传给策略层。
+ *
+ * ⚠ **故意不模拟队列的进出**:源 OS 的队列是"全部线程的名册",
+ *   current 与睡眠者都留在里面(见 sched.h)。在宿主上多模拟一份队列维护,
+ *   等于验一个板上不存在的模型。
+ */
+#define SIM_K_MAX        8u
+#define SIM_WINDOW_TICKS 64u  /* ★ 与板上同一个 N ★ */
+#define SIM_WINDOWS      16u  /* 结算多少个完整窗口 */
+
+typedef struct
+{
+    u32 ticks_run; /* ★ 线程**自己的**计数器(与板上那个 count 同义)*/
+    u32 miss;      /* 有多少个窗口里它一次都没推进(>0 就是被饿着了)*/
+} sim_stat_t;
+
+static struct arm_thread_control_block sim_tcb[SIM_K_MAX];
+
+/*
+ * 跑一段模拟,返回**结算过的完整窗口数**。
+ * `k` 个线程全部是"永不睡眠的纯占用"(status 恒为 RUNNING)。
+ */
+static u32 sim_run(u32 k, u64 slice_ns, sim_stat_t *st)
+{
+    sched_queue_t q;
+    tcb_t         cur = NULL;
+    u32           ck[SIM_K_MAX];
+    u32           slice_used = 0u;
+    u32           windows    = 0u;
+    u32           total      = (SIM_WINDOWS + 1u) * SIM_WINDOW_TICKS;
+    u64           now        = 0u;
+    u32           tick;
+    u32           i;
+
+    for (i = 0u; i < k; i++) {
+        memset(&sim_tcb[i], 0, sizeof(sim_tcb[i]));
+        sim_tcb[i].task_level = TASK_KERNEL_LEVEL;
+        sim_tcb[i].status     = RUNNING;
+        sched_entity_init(&sim_tcb[i], 0u);
+        sim_tcb[i].eevdf_slice = slice_ns;
+        st[i].ticks_run        = 0u;
+        st[i].miss             = 0u;
+        ck[i]                  = 0u;
+    }
+
+    sched_queue_init(&q);
+    for (i = 0u; i < k; i++) {
+        CHECK(sched_queue_append(&q, &sim_tcb[i]));
+    }
+
+    for (tick = 0u; tick < total; tick++) {
+        now += SCHED_TICK_NS;
+
+        /* ---- 窗口边界:先结算**上一个**窗口,再往下走 ---- */
+        if ((tick != 0u) && ((tick % SIM_WINDOW_TICKS) == 0u)) {
+            windows++;
+            for (i = 0u; i < k; i++) {
+                if (st[i].ticks_run == ck[i]) {
+                    st[i].miss++; /* ★ 整整一个窗口一次都没推进 ★ */
+                }
+                ck[i] = st[i].ticks_run;
+            }
+        }
+
+        if (cur != NULL) {
+            st[(u32)(cur - &sim_tcb[0])].ticks_run++; /* 它真的跑了一个 tick */
+            slice_used++;
+            sched_account_run(cur, SCHED_TICK_NS);
+            if (slice_used < SCHED_TIME_SLICE) {
+                continue; /* 时间片没到:tick 什么都不做 */
+            }
+        }
+
+        {
+            tcb_t nxt = sched_select_next(&q, cur, now);
+
+            if (nxt == NULL) {
+                break;
+            }
+            cur        = nxt;
+            slice_used = 0u;
+        }
+    }
+
+    return windows;
 }
 
 int main(void)
@@ -708,6 +824,153 @@ int main(void)
             CHECK(t.ctx.sp != sp32);
         }
     }
+
+    /* ================================================================ */
+    /* 13. ★ M4-8.5:无饥饿判据(策略层,穷尽)★                        */
+    /* ================================================================ */
+
+    /*
+     * 判据、N 的取法、以及"为什么只能在宿主上穷尽"都写在模拟器那段注释里。
+     * 这里只加三件板上做不到的事:
+     *
+     *   13a. **穷尽扫 K**:2..8 个等权纯占用线程,每一种都必须零违反。
+     *        板上只有一组 K,所以"K 变大也不会漏"这件事板上证不了。
+     *   13b. **对照组**:`g_pick_sticky` 把 current 粘住 ⇒ 其余线程必然饿死
+     *        ⇒ **同一个检出器必须报警**。没有这一条,"零违反"只说明
+     *        检查没报错,不说明它有区分能力。
+     *   13c. **粘住不适用于 idle**(见 src/sched.c 里那两处偏离说明):
+     *        否则对照组一开始就把启动流程自己粘住,一个线程都起不来。
+     */
+    {
+        sim_stat_t st[SIM_K_MAX];
+        u32        k;
+
+        /* ---- 13a. 穷尽 K:每个窗口里每个线程都必须推进过 ---- */
+        for (k = 2u; k <= SIM_K_MAX; k++) {
+            u32 windows = sim_run(k, SCHED_BASE_SLICE_NS, st);
+            u32 misses  = 0u;
+            u32 picks_min = 0xFFFFFFFFu;
+            u32 i;
+
+            /* 非空转:窗口真的结算过,而且不止一个 */
+            CHECK(windows >= SIM_WINDOWS / 2u);
+
+            for (i = 0u; i < k; i++) {
+                misses += st[i].miss;
+                if (st[i].ticks_run < picks_min) {
+                    picks_min = st[i].ticks_run;
+                }
+                /* 每个线程都真的跑到了东西(否则"零违反"是空转出来的)*/
+                CHECK(st[i].ticks_run > 0u);
+            }
+
+            /* ★ 判据本身:零违反 ★ */
+            CHECK(misses == 0u);
+            printf("no-starvation: K=%u windows=%u misses=%u min_ticks=%u\n", k, windows, misses,
+                   picks_min);
+        }
+
+        /* 片长取下限时同样不许漏(片长是策略的输入,不是常量)*/
+        for (k = 2u; k <= 4u; k++) {
+            u32 windows = sim_run(k, SCHED_MIN_SLICE_NS, st);
+            u32 misses  = 0u;
+            u32 i;
+
+            CHECK(windows >= SIM_WINDOWS / 2u);
+            for (i = 0u; i < k; i++) {
+                misses += st[i].miss;
+            }
+            CHECK(misses == 0u);
+        }
+
+        /* ---- 13b. ★ 破坏性 A/B:粘住 current ⇒ 必然饿死 ★ ---- */
+        /*
+         * `g_pick_sticky` 取一个大数,等于"整段模拟期间都不许换人"。
+         * 预期结果:只有一个线程在跑,其余**一个窗口都没轮到**。
+         * 这与板上那一相是同一件事,只是一个在策略层、一个在机制层。
+         */
+        g_pick_sticky = 0xFFFFFFFFu;
+        {
+            u32 windows = sim_run(4u, SCHED_BASE_SLICE_NS, st);
+            u32 starved = 0u;
+            u32 runners = 0u;
+            u32 i;
+
+            for (i = 0u; i < 4u; i++) {
+                if (st[i].ticks_run == 0u) {
+                    starved++;
+                } else {
+                    runners++;
+                }
+            }
+
+            /* ★ 粘住确实只让一个线程在跑 ★ */
+            CHECK(runners == 1u);
+            CHECK(starved == 3u);
+            /* ★ 而且**同一个检出器**会响:3 个线程每个窗口都算一次违反 ★ */
+            CHECK(st[1].miss == windows);
+            CHECK(st[2].miss == windows);
+            CHECK(st[3].miss == windows);
+            CHECK(windows >= SIM_WINDOWS / 2u);
+            printf("no-starvation: sticky -> runners=%u starved=%u misses=(%u,%u,%u) windows=%u\n",
+                   runners, starved, st[1].miss, st[2].miss, st[3].miss, windows);
+        }
+        g_pick_sticky = 0u;
+
+        /* ---- 13c. 粘住是**计数**:粘够次数就恢复 ---- */
+        {
+            sched_queue_init(&q);
+            mk(&ta, TASK_KERNEL_LEVEL, 0u, 0u, SCHED_BASE_SLICE_NS);
+            mk(&tb, TASK_KERNEL_LEVEL, 0u, 0u, SCHED_BASE_SLICE_NS);
+            sched_queue_append(&q, &ta);
+            sched_queue_append(&q, &tb);
+
+            /* (1) 真实线程被粘住,而且每粘一次消耗一次 */
+            g_pick_sticky = 2u;
+            CHECK(sched_select_next(&q, &ta, 0u) == &ta);
+            CHECK(g_pick_sticky == 1u);
+            CHECK(sched_select_next(&q, &ta, 0u) == &ta);
+            CHECK(g_pick_sticky == 0u);
+            /*
+             * (2) 次数用完之后**必须恢复选取** —— 否则对照组没人能收尾,
+             *     那不是"判据不承重",是**测不了**(系统就地挂死)。
+             */
+            CHECK(sched_select_next(&q, &ta, 0u) == &tb);
+
+            /* ---- 13d. 粘住**不适用于 idle** ---- */
+            /*
+             * idle 的 status 是 RUNNING,`sched_current_runnable` 对它返回真
+             * (那处不对称是源 OS 的原样)。若照字面粘住它,启动流程会把自己
+             * 粘住 —— 对照组一个线程都起不来,什么也观察不到。
+             * 而源 OS 在 current 是 idle 时**本来就会切走**,所以排除 idle
+             * 才是 M4-8 的忠实等价物。
+             */
+            {
+                tcb_t il;
+
+                mk(&tb, TASK_KERNEL_LEVEL, 0u, 0u, SCHED_BASE_SLICE_NS);
+                il = mk(&tc, TASK_IDLE_LEVEL, 0u, 0u, SCHED_BASE_SLICE_NS);
+                sched_queue_init(&q);
+                sched_queue_append(&q, il);
+                sched_queue_append(&q, &tb);
+
+                g_pick_sticky = 5u;
+                CHECK(sched_select_next(&q, il, 0u) == &tb); /* idle 不被粘住 */
+                CHECK(g_pick_sticky == 5u);                  /* 也没被消耗 */
+                CHECK(sched_select_next(&q, &tb, 0u) == &tb); /* 真实线程被粘住 */
+                CHECK(g_pick_sticky == 4u);
+            }
+        }
+        g_pick_sticky = 0u;
+        g_wake_skip   = 0u;
+    }
+
+    /*
+     * 生产路径的默认值:三个破坏性开关在报告之外必须都是 0。
+     * 这一条防的是"某一段用例忘了复位"—— 那会让后面的判据静默失真。
+     */
+    CHECK(g_wake_skip == 0u);
+    CHECK(g_pick_sticky == 0u);
 
     if (failures != 0) {
         printf("%d check(s) failed\n", failures);

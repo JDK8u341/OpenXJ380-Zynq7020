@@ -686,6 +686,409 @@ static void load_probe(void *arg)
     (void)arg;
 }
 
+/* ------------------------------------------------------------------ */
+/* ★ M4-8.5:无饥饿判据 —— K 个绝不睡眠的线程 + 一个睡眠式监视器 ★      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * ## 判据(与宿主那一半**同一个 N**)
+ *
+ *     一个**可运行**的线程,永远不会被无限期地漏掉。
+ *
+ * 落成可测的形式:把时间切成 N tick 的窗口,**每个窗口里,每个"被监视且
+ * 仍然可运行"的线程,它自己的计数器都必须至少涨过一次**。
+ *
+ * ⚠ 它**不是**公平性/比率判据:计划里明写"任何策略在等权 + 纯占用负载下
+ *   都会通过",所以份额类判据**没有区分能力**,这一条有(见下面的对照组)。
+ *
+ * ## 四件定死的事(计划 §0.5.7)
+ *
+ *   1. **N = 64 tick** —— 由 `SCHED_TIME_SLICE = 4` 推:K 个等权纯占用线程
+ *      每个约每 `4K` tick 轮到一次;K=4 ⇒ 16,取 **4 倍余量**。
+ *      ⚠ 写成"刚好够"不会更严,只会**更脆**(负载抖一下就误报)。
+ *   2. **只盯"从不睡、从不挂起"的线程** —— 只有它们"应当一直在推进"。
+ *      实现上落成:kmain 造线程时**显式登记**给监视器,监视器只认名单;
+ *      而且每次结算都要复查 `status` 与 `task_level`(见下)。
+ *   3. **监视器自己用 `sched_sleep_ns` 睡**(正是 M4-8.4 建好的机制)。
+ *      它睡眠时不参与竞争,于是不会挤占被观察者的 CPU。
+ *   4. **"推进过"取线程自己的计数器**,不是"被选中过" ——
+ *      后者漏掉"选中了但没干活就被换下"这个方向。
+ *
+ * ## 监视器必须能区分三种"没推进"
+ *
+ *   | 情况 | 处置 |
+ *   |---|---|
+ *   | 那个线程**本来就不该跑**(WAIT / 挂起 / idle)| 跳过,而且**重新起算** checkpoint |
+ *   | 有人**故意关了调度**(`console_excl` 打自检报告要好几秒,整个系统停摆)| 这个窗口**作废**,单独计数 |
+ *   | 其余 | ★ **饥饿**:计数 + 打一行报警 ★ |
+ *
+ * ⚠ 最后那一条正是它存在的理由。M4-8.4 那一步里连续踩了两个**同一类**的错
+ *   ("A/B 清理里调 `sched_kern_init()` 清空队列" / "对还在队列里的节点写
+ *   `sched_next = NULL`"),两者都是"**一个永久可运行的线程静默消失**",
+ *   定位代价是一次 JTAG 会话。常驻监视器会把它们变成**一行输出**。
+ */
+#define STARVE_K            4u
+#define STARVE_WINDOW_TICKS 64u /* ★ 与宿主同一个 N ★ */
+#define STARVE_WINDOW_NS    (STARVE_WINDOW_TICKS * SCHED_TICK_NS)
+/* 窗口长度超过 4N ⇒ 连**监视器自己**都没被调度到:那是饥饿的另一种样子 */
+#define STARVE_LATE_TICKS   (STARVE_WINDOW_TICKS * 4u)
+/* 关调度超过这个时长,就认为这个窗口被人为打断了(作废,不算饥饿)*/
+#define STARVE_FREEZE_NS 1000000ull /* 1 ms */
+/* 报警最多打几行 —— 对照组会故意触发,不能刷屏 */
+#define STARVE_ALARM_MAX 3u
+
+/* 相 5 的观测时长与负载时长。负载**必须**活得比观测期长,否则最后一个
+ * 窗口里它会挂起,`watched` 就不足 K,判据自己先失真。 */
+#define STARVE_PHASE_MS  1200u
+#define STARVE_BUDGET_US (1600u * 1000u)
+
+/* 判据非空转的下限:1200ms / 64ms ≈ 18 个窗口,减去被排他输出作废的那几个 */
+#define STARVE_MIN_FULL 8u
+
+/* 对照组的时长与粘住次数。粘住 n 次 ≈ 每个时间片粘一次 ≈ 4n tick */
+#define STARVE_CTL_MS     2400u
+#define STARVE_CTL_BUDGET (600u * 1000u)   /* 受害者:粘住期间就到期 */
+#define STARVE_CTL_HOG    (2000u * 1000u)  /* 粘住的那一个:必须活过整段粘住 */
+#define STARVE_STICKY_N   300u
+
+/* 一个"绝不睡眠"的负载线程。★ 计数器是**它自己的** ★ */
+typedef struct
+{
+    volatile u32 count;     /* ← 判据取的就是这个量 */
+    volatile u32 done;
+    volatile u32 exit_ms;   /* 它退出时"离本相开始多久"(毫秒)—— 相的长度要和它对账 */
+    u32          budget_us; /* 跑多久墙钟(不是固定迭代数 —— 估小了会挂住系统)*/
+} starve_probe_t;
+
+static starve_probe_t g_starve[STARVE_K];
+
+/*
+ * ★ 这一相是从**哪一刻**开始算的墙钟 ★
+ *
+ * ⚠ 这不是小事,它是被对照组逼出来的:如果每个负载线程按"**我被选中的那一刻**"
+ *   起算墙钟(M4-9 的探针就是这么写的),那么**被饿着的线程在饿完之后才开始
+ *   计预算** —— 它会接着跑满自己那一份,于是"谁被饿过"在读数上**看不出来**。
+ *
+ *   本判据要的恰恰是反过来:被饿着的线程应当在饿完之后**立刻到期**,
+ *   让"它一次都没推进过"这件事留在计数上。所以墙钟从**本相开始**算。
+ */
+static u64 g_starve_t0_us;
+
+/* 监视器的一个被观察对象 */
+typedef struct
+{
+    tcb_t               task;       /* NULL = 这一格空着 */
+    volatile const u32 *counter;    /* ★ 线程自己的计数器 ★ */
+    u32                 checkpoint; /* 上一个窗口结算时的值 */
+} starve_watch_t;
+
+static starve_watch_t g_starve_watch[STARVE_K];
+
+/* 监视器发布的量(全部单调递增,判据一律取**前后差值** —— 慢串口的教训)*/
+static volatile u32 g_starve_checks;  /* 结算过的窗口数(含"被观察者不足 K"的)*/
+static volatile u32 g_starve_full;    /* 其中 K 个**都还处于可运行状态**的窗口数 */
+static volatile u32 g_starve_events;  /* ★ "可运行却没推进"的 (线程,窗口) 对数 ★ */
+static volatile u32 g_starve_late;    /* ★ 窗口长度超过 4N 的次数 ★ */
+static volatile u32 g_starve_skipped; /* 因"量不准"而作废的窗口数(见下)*/
+static volatile u32 g_starve_win_max; /* 见过的最长窗口(tick)*/
+static volatile u32 g_starve_ticks;   /* 结算过的窗口长度之和(tick)—— 覆盖率审计 */
+static volatile u32 g_starve_alarms;  /* 已经打过的报警行数 */
+
+/* 相 5 的结论(供自检报告使用)*/
+static u32 g_starve_ok;
+static u32 g_starve_full_at;
+static u32 g_starve_events_at;
+static u32 g_starve_late_at;
+static u32 g_starve_skip_at;
+static u32 g_starve_win_max_at;
+static u32 g_starve_ticks_at;
+static u32 g_starve_ms_at;     /* 相的**墙钟**时长(毫秒),与上面那个 tick 数对账 */
+static u32 g_starve_adv_at;    /* 相 5 里真的推进过的负载线程数(应当 == K)*/
+static u32 g_starve_ctl_adv;   /* 对照组里推进过的个数(应当很小)*/
+static u32 g_starve_ctl_detect;/* 对照组里监视器报没报警 */
+
+static void starve_reset(u32 budget_us)
+{
+    u32 i;
+
+    g_starve_t0_us = timer_read_us();
+
+    for (i = 0u; i < STARVE_K; i++) {
+        g_starve[i].count   = 0u;
+        g_starve[i].done    = 0u;
+        g_starve[i].exit_ms = 0u;
+        g_starve[i].budget_us = budget_us;
+    }
+}
+
+/*
+ * 把监视器的**观察名单**设成这几个线程,并把统计量清零。
+ *
+ * ⚠ 必须与"造这些线程"在**同一个关调度的窗口**里:监视器是另一个上下文,
+ *   名单改到一半被它读到的话,它会拿着旧 checkpoint 去比新线程 ——
+ *   那种错是静默的。
+ *
+ * ⚠ 名单是**显式登记**的,监视器不猜。理由:能"一直在推进"的线程是造它的
+ *   那个人才知道的性质(见上面第 2 条)。
+ */
+static void starve_arm(tcb_t *tasks, u32 n)
+{
+    u32 i;
+
+    for (i = 0u; i < STARVE_K; i++) {
+        if (i < n && tasks != NULL && tasks[i] != NULL) {
+            g_starve_watch[i].task       = tasks[i];
+            g_starve_watch[i].counter    = &g_starve[i].count;
+            g_starve_watch[i].checkpoint = 0u;
+        } else {
+            g_starve_watch[i].task    = NULL;
+            g_starve_watch[i].counter = NULL;
+        }
+    }
+
+    g_starve_checks  = 0u;
+    g_starve_full    = 0u;
+    g_starve_events  = 0u;
+    g_starve_late    = 0u;
+    g_starve_skipped = 0u;
+    g_starve_win_max = 0u;
+    g_starve_ticks   = 0u;
+    g_starve_alarms  = 0u;
+}
+
+/*
+ * 纯占用负载:跑满一段**墙钟**就结束。
+ *
+ * ⚠ 与 M4-9 的探针同一个理由:用墙钟而不是固定迭代次数 ——
+ *   迭代次数依赖编译结果与 CPU 频率,估小了线程就永远跑不完,
+ *   于是启动流程再也回不来,那是"自检把系统挂住"的失败模式。
+ *
+ * ⚠ 起算点是 `g_starve_t0_us`(**本相开始的那一刻**),不是"我被选中的那一刻" ——
+ *   理由见那个变量的说明:否则被饿着的线程会在饿完之后才开始计预算。
+ *
+ * 循环体只有一件事:推进**自己的**计数器。判据要的正是它。
+ */
+static void starve_probe(void *arg)
+{
+    starve_probe_t *p  = (starve_probe_t *)arg;
+    u64             t0 = g_starve_t0_us;
+
+    while ((timer_read_us() - t0) < (u64)p->budget_us) {
+        p->count++;
+    }
+
+    p->exit_ms = (u32)((timer_read_us() - t0) / 1000u);
+    p->done    = 1u;
+    thread_finish();
+}
+
+static void starve_w0(void *arg)
+{
+    starve_probe((void *)&g_starve[0]);
+    (void)arg;
+}
+
+static void starve_w1(void *arg)
+{
+    starve_probe((void *)&g_starve[1]);
+    (void)arg;
+}
+
+static void starve_w2(void *arg)
+{
+    starve_probe((void *)&g_starve[2]);
+    (void)arg;
+}
+
+static void starve_w3(void *arg)
+{
+    starve_probe((void *)&g_starve[3]);
+    (void)arg;
+}
+
+/*
+ * ★ 常驻饥饿监视器 ★
+ *
+ * 形状与源 OS 的周期任务一样(`ipc.cpp:37,46` / `sys.cpp:618`:
+ * `do { scheduler_sleep_ns(1ms); …干活…; } while (…)`):
+ * **睡一个窗口 → 结算 → 再睡**。
+ *
+ * ⚠ 正常路径上它**一个字都不打印**:9600 波特下一行要 60~80ms,一个每秒
+ *   都说话的监视器会把串口占满,而且会污染自检报告区间
+ *   (`verify_board.py` 对区间内的非 CHECK 行是**拒绝**的)。
+ *   只有真的判定为饥饿时才打一行,而且限量。
+ *
+ * ⚠ 窗口长度用 **tick 计数**(`g_tick_seen`)量,不用墙钟:
+ *   这条判据本身就是以 tick 定义的。
+ */
+static void starve_monitor(void *arg)
+{
+    u32 i;
+
+    (void)arg;
+
+    for (;;) {
+        u32 win0 = g_tick_seen;
+        u64 off0 = sched_off_total_ns();
+
+        sched_sleep_ns(STARVE_WINDOW_NS);
+
+        {
+            u32 win    = g_tick_seen - win0;
+            u64 frozen = sched_off_total_ns() - off0;
+            u32 watched = 0u;
+            u32 missed  = 0u;
+
+            /*
+             * ★★★ 判据用的是"扣掉人为停摆之后**还剩下多少可执行时间**" ★★★
+             *
+             * 排他输出(`console_excl_begin/end`)是**关调度**实现的:自检报告那
+             * 几秒钟里整个系统停摆,所有线程都醒不过来 —— 那不是饥饿。
+             *
+             * ⚠ 但**不能因此把整个窗口一扔了事**(第一版就是这么写的,上板立刻
+             *   打回来):**饥饿本身也会让窗口变得很长**,而且两者会叠加在
+             *   同一个窗口里 —— 扔掉就等于**漏报**,而那正是这条判据唯一
+             *   存在的理由。上板实测:A/B 里监视器被粘住 1.2 秒的那个窗口
+             *   因为"里面有 100ms 是关调度的"被整段作废,于是
+             *   `events=0 late=0` —— 报"未检出",而线程确实被饿死了。
+             *
+             * 扣掉之后:
+             *   自检报告窗口:窗口 5s、停摆 5s   -> 可执行 ≈ 0    -> 不算数(单列计数)
+             *   粘住对照组  :窗口 1.2s、停摆 0.1s -> 可执行 ≈ 1.1s -> ★ 报警 ★
+             *
+             * `usable` 以 tick 计,而 tick 与毫秒在这块板上是 1:1(私有定时器
+             * 1kHz,已用状态行的 `ticks`/`lag` 对过账)。
+             */
+            u32  frozen_ms = (u32)(frozen / 1000000ull);
+            u32  usable    = (win > frozen_ms) ? (win - frozen_ms) : 0u;
+            bool judge     = (usable >= STARVE_WINDOW_TICKS);
+
+            g_starve_checks++;
+            g_starve_ticks += win;
+            if (!judge) {
+                /*
+                 * 这个窗口里"可执行时间"不足一个完整窗口 —— 量不出东西来。
+                 * **单独计数**:"一个窗口都没作废"与"一半窗口都作废了"
+                 * 是两种完全不同的可信度,读数的人有权知道是哪种。
+                 */
+                g_starve_skipped++;
+            }
+            if (win > g_starve_win_max) {
+                g_starve_win_max = win;
+            }
+            if (usable > STARVE_LATE_TICKS) {
+                g_starve_late++;
+            }
+
+            for (i = 0u; i < STARVE_K; i++) {
+                starve_watch_t *w = &g_starve_watch[i];
+                tcb_t           t = w->task;
+
+                if (t == NULL || w->counter == NULL) {
+                    continue;
+                }
+
+                if ((t->task_level == TASK_IDLE_LEVEL) || !sched_status_runnable(t->status)) {
+                    /*
+                     * 它**本来就不该在这段时间里推进**(睡着的 / 挂起的 / idle)。
+                     * 跳过,并且**重新起算** —— 否则"它在我们等它的时候睡着了"
+                     * 会被记成"它被饿着",而那是两件完全不同的事。
+                     */
+                    w->checkpoint = *w->counter;
+                    continue;
+                }
+
+                watched++;
+                /*
+                 * ⚠ 只在 `judge` 成立时才判"没推进":窗口里可执行时间不足
+                 *   一个完整窗口时,"没推进"是**停摆**的直接后果,不是饥饿。
+                 *   checkpoint 照样更新 —— 否则下一个窗口会拿一个更早的
+                 *   基准去比,把停摆那一段算到它头上。
+                 */
+                if (judge && (*w->counter == w->checkpoint)) {
+                    missed++; /* ★ 整整一个窗口:可运行,却一次都没推进 ★ */
+                }
+                w->checkpoint = *w->counter;
+            }
+
+            if (watched == STARVE_K) {
+                g_starve_full++;
+            }
+            if (missed != 0u) {
+                g_starve_events += missed;
+            }
+
+            if (((missed != 0u) || (usable > STARVE_LATE_TICKS)) && (g_starve_alarms < STARVE_ALARM_MAX) &&
+                uart_present) {
+                g_starve_alarms++;
+                /* 整行排他:串口有两个写者,而一行要 60~80ms */
+                console_excl_begin();
+                console_printf("[XJ380/arm32] STARVATION: win=%u tick frozen=%u ms usable=%u "
+                               "missed=%u/%u\n",
+                               win, frozen_ms, usable, missed, watched);
+                console_excl_end();
+            }
+        }
+    }
+}
+
+/* 相 5 与对照组的四个负载线程入口(同一个探针,两个 g_starve 槽)*/
+static u32 starve_created(const tcb_t *out)
+{
+    u32 i;
+
+    for (i = 0u; i < STARVE_K; i++) {
+        if (out[i] == NULL) {
+            return 0u;
+        }
+    }
+
+    return 1u;
+}
+
+static u32 starve_advanced(void)
+{
+    u32 i;
+    u32 n = 0u;
+
+    for (i = 0u; i < STARVE_K; i++) {
+        if (g_starve[i].count != 0u) {
+            n++;
+        }
+    }
+
+    return n;
+}
+
+/*
+ * ★ 等一段**墙钟** —— 不是"我自己的 N 毫秒" ★
+ *
+ * ⚠ 这两个不是一回事,而 `timer_delay_ms(N)` 是**后者**:它的实现是
+ *   `while (ms--) timer_delay_us(1000)`,即 N 次**串行**的 1 毫秒等待。
+ *   当前线程被抢占多久,它就多花多久。
+ *
+ *   上板实测(这个坑值得记下来,它是本项目第 39 个同类):
+ *     相 5 请求 1200ms、实际 **2880ms** —— 差额正好是被 4 个负载线程占住
+ *     的那 1600ms;相 4 请求 3000ms、实际约 5.4s,状态线程于是"醒了 5 次"
+ *     而不是 3 次(那个数从 M4-8.4 起就一直是 5,当时没人追问)。
+ *
+ *   **内核没有问题,是我用错了函数。** 但它让"相的长度"变成一个猜不出来的
+ *   数,而这条判据的时序(负载活多久、粘住多久)全押在它上面。
+ *   要"截止时刻"语义就得自己算一次绝对时间。
+ *
+ * ⚠ 这里**故意不让出**:相的长度必须由墙钟决定,而不是由"谁愿意让我跑"
+ *   决定。被抢占时它会在恢复后立刻检查截止时刻并返回。
+ */
+static void starve_wait_ms(u32 ms)
+{
+    u64 t0 = timer_read_us();
+    u64 us = (u64)ms * 1000ull;
+
+    while ((timer_read_us() - t0) < us) {
+        /* 忙等 */
+    }
+}
+
 /* M4-7:异常帧是否落在 SVC 栈区(1 = 在,0 = 不在)*/
 static u32 g_exc_frame_on_svc_stack;
 
@@ -2437,6 +2840,116 @@ void kmain(void)
         }
     }
 
+    /* ---- 相 5:★ M4-8.5 —— 无饥饿判据(机制层)★ ---- */
+    /*
+     * K=4 个**绝不让出**的线程 + 一个睡眠式监视器,判据见 starve_monitor
+     * 上面那段。这里只说**与 M4-9 的增量在哪**(不说清楚的话,这一相看起来
+     * 只是把 20ms 的探针拉长了):
+     *
+     *   - K 从 **2 变成 4**:两个线程交错可能只是"你一次我一次";
+     *   - 走的是 **avg_vruntime 闸门 + 全表扫描**那条路(不是"队首"),
+     *     于是这条判据同时压到了 M4-8.4 改回源 OS 的那套选取;
+     *   - 判据是**常驻监视器的逐窗口结算**,不是一次性检查 ——
+     *     一次性检查抓不到"跑完那一下才出错"的形态。
+     *
+     * ⚠ 负载线程必须活得比观测期长(1600ms vs 1200ms):
+     *   否则最后一个窗口里它们会挂起,`watched` 不足 K,判据自己先失真。
+     */
+    sched_disable();
+    starve_reset(STARVE_BUDGET_US);
+    {
+        tcb_t sv[STARVE_K];
+        tcb_t sm;
+
+        sv[0] = sched_kthread_create(starve_w0, NULL, "sv0");
+        sv[1] = sched_kthread_create(starve_w1, NULL, "sv1");
+        sv[2] = sched_kthread_create(starve_w2, NULL, "sv2");
+        sv[3] = sched_kthread_create(starve_w3, NULL, "sv3");
+        starve_arm(sv, STARVE_K);
+        sm = sched_kthread_create(starve_monitor, NULL, "smon");
+        sched_enable();
+
+        if (!starve_created(sv) || sm == NULL) {
+            console_puts(" Sched nostarve: kthread_create FAILED\n");
+        } else {
+            u32 i;
+            u32 sw0;
+            u32 pre0;
+            u64 t_wall = timer_read_us(); /* 从调度打开那一刻起算 —— 那才是"相" */
+
+            sw0  = sched_tick_switched();
+            pre0 = sched_tick_preempted();
+            starve_wait_ms(STARVE_PHASE_MS);
+            t_wall = timer_read_us() - t_wall;
+
+            g_starve_full_at    = g_starve_full;
+            g_starve_events_at  = g_starve_events;
+            g_starve_late_at    = g_starve_late;
+            g_starve_skip_at    = g_starve_skipped;
+            g_starve_win_max_at = g_starve_win_max;
+            g_starve_ticks_at   = g_starve_ticks;
+            g_starve_ms_at      = (u32)(t_wall / 1000u);
+            g_starve_adv_at     = starve_advanced();
+
+            /*
+             * 四项判据,缺一不可:
+             *   events == 0  ★ 没有任何"可运行却没推进"的 (线程,窗口) 对
+             *   late   == 0     监视器自己也没被饿着(窗口没长得离谱)
+             *   full   >= 8     **判据非空转**:真有那么多个窗口里 4 个线程都
+             *                   处于可运行状态 —— 否则"零违反"可能只是
+             *                   "压根没观察"(那种判据等于没判)
+             *   adv    == K     4 个线程都真的在推进(负载是真的)
+             */
+            g_starve_ok = ((g_starve_events_at == 0u) && (g_starve_late_at == 0u) &&
+                           (g_starve_full_at >= STARVE_MIN_FULL) && (g_starve_adv_at == STARVE_K))
+                              ? 1u
+                              : 0u;
+
+            console_excl_begin(); /* 串口有两个写者:整段排他,免得被状态行劈开 */
+            console_printf(" Sched nostarve: K=%u windows=%u full=%u events=%u late=%u skipped=%u\n",
+                           STARVE_K, g_starve_checks, g_starve_full_at, g_starve_events_at,
+                           g_starve_late_at, g_starve_skip_at);
+            /*
+             * 第二行是**覆盖率审计**:相持续了多少毫秒(墙钟)*对比*监视器一共
+             * 看住了多少 tick。两者应当接近(1 tick ≈ 1ms);差得多就说明
+             * "零违反"是因为**没在看**,而不是因为没问题。
+             */
+            console_printf(" Sched nostarve: phase=%u ms observed=%u tick win_max=%u adv=%u/%u\n",
+                           g_starve_ms_at, g_starve_ticks_at, g_starve_win_max_at, g_starve_adv_at,
+                           STARVE_K);
+            console_printf(" Sched nostarve: counts=%u,%u,%u,%u\n", g_starve[0].count,
+                           g_starve[1].count, g_starve[2].count, g_starve[3].count);
+            /*
+             * 第三行是**时机对账**:每个负载线程"离本相开始多久"退出,以及
+             * 这段时间里真的切换了多少次。相的长度(上面那一行)与它们之间的
+             * 差额就是"没有负载在跑、启动流程却没回来"的那一段 ——
+             * 上板实测它是 ~1.3 秒,而原因**尚未定位**(预先存在:相 4 也有)。
+             */
+            console_printf(" Sched nostarve: exit_ms=%u,%u,%u,%u done=%u,%u,%u,%u sw=%u pre=%u\n",
+                           g_starve[0].exit_ms, g_starve[1].exit_ms, g_starve[2].exit_ms,
+                           g_starve[3].exit_ms, g_starve[0].done, g_starve[1].done, g_starve[2].done,
+                           g_starve[3].done, sched_tick_switched() - sw0,
+                           sched_tick_preempted() - pre0);
+            console_printf(" Sched nostarve: every runnable thread advanced in every window = %s\n",
+                           g_starve_ok ? "PASS" : "FAIL");
+            console_excl_end();
+
+            /*
+             * 观测期结束:把负载线程挂起,并**撤销观察名单**。
+             *
+             * ⚠ 不撤销也能过(监视器会因 status 不是可运行而跳过它们),
+             *   但那是"碰巧安全":名单里留着已死线程,下一次改动的任何
+             *   差池都会被读成饥饿。显式撤销,让"现在没有东西在被监视"
+             *   这件事是**说出来的**,而不是推出来的。
+             */
+            for (i = 0u; i < STARVE_K; i++) {
+                sv[i]->status      = WAIT;
+                sv[i]->wakeup_time = 0u;
+            }
+            starve_arm(NULL, 0u);
+        }
+    }
+
     /* ---- 10. 启动自检总账 ---- */
     /*
      * 位置:所有自检都跑完之后、主循环之前。
@@ -2725,6 +3238,21 @@ void kmain(void)
     selftest_report("sched_sleep_latency", (g_sleep_late_max_at < 20000u) ? 1u : 0u, 1u, SELFTEST_EQ);
     selftest_report("sched_sleep_yields", g_sleep_load_ok, 1u, SELFTEST_EQ);
     selftest_report("sched_sleep_printed", (g_sleep_printed_at >= 2u) ? 1u : 0u, 1u, SELFTEST_EQ);
+
+    /*
+     * ---- ★ M4-8.5:无饥饿判据 ★ ----
+     *
+     * 两项分开报,因为它们的失败含义完全不同:
+     *   sched_no_starvation   判据本身:没有任何"可运行却没推进"的窗口
+     *   sched_no_starve_windows  **判据非空转**:有那么多个窗口里 4 个线程
+     *                        都还处于可运行状态
+     *
+     * ⚠ 第二项不是装饰。一个"什么都没观察到"的检查永远通过 ——
+     *   本项目已经不止一次因为判据太松白跑一轮上板(见计划 §0.5.5)。
+     */
+    selftest_report("sched_no_starvation", g_starve_ok, 1u, SELFTEST_EQ);
+    selftest_report("sched_no_starve_windows", g_starve_full_at, STARVE_MIN_FULL, SELFTEST_GE);
+
     /*
      * `invalid_ctx` 必须恒为 0:它不是"发生过多少件坏事"的计数,
      * 而是"调度器有没有挑到过不可切换的上下文"。挑了就是有 bug ——
@@ -3128,6 +3656,138 @@ void kmain(void)
             sched_ctx_restore_all(ctx_snapshot, ctx_snapshot_n);
             /* ⚠ 不调 sched_kern_init():见上面 9.75 那段说明 —— 它会清空队列、
              *   把常驻的周期状态线程一起抹掉。 */
+        }
+    }
+
+    /* ---- 9.78 ★ M4-8.5 的破坏性对照组:严格非抢占 ⇒ 必然饿死 ★ ---- */
+    /*
+     * 同一段选取代码、同一批负载、**同一个监视器**,只把"选谁"改成
+     * "current 可运行就还是它"(`g_pick_sticky`,粘够 n 次之后自动恢复)。
+     *
+     *   粘住关(相 5 实测):4 个线程轮转,每个窗口每个都推进 ⇒ events=0 late=0
+     *   粘住开           :一个线程一路跑到底,**其余 3 个一个窗口都没轮到**;
+     *                      而且连监视器自己都醒不过来 ⇒ 它的窗口长度从
+     *                      ~64 tick 变成上千 tick
+     *
+     * ⚠ 判据是"**监视器报警了**(events 或 late 有增量)**而且**受害者真的
+     *   没推进(adv < K)"。两个条件都要:只有报警可能是误报,只有"没推进"
+     *   可能只是因为负载压根没起来。与前四个对照组一样,这里是**预期它坏**。
+     *
+     * ⚠ 为什么粘住必须是**有限次数**:粘住之后没有任何人能把它清零
+     *   (kmain 与监视器都轮不到 CPU),对照组会就地挂死 ——
+     *   那不是"判据不承重",是**测不了**。见 src/sched.c 的说明。
+     *
+     * ⚠ 负载的墙钟预算(600ms)**故意短于**粘住的时长(~1.2s):
+     *   于是粘住一结束,它们一被选中就立刻到期挂起,计数停在 0 ——
+     *   "谁推进过、谁没推进过"在读数上是一目了然的。
+     */
+    {
+        tcb_t sa[STARVE_K];
+        u32   i;
+
+        sched_disable();
+        starve_reset(STARVE_CTL_BUDGET);
+        /*
+         * ★ 粘住的那一个(sa[0])必须**活过整段粘住**,其余三个必须**活不过** ★
+         *
+         *   活过:否则它自己到期挂起,把粘住提前结束 —— 粘住的次数就用不完,
+         *         而且监视器会在"粘住还在生效"的时候拿到 CPU(上板实测过:
+         *         粘住 300 次只消耗 121 次,而监视器仍然报了警 —— 结论对,
+         *         但**时序不是我设计的那个**,读数要靠猜)。
+         *   活不过:它们一被选中就立刻到期挂起,**计数停在 0** ——
+         *         "谁被饿着"于是留在读数上,而不是"饿完接着跑满自己那份"。
+         */
+        g_starve[0].budget_us = STARVE_CTL_HOG;
+
+        sa[0] = sched_kthread_create(starve_w0, NULL, "sa0");
+        sa[1] = sched_kthread_create(starve_w1, NULL, "sa1");
+        sa[2] = sched_kthread_create(starve_w2, NULL, "sa2");
+        sa[3] = sched_kthread_create(starve_w3, NULL, "sa3");
+        starve_arm(sa, STARVE_K); /* 统计量从这里清零,所以下面读到的就是增量 */
+
+        g_pick_sticky = STARVE_STICKY_N; /* ★ 对照组:不许换人 ★ */
+        sched_enable();
+
+        if (!starve_created(sa)) {
+            g_pick_sticky = 0u;
+            console_puts(" No-starve A/B: kthread_create FAILED\n");
+        } else {
+            /*
+             * ★ 打印用的数**必须在收拾之前全部抄出来** ★
+             *
+             * `starve_arm(NULL, 0)` 会把监视器的统计量清零 —— 那是它的职责
+             * (下一次装名单要从零起算)。所以先抄进局部量,再收拾,最后打印。
+             * (第一版就是先收拾再打印,打出来全是 0。)
+             */
+            u32 ev;
+            u32 late;
+            u32 full;
+            u32 wmax;
+            u32 observed;
+            u32 skipped;
+            u32 sticky_left;
+            u64 t_wall = timer_read_us();
+
+            starve_wait_ms(STARVE_CTL_MS);
+            t_wall = timer_read_us() - t_wall;
+
+            ev          = g_starve_events;
+            late        = g_starve_late;
+            full        = g_starve_full;
+            wmax        = g_starve_win_max;
+            observed    = g_starve_ticks;
+            skipped     = g_starve_skipped;
+            sticky_left = g_pick_sticky; /* 应当为 0:粘住的次数在窗口内用完 */
+            g_starve_ctl_adv = starve_advanced();
+
+            /*
+             * ★ 判据:监视器报警了 **而且** 受害者真的没推进 ★
+             *
+             * 两个检出信号,任一成立即可 —— 它们量的是同一件事的两面:
+             *   events>0  "某个**可运行**的被观察线程,整整一个窗口没推进"
+             *   late >0   监视器自己的窗口长度超过 4N —— 连它都没被调度到
+             *             (它从 64ms 的周期被拖到上千 ms,那就是饥饿本身)
+             *
+             * ⚠ `adv < K` 这一条是防"报警是真的、但负载压根没被饿着"的:
+             *   4 个里都推进过就不能叫饿死。它是**辅助判据**,不是主判据 ——
+             *   上板实测里主判据(events/late)是稳的,而"哪些受害者最终
+             *   推进了"取决于粘住结束后谁先被选中,那不是我设计的东西。
+             *
+             * ⚠ `sticky_left` **不参与判定**(第一版把它写进判据,结果因为
+             *   "粘住还没用完但监视器已经报警"而误判为未检出)。它只作为
+             *   时序信息打出来:0 = 粘住次数真的用完了;非 0 = 粘住被
+             *   sa[0] 自己的到期提前结束(那也是合法的一次对照,见上)。
+             */
+            g_starve_ctl_detect = (((ev != 0u) || (late != 0u)) && (g_starve_ctl_adv < STARVE_K)) ? 1u
+                                                                                                  : 0u;
+
+            /*
+             * ---- 收拾,而且**在打印之前** ----
+             *
+             * 9600 波特下一行要 60~80ms,而系统一直在跑。窗口结束时
+             * `g_pick_sticky` 已经归零(粘够了),但四个受害者还在就绪队列里 ——
+             * 打印期间它们会被挑中、发现自己已经超期、然后挂起。
+             * 那不致命,但会让"打印出来的数"与"打印之后的状态"不一致,
+             * 前四个对照组已经被这件事咬过一次(见 9.75 那段留痕)。
+             */
+            for (i = 0u; i < STARVE_K; i++) {
+                sa[i]->status      = WAIT;
+                sa[i]->wakeup_time = 0u;
+            }
+            starve_arm(NULL, 0u); /* 撤销观察名单:现在没有东西在被监视 */
+            g_pick_sticky = 0u;
+
+            console_excl_begin();
+            console_printf(" No-starve A/B: sticky n=%u left=%u phase=%u ms observed=%u tick "
+                           "skipped=%u\n",
+                           STARVE_STICKY_N, sticky_left, (u32)(t_wall / 1000u), observed, skipped);
+            console_printf(" No-starve A/B: adv=%u/%u events=%u late=%u full=%u win_max=%u tick\n",
+                           g_starve_ctl_adv, STARVE_K, ev, late, full, wmax);
+            console_printf(" No-starve A/B: counts=%u,%u,%u,%u(粘住的跑满,其余停在 0)\n",
+                           g_starve[0].count, g_starve[1].count, g_starve[2].count, g_starve[3].count);
+            console_printf(" No-starve A/B: strict non-preempt -> %s(可运行却被无限期漏掉)\n",
+                           g_starve_ctl_detect ? "DETECTED" : "MISSED - detector not load-bearing");
+            console_excl_end();
         }
     }
 

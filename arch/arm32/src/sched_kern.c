@@ -165,19 +165,80 @@ void sched_kern_init(void)
  */
 static u32 g_sched_enabled = 1u;
 
+/*
+ * ★ M4-8.5:"关调度"的**嵌套深度**与**累计时长** ★
+ *
+ * ## 为什么需要深度而不只是布尔
+ *
+ * 关调度的用途有两个,而且会**互相嵌套**:
+ *   - `console_excl_begin/end`(排他输出,见 arch/console.h)—— 它自己带计数;
+ *   - kmain 里"造线程 / 改调度状态"那种多步操作的窗口。
+ *
+ * 只要有一次不成对(或者嵌套里的内层先 `enable`),布尔版本就会**提前打开**
+ * 调度 —— 而"提前打开"不会报任何错,只表现为"偶尔被切走一次",属于最难查的
+ * 那一类。改成计数之后,`enable` 只在深度归零时才真的打开。
+ *
+ * 不变式:深度为 0 ⟺ 调度开着。于是"多调一次 enable"是无害的空操作,
+ * 而不是把某个还没结束的临界区打开。
+ *
+ * ## 累计时长是给饥饿监视器用的
+ *
+ * 排他输出期间(自检报告要好几秒)**整个系统停摆**:所有线程都醒不过来。
+ * 监视器必须能把"有人故意关了调度"与"某个线程被饿着"分开,否则报告一打完
+ * 它就会报一次假警。
+ *
+ * ⚠ 分开的办法**不是**"有这个量就作废整个窗口":饥饿也会让窗口变长,两者会
+ *   叠加在同一个窗口里(上板实测就是这么漏报的)。监视器用的是
+ *   `窗口长度 - 停摆时长`,见 `sched_off_total_ns()` 的说明与
+ *   src/kmain.c 的 `starve_monitor`。
+ */
+static u32 g_sched_off_depth;
+static u64 g_sched_off_since; /* 深度从 0 变 1 的那一刻(纳秒)*/
+static u64 g_sched_off_total; /* 累计关掉的纳秒数 */
+
 void sched_disable(void)
 {
+    if (g_sched_off_depth == 0u) {
+        g_sched_off_since = timer_read_ns();
+    }
+    g_sched_off_depth++;
     g_sched_enabled = 0u;
 }
 
 void sched_enable(void)
 {
-    g_sched_enabled = 1u;
+    if (g_sched_off_depth == 0u) {
+        g_sched_enabled = 1u; /* 不成对的 enable:无害空操作(见上)*/
+        return;
+    }
+
+    g_sched_off_depth--;
+    if (g_sched_off_depth == 0u) {
+        u64 now = timer_read_ns();
+
+        g_sched_off_total += (now - g_sched_off_since);
+        g_sched_off_since = 0u;
+        g_sched_enabled   = 1u;
+    }
 }
 
 bool sched_is_enabled(void)
 {
     return g_sched_enabled != 0u;
+}
+
+u64 sched_off_total_ns(void)
+{
+    /*
+     * 正在关着的时候把**已经过去的那一段**也算进去 ——
+     * 否则"报告打到一半时取数"会得到一个偏小的值,而那种偏小会让
+     * 监视器把一个停摆窗口误判成饥饿窗口。
+     */
+    if (g_sched_off_depth == 0u) {
+        return g_sched_off_total;
+    }
+
+    return g_sched_off_total + (timer_read_ns() - g_sched_off_since);
 }
 
 static sched_queue_t *self_runq(void)
