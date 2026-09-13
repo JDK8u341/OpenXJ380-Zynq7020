@@ -173,14 +173,35 @@ void fault_test_trigger(u32 selector)
 
         if (selector == FAULT_SEL_STACK_GUARD_AP) {
             /*
-             * AP=0b000 的 guard 需要**另一个池实例**(guard_kind 是池级配置)。
-             * 板级只建了 KSTACK_GUARD_UNMAPPED 那一个,所以这里如实说明,
-             * 而不是悄悄退化成"不映射"那一种 —— 那会让 6 和 7 看起来
-             * 都验证过了。
+             * AP=0b000 的 guard 需要**另一个池实例**(guard_kind 是池级配置),
+             * 所以板级建了两个池:大的那个用"不映射",这个小的用 AP=0b000。
+             *
+             * ★ 这一路的 A/B 比"不映射"那一路更紧 ★
+             *   两个阶段里 guard 页**都是映射着的**,唯一的差别就是 AP 是不是
+             *   0b000(对照组的 kstack_guard_disable 会把 AP 改回全权限)。
+             *   所以它同时回答两件事:
+             *     1. KSTACK_GUARD_AP_NONE 这条实现在真硬件上成不成立;
+             *     2. ★ DACR = client 模式下 AP 到底有没有被硬件执行 ★ ——
+             *        这是 M2-4 欠的账:当时把 DACR 从全 manager 切成全 client,
+             *        理由是"所有区域的 AP 都是 0b011,所以行为应当完全不变",
+             *        也就是说 AP 有没有被强制执行**从来没有被验证过**。
              */
-            console_puts("    NOTE: the board pool uses KSTACK_GUARD_UNMAPPED\n");
-            console_puts("      the AP=0b000 variant is covered by kstack_selftest\n");
-            console_puts("      (its hardware trip needs a second pool - not built yet)\n");
+            const kstack_t *ap = kstack_probe_stack_ap();
+
+            if (ap == NULL) {
+                console_puts("    no AP-mode stack registered (kstack_probe_register_ap)\n");
+                return;
+            }
+
+            console_printf("    stack base=0x%08X top=0x%08X guard=0x%08X\n", ap->base, ap->top,
+                           ap->guard);
+            console_puts("    guard page is MAPPED but AP=0b000 (no access at PL1)\n");
+            console_puts("      -> expect Data Abort with DFAR = base-4\n");
+            console_puts("         and FS[4:0]=0x0F (permission fault, level 2)\n");
+            console_puts("         (NOT 0x07: this is a permission fault, not a translation one)\n");
+            timer_delay_ms(50);
+
+            (void)kstack_probe_overflow_ap();
             return;
         }
 

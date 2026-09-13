@@ -616,6 +616,8 @@ bool kstack_overflow_visible(uintptr_t base)
 
 static kstack_pool_t *g_probe_pool;
 static kstack_t      *g_probe_stack;
+static kstack_pool_t *g_probe_pool_ap;
+static kstack_t      *g_probe_stack_ap;
 
 void kstack_probe_register(kstack_pool_t *pool, kstack_t *stack)
 {
@@ -623,9 +625,20 @@ void kstack_probe_register(kstack_pool_t *pool, kstack_t *stack)
     g_probe_stack = stack;
 }
 
+void kstack_probe_register_ap(kstack_pool_t *pool, kstack_t *stack)
+{
+    g_probe_pool_ap  = pool;
+    g_probe_stack_ap = stack;
+}
+
 const kstack_t *kstack_probe_stack(void)
 {
     return g_probe_stack;
+}
+
+const kstack_t *kstack_probe_stack_ap(void)
+{
+    return g_probe_stack_ap;
 }
 
 u32 kstack_probe_overflow(void)
@@ -642,6 +655,15 @@ u32 kstack_probe_overflow(void)
     return kstack_overflow_write((uintptr_t)g_probe_stack->base);
 }
 
+u32 kstack_probe_overflow_ap(void)
+{
+    if (g_probe_stack_ap == NULL || !g_probe_stack_ap->in_use) {
+        return 0u;
+    }
+
+    return kstack_overflow_write((uintptr_t)g_probe_stack_ap->base);
+}
+
 bool kstack_probe_clobbered(void)
 {
     if (g_probe_stack == NULL) {
@@ -649,6 +671,15 @@ bool kstack_probe_clobbered(void)
     }
 
     return kstack_overflow_visible((uintptr_t)g_probe_stack->base);
+}
+
+bool kstack_probe_clobbered_ap(void)
+{
+    if (g_probe_stack_ap == NULL) {
+        return false;
+    }
+
+    return kstack_overflow_visible((uintptr_t)g_probe_stack_ap->base);
 }
 
 kstack_err_t kstack_probe_guard_disable(void)
@@ -667,6 +698,24 @@ kstack_err_t kstack_probe_guard_enable(void)
     }
 
     return kstack_guard_enable(g_probe_pool, g_probe_stack);
+}
+
+kstack_err_t kstack_probe_guard_disable_ap(void)
+{
+    if (g_probe_pool_ap == NULL || g_probe_stack_ap == NULL) {
+        return KSTACK_ERR_NOT_INIT;
+    }
+
+    return kstack_guard_disable(g_probe_pool_ap, g_probe_stack_ap);
+}
+
+kstack_err_t kstack_probe_guard_enable_ap(void)
+{
+    if (g_probe_pool_ap == NULL || g_probe_stack_ap == NULL) {
+        return KSTACK_ERR_NOT_INIT;
+    }
+
+    return kstack_guard_enable(g_probe_pool_ap, g_probe_stack_ap);
 }
 
 /* ------------------------------------------------------------------ */

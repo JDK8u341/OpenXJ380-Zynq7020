@@ -126,6 +126,48 @@ static u32    g_kstack_bitmap[KSTACK_BITMAP_WORDS];
 static kstack_pool_t g_kstack;
 static kstack_t      g_kstack_probe;
 
+/*
+ * 第二、个**小**栈池,guard 用 AP=0b000 实现。
+ *
+ * ====================================================================
+ * 为什么值得单独建一个池
+ * ====================================================================
+ *
+ * `guard_kind` 是**池级**配置,所以两种 guard 必然是两套页表配置。
+ *
+ * 这个池存在的唯一目的就是把两件事在**真硬件**上钉死:
+ *
+ *   1. `KSTACK_GUARD_AP_NONE` 这条实现路径成不成立;
+ *   2. ★ **DACR = client 模式下 AP 有没有被硬件执行** ★
+ *
+ * 第 2 条是 M2-4 欠下的一笔账。当时把 DACR 从全 manager 切成全 client,
+ * 理由是"所有区域的 AP 都是 0b011(全权限),所以行为应当完全不变" ——
+ * 那句话是**推理**,不是证据:AP 到底有没有被强制执行,当时无从观测。
+ * 一个 AP=0b000 的页把它变成可观测的:同一页、同样映射着,
+ * 只把 AP 从 0b011 改成 0b000,访问就必须从"成功"变成"权限故障"。
+ *
+ * ====================================================================
+ * 为什么栈可以开得很小
+ * ====================================================================
+ *
+ * 每个栈只要 2 页。guard 机制与栈有多大**无关** ——
+ * 它只关心"栈底下面那一页可不可访问"。用 1MB 只会白占内存,
+ * 而这个池不承担任何真实任务。
+ */
+#define KSTACK_AP_SLOTS       2u
+#define KSTACK_AP_STACK_PAGES 2u
+#define KSTACK_AP_POOL_PAGES  (KSTACK_AP_SLOTS * (KSTACK_AP_STACK_PAGES + 1u)) /* 6 页 */
+#define KSTACK_AP_L2_TABLES   2u
+
+static u32    g_l2_pool_ap[KSTACK_AP_L2_TABLES * VMAP_L2_ENTRIES] __attribute__((aligned(1024)));
+static vmap_t g_vmap_ap;
+static u32    g_kstack_ap_bitmap[KSTACK_BITMAP_WORDS];
+
+static kstack_pool_t g_kstack_ap;
+static kstack_t      g_kstack_ap_probe;
+
+static u32 g_kstack_ap_ok;
+
 static u32 g_kstack_selftest;
 static u32 g_kstack_slots_ok;
 static u32 g_kstack_guard_ok;
@@ -1154,6 +1196,53 @@ void kmain(void)
         }
     }
 
+    /* ---- 9.47 AP=0b000 的 guard:小池(A/B 更紧,并补 M2-4 的账)---- */
+    {
+        uintptr_t    pool = 0;
+        palloc_err_t pe   = palloc_alloc_pages(&g_palloc, KSTACK_AP_POOL_PAGES, &pool);
+        vmap_err_t   ve   = VMAP_ERR_NOT_INIT;
+        kstack_err_t ke   = KSTACK_ERR_NOT_INIT;
+
+        if (pe == PALLOC_OK) {
+            /* 这个池小得多,所以另给一份小的 L2 表池 —— 与栈池互不影响 */
+            ve = vmap_init(&g_vmap_ap, g_mmu_l1_table, g_l2_pool_ap, (u32)(uintptr_t)g_l2_pool_ap,
+                           KSTACK_AP_L2_TABLES, (u32)pool,
+                           (u32)pool + (u32)(KSTACK_AP_POOL_PAGES * PALLOC_PAGE_SIZE));
+        }
+
+        if (ve == VMAP_OK) {
+            ke = kstack_pool_init(&g_kstack_ap, &g_vmap_ap, (u32)pool,
+                                  (u32)(KSTACK_AP_POOL_PAGES * PALLOC_PAGE_SIZE), KSTACK_AP_STACK_PAGES,
+                                  KSTACK_GUARD_AP_NONE, g_kstack_ap_bitmap, KSTACK_BITMAP_WORDS,
+                                  kstack_tlb_flush_range);
+        }
+
+        if (ke == KSTACK_OK && kstack_alloc(&g_kstack_ap, &g_kstack_ap_probe) == KSTACK_OK) {
+            /*
+             * 与"不映射"那一路不同,这一路的 guard 页在页表里**是映射着的** ——
+             * 所以这里能做的读回只有"AP 位确实是 0b000"。
+             * 真正"硬件会不会拦"要靠选择器 7 的破坏性验证。
+             */
+            u32 got = vmap_lookup(&g_vmap_ap, g_kstack_ap_probe.guard);
+
+            g_kstack_ap_ok = ((got != 0u) && (got != VMAP_RESULT_SECTION) && (((got >> 4) & 0x3u) == 0u) &&
+                              (((got >> 9) & 0x1u) == 0u))
+                                 ? 1u
+                                 : 0u;
+
+            console_printf(" Ap guard    : pool at 0x%08X base=0x%08X guard=0x%08X AP=%u -> %s\n",
+                           (u32)pool, g_kstack_ap_probe.base, g_kstack_ap_probe.guard,
+                           (got >> 4) & 0x3u, g_kstack_ap_ok ? "PASS" : "FAIL");
+
+            if (g_kstack_ap_ok != 0u) {
+                kstack_probe_register_ap(&g_kstack_ap, &g_kstack_ap_probe);
+            }
+        } else {
+            console_printf(" Ap guard    : FAILED palloc=%u vmap=%u kstack=%u\n", (u32)pe, (u32)ve,
+                           (u32)ke);
+        }
+    }
+
     /* ---- 9.5 第二个核(AM3-1/2/3) ---- */
     /*
      * 位置:MMU 与缓存都已就绪之后。
@@ -1324,6 +1413,8 @@ void kmain(void)
     selftest_report("kstack_usable", g_kstack_usable_ok, 1u, SELFTEST_EQ);
     selftest_report("kstack_adjacent", g_kstack_adjacent_ok, 1u, SELFTEST_EQ);
     selftest_report("kstack_free_reuse", g_kstack_reuse_ok, 1u, SELFTEST_EQ);
+    /* AP=0b000 那一路:guard 页是**映射着的**,拦住访问的是 AP 而不是"没映射" */
+    selftest_report("kstack_ap_guard_ap0", g_kstack_ap_ok, 1u, SELFTEST_EQ);
 
     selftest_report("smp_cpu1_online", g_percpu[1].online, 1u, SELFTEST_EQ);
     selftest_report("smp_cpu1_stage", HB[HB_SLOT_CPU1_STAGE], HB_CPU1_STAGE_ONLINE, SELFTEST_EQ);

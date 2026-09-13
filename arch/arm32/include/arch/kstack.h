@@ -294,6 +294,11 @@ bool kstack_probe_clobbered(void);
  * 放在模块里而不是让 fault_test 自己持有,是因为"哪个栈用于验证"
  * 这件事只有 kmain 知道(它在栈池就绪之后才登记),而触发点
  * (fault_test_poll)在别处。
+ *
+ * 分两个槽位而不是一个:`guard_kind` 是**池级**配置,所以
+ * "不映射"与"AP=0b000"这两种 guard 必然是**两个池**。
+ * 合成一个只会让选择器 7 悄悄退化成"不映射"那一种 ——
+ * 那样 6 和 7 看起来都验证过了,实际上只验了一种。
  */
 void kstack_probe_register(kstack_pool_t *pool, kstack_t *stack);
 
@@ -303,6 +308,26 @@ kstack_err_t kstack_probe_guard_enable(void);
 
 /* 已登记的探针栈;未登记返回 NULL */
 const kstack_t *kstack_probe_stack(void);
+
+/*
+ * AP=0b000 那一路的独立登记与触发。
+ *
+ * 它的 A/B 比"不映射"那一路**更紧**:两个阶段里 guard 页**都是映射着的**,
+ * 唯一的差别就是 AP 是不是 0b000。于是它同时回答两个问题:
+ *   1. `KSTACK_GUARD_AP_NONE` 这条实现路径在真硬件上成不成立;
+ *   2. ★ **DACR = client 模式下 AP 到底有没有被硬件执行** ★ ——
+ *      这是 M2-4 欠下的一笔账:当时把 DACR 从全 manager 切成全 client,
+ *      理由是"所有区域的 AP 都是 0b011,所以行为应当完全不变",
+ *      也就是说 **AP 有没有被强制执行,从来没有被验证过**。
+ */
+void kstack_probe_register_ap(kstack_pool_t *pool, kstack_t *stack);
+
+/* 对 AP 探针栈跑同一段溢出。guard 生效时不返回 */
+u32  kstack_probe_overflow_ap(void);
+bool kstack_probe_clobbered_ap(void);
+kstack_err_t kstack_probe_guard_disable_ap(void);
+kstack_err_t kstack_probe_guard_enable_ap(void);
+const kstack_t *kstack_probe_stack_ap(void);
 
 /* 一次溢出要写多少个字。64 字 = 256 字节,足以越过 guard 页的第一行 */
 #define KSTACK_OVERFLOW_WORDS 64u

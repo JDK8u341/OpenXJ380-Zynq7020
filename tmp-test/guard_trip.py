@@ -13,31 +13,56 @@ guard 完全失效,而所有读回检查全部通过。这恰恰是本模块最�
 (改完页表忘了失效 TLB,见 arch/kstack.h 顶部)。
 
 所以要证明 guard 承重,只有一条路:**同一个地址、同一条指令,
-只在"这一页映射与否"这一件事上不同,看行为是否随之改变。**
+只在"这一页到底能不能访问"这一件事上不同,看行为是否随之改变。**
 
 ======================================================================
-三个阶段(一次加载里全部跑完)
+两个 guard 实现,各一组受控 A/B
 ======================================================================
 
-  A  读自检报告:必须全过,并从串口取出探针栈的 base / guard 地址
-     (后面要靠它核对 DFAR)。
+guard 有两条独立实现(见 arch/kstack.h):
+
+  - `KSTACK_GUARD_UNMAPPED` —— L2 项清零(板级大池用的就是这个)
+  - `KSTACK_GUARD_AP_NONE`  —— 映射着,但 AP=0b000
+
+它们**不是"两种写法"**,而是两种机制:`guard_kind` 是池级配置,所以板级
+建了两个池,本脚本对两个池各跑一组 A/B。
+
+### 第一次加载:B(共用对照组)+ C
+
+  A  读自检报告:必须全过。
 
   B  选择器 8 —— **对照组**:把 guard 页临时映射成普通可读写页,
      再跑同一段溢出代码。
      期望:**没有任何异常**,而且写下去的内容能读回来
-     ("静默损坏"就此被看见)。
+     ("静默损坏"就此被看见)。这一组是 C 与 D **共用**的对照 ——
+     它证明"这一段代码本身不会炸"。
 
-  C  选择器 6 —— guard 生效:同一段代码、同一批地址。
+  C  选择器 6 —— guard 生效("不映射"实现):同一段代码、同一批地址。
      期望:Data Abort,且
        - DFAR 正好等于 `base - 4`(guard 页的最后一个字)
        - FS[4:0] == 0x07(translation fault, level 2)+ WnR = 1(写)
 
-判定:
-  B 不报错 **且** C 报错并且 DFAR/DFSR 都对 → guard 是承重的,结论成立。
-  只有 C 报错、B 表现不干净 → 无法排除"这段代码本来就会炸",结论不成立。
-  只有 B 不报错、C 也不报错 → guard 没生效。
+### 第二次加载:D
 
-⚠ 顺序不能反:C 会停机,必须在它之前把 B 跑完。
+  D  选择器 7 —— guard 改用 `AP=0b000` 实现。
+     这一路 guard 页在**两个阶段里都是映射着的**,唯一差别就是 AP 是不是
+     0b000(阶段 B 的 kstack_guard_disable 会把 AP 改回全权限)。
+     期望:Data Abort,FS[4:0] == 0x0F(permission fault, level 2)。
+
+     ⚠ 0x0F 而不是 0x07:这是**权限**故障,不是转换故障。两者混起来就等于
+       把"guard 拦住了"和"这一段根本没映射"当成同一件事。
+     ⚠ 这一路顺带补上 M2-4 欠的账:当年把 DACR 从全 manager 切成全 client,
+       理由是"所有区域的 AP 都是 0b011,行为应当完全不变" —— 那是**推理**,
+       不是证据。一个 AP=0b000 的页才让"AP 到底有没有被硬件执行"可观测。
+
+======================================================================
+判定
+======================================================================
+
+  A/B 1 成立(对照组干净 + C 的 DFAR/FS 都对)→ guard("不映射")是承重的。
+  A/B 2 成立(D 的 FS == 0x0F)→ AP 被硬件执行,AP 式 guard 也成立。
+
+⚠ 顺序不能反:C 与 D 都会停机,一次加载里只能跑其中一个。
 ⚠ 串口必须在**加载之前**就打开并在后台线程里持续读 ——
   9600 波特下自检报告比 Windows 串口缓冲区大,等加载完再打开会丢掉报告。
   这个坑 verify_board.py 已经踩过一次。
@@ -62,6 +87,7 @@ BAUD = 9600
 
 FAULT_SEL_ADDR = 0x00020080
 SEL_GUARD = 6
+SEL_GUARD_AP = 7
 SEL_GUARD_OFF = 8
 
 STACK_RE = re.compile(r"Kernel stack: slot0 base=0x([0-9A-F]{8}) top=0x([0-9A-F]{8}) guard=0x([0-9A-F]{8})")
@@ -173,15 +199,13 @@ def poke(selector: int) -> str:
     return m.group(1)
 
 
-def main() -> int:
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:  # noqa: BLE001
-        pass
+# ---------------------------------------------------------------------------
+# 一次"加载 + 串口会话"
+# ---------------------------------------------------------------------------
 
-    do_load = "--load" in sys.argv
 
-    # ⚠ 必须先开串口再加载:见文件顶部的说明
+def open_boot(do_load: bool) -> SerialLog | None:
+    """开串口(必须在加载之前)+ 可选加载。失败返回 None。"""
     log = SerialLog(PORT, BAUD)
     time.sleep(0.4)
 
@@ -194,149 +218,242 @@ def main() -> int:
             print(out[-2000:])
             print("!! 加载失败")
             log.close()
-            return 2
+            return None
         print("  加载完成")
 
-    # ------------------------------------------------------------------
-    print("\n阶段 A:读自检报告,取出探针栈的地址")
-    # ------------------------------------------------------------------
+    return log
+
+
+def stage_report(log: SerialLog) -> bool:
+    """阶段 A:等自检报告,确认全过。"""
+    print("\n阶段 A:读自检报告")
+
     text = log.wait_for("=== SELF-TEST END ===", 30.0)
     m = SUMMARY_RE.search(text)
     if not m:
         print(text[-1500:])
         print("!! 没等到自检报告 —— 内核可能没跑到那里(不带 --load 时报告早已打完)")
-        log.close()
-        return 2
+        return False
 
     passed, failed = int(m.group(1)), int(m.group(2))
     print(f"  自检 {passed} passed / {failed} failed")
     if failed != 0:
         print("!! 自检有失败项,先修它再谈 guard —— 否则下面的对比没有意义")
-        log.close()
-        return 2
+        return False
 
     m = STACK_RE.search(text)
-    if not m:
-        print(text[-1500:])
-        print("!! 串口里没有 'Kernel stack: slot0 ...' 行 —— 栈池没建起来")
-        log.close()
-        return 2
-
-    slot0_base, slot0_top, slot0_guard = (int(m.group(i), 16) for i in (1, 2, 3))
-    print(f"  slot0   base=0x{slot0_base:08X}  top=0x{slot0_top:08X}  guard=0x{slot0_guard:08X}")
-    print("  (这一行只用来确认栈池建起来了;溢出落点要看下面注入输出里的探针地址)")
+    if m:
+        b, tp, g = (int(m.group(k), 16) for k in (1, 2, 3))
+        print(f"  slot0   base=0x{b:08X}  top=0x{tp:08X}  guard=0x{g:08X}")
+        print("  (这行只确认栈池建起来了;溢出落点看下面注入输出里的探针地址)")
+    for line in text.splitlines():
+        if "Ap guard" in line:
+            print(f"  {line.strip()}")
 
     # 排空启动尾巴,让主循环稳定下来
     log.wait_for("alive loop=", 8.0)
+    return True
 
-    # ------------------------------------------------------------------
-    print("\n阶段 B:对照组 —— 选择器 8(临时关掉 guard,同一段溢出)")
-    # ------------------------------------------------------------------
+
+def stage_control(log: SerialLog) -> dict:
+    """阶段 B:对照组 —— 把 guard 页映射成普通可读写页,再跑同一段溢出。
+
+    这一组是 C 与 D **共用**的对照:它证明"这一段代码本身不会炸"。
+    """
+    print("\n阶段 B:对照组 —— 选择器 8(临时把 guard 页映射出来,同一段溢出)")
     print(f"  写 0x{FAULT_SEL_ADDR:08X} = {SEL_GUARD_OFF}(读回 0x{poke(SEL_GUARD_OFF)})")
 
-    # 二选一:要么打出对照组标记(正常),要么直接 Data Abort(说明"无 guard 也炸")
-    btext = log.wait_for_any(("!!! CONTROL GROUP", "Data Abort", "!!!"), 10.0)
-    if "!!! CONTROL GROUP" not in btext:
-        btext += log.wait_for_any(("!!! CONTROL GROUP", "Data Abort"), 6.0)
+    text = log.wait_for_any(("!!! CONTROL GROUP", "Data Abort", "!!!"), 10.0)
+    if "!!! CONTROL GROUP" not in text:
+        text += log.wait_for_any(("!!! CONTROL GROUP", "Data Abort"), 6.0)
 
-    b_control = "!!! CONTROL GROUP" in btext
-    b_silent = "silent corruption" in btext
-    b_abort = "Data Abort" in btext
-    b_written = re.search(r"overflow wrote (\d+) words", btext)
-    b_guard_dis = re.search(r"guard_disable=(\d+)", btext)
-
-    print(f"  反馈文本          :")
-    for line in btext.splitlines():
+    print("  反馈文本:")
+    for line in text.splitlines():
         if line.strip():
             print(f"      {line.rstrip()}")
 
-    # 对照组之后内核必须还活着 —— 否则"没有异常"这个结论不成立
     alive = log.wait_for("alive loop=", 8.0)
-    b_alive = "alive loop=" in alive
 
-    m = PROBE_RE.search(btext)
-    if not m:
-        print("!! 注入输出里没有探针地址 —— 无法核对落点")
+    res = {
+        "control": "!!! CONTROL GROUP" in text,
+        "silent": "silent corruption" in text,
+        "abort": "Data Abort" in text,
+        "alive": "alive loop=" in alive,
+        "probe": None,
+    }
+    m = PROBE_RE.search(text)
+    if m:
+        res["probe"] = tuple(int(m.group(k), 16) for k in (1, 2, 3))
+
+    print(f"  对照组标记        : {'出现' if res['control'] else '未出现'}")
+    print(f"  静默损坏被读到    : {'是' if res['silent'] else '否'}")
+    print(f"  这一步有 Data Abort: {'有' if res['abort'] else '无'}")
+    print(f"  内核仍在推进      : {'是' if res['alive'] else '否'}")
+    if res["probe"]:
+        b, tp, g = res["probe"]
+        print(f"  探针栈            : base=0x{b:08X} top=0x{tp:08X} guard=0x{g:08X}")
+        print(f"  guard == base-4096: {g == b - 4096}")
+
+    return res
+
+
+def stage_trip(log: SerialLog, selector: int, expect_fs: int, label: str) -> dict:
+    """阶段 C / D:让 guard 生效,跑同一段溢出。会停机,所以每次加载只能跑一个。"""
+    print(f"\n阶段 {label}:guard 生效 —— 选择器 {selector}(同一段代码、同一批地址)")
+    print(f"  写 0x{FAULT_SEL_ADDR:08X} = {selector}(读回 0x{poke(selector)})")
+
+    text = log.wait_for("System halted", 12.0)
+    for line in text.splitlines():
+        if line.strip():
+            print(f"      {line.rstrip()}")
+
+    m = DFAR_RE.search(text)
+    dfar = int(m.group(1), 16) if m else None
+    m = DFSR_RE.search(text)
+    dfsr = int(m.group(1), 16) if m else None
+    fs = fs_of(dfsr) if dfsr is not None else -1
+    m = DOMAIN_RE.search(text)
+    domain = int(m.group(1)) if m else -1
+    wnr = int(m.group(2)) if m else -1
+    m = PROBE_RE.search(text)
+    probe = tuple(int(m.group(k), 16) for k in (1, 2, 3)) if m else None
+
+    print(f"  → Data Abort={'有' if 'Data Abort' in text else '无'}"
+          f"   DFAR={f'0x{dfar:08X}' if dfar is not None else '?'}"
+          f"   FS[4:0]=0x{fs:02X}(期望 0x{expect_fs:02X})"
+          f"   WnR={wnr}   domain={domain}")
+
+    return {"abort": "Data Abort" in text, "dfar": dfar, "fs": fs, "wnr": wnr, "probe": probe}
+
+
+def probe_of(dst: dict, fallback: dict) -> tuple | None:
+    """取探针地址:优先本阶段打印的,退而求其次用对照组打印的。"""
+    for d in (dst, fallback):
+        if d and d.get("probe"):
+            return d["probe"]
+    return None
+
+
+def main() -> int:
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        pass
+
+    do_load = "--load" in sys.argv
+
+    # ==================================================================
+    # 第一次加载:B(共用对照组)+ C(guard 用"不映射"实现)
+    # ==================================================================
+    log = open_boot(do_load)
+    if log is None:
+        return 2
+
+    if not stage_report(log):
         log.close()
         return 2
-    base, top, guard = (int(m.group(i), 16) for i in (1, 2, 3))
-    print(f"  探针栈            : base=0x{base:08X} top=0x{top:08X} guard=0x{guard:08X}")
-    print(f"  溢出第一个字应当落在  0x{base - 4:08X}(guard 页的最后一个字)")
-    print(f"  guard == base-4096: {guard == base - 4096}")
-    print(f"  探针不是 slot0    : {base != slot0_base}(相邻槽的栈顶就是它的 guard)")
-    print(f"  对照组标记        : {'出现' if b_control else '未出现'}")
-    print(f"  guard_disable 返回: {b_guard_dis.group(1) if b_guard_dis else '（没报）'}")
-    print(f"  溢出写入字数      : {b_written.group(1) if b_written else '（没报）'}")
-    print(f"  静默损坏被读到    : {'是' if b_silent else '否'}")
-    print(f"  这一步有 Data Abort: {'有' if b_abort else '无'}")
-    print(f"  内核仍在推进      : {'是' if b_alive else '否'}")
 
-    # ------------------------------------------------------------------
-    print("\n阶段 C:guard 生效 —— 选择器 6(同一段代码、同一批地址)")
-    # ------------------------------------------------------------------
-    print(f"  写 0x{FAULT_SEL_ADDR:08X} = {SEL_GUARD}(读回 0x{poke(SEL_GUARD)})")
-    ctext = log.wait_for("System halted", 12.0)
-
-    for line in ctext.splitlines():
-        if line.strip():
-            print(f"      {line.rstrip()}")
-
-    c_abort = "Data Abort" in ctext
-    m = DFAR_RE.search(ctext)
-    c_dfar = int(m.group(1), 16) if m else None
-    m = DFSR_RE.search(ctext)
-    c_dfsr = int(m.group(1), 16) if m else None
-    c_dfsr_text = m.group(2) if m else ""
-    c_fs = fs_of(c_dfsr) if c_dfsr is not None else -1
-    m = DOMAIN_RE.search(ctext)
-    c_domain = int(m.group(1)) if m else -1
-    c_wnr = int(m.group(2)) if m else -1
-
+    b = stage_control(log)
+    c = stage_trip(log, SEL_GUARD, 0x07, "C")
     log.close()
 
-    print("\n  解析")
-    print(f"      Data Abort        : {'有' if c_abort else '无'}")
-    print(f"      DFAR              : {f'0x{c_dfar:08X}' if c_dfar is not None else '（没读到）'}")
-    print(f"      DFSR              : {f'0x{c_dfsr:08X}' if c_dfsr is not None else '（没读到）'}"
-          f"  ({c_dfsr_text})")
-    if c_dfsr is not None:
-        print(f"      Domain / WnR      : {c_domain} / {c_wnr}")
-    print(f"      FS[4:0]           : 0x{c_fs:02X}"
-          f"(guard 用'不映射'实现时期望 0x07 = translation fault, level 2)")
+    probe = probe_of(c, b)
+    ok_guard = ok_dfar = ok_fs = False
+    if probe:
+        pbase, _ptop, pguard = probe
+        ok_guard = pguard == pbase - 4096
+        ok_dfar = c["dfar"] == pbase - 4
+        print(f"\n  探针 guard == base-4096 : {ok_guard}")
+        print(f"  C 的 DFAR == base-4     : {ok_dfar}   "
+              f"(DFAR={f'0x{c[chr(100) + chr(102) + chr(97) + chr(114)]:08X}' if c['dfar'] is not None else '?'}"
+              f" 期望=0x{pbase - 4:08X})")
+    ok_fs = c["fs"] == 0x07
+    print(f"  C 的 FS[4:0] == 0x07    : {ok_fs}")
+    print(f"  C 的 WnR == 1(写)       : {c['wnr'] == 1}")
 
-    # ------------------------------------------------------------------
-    print("\n判定")
-    # ------------------------------------------------------------------
-    ok_dfar = c_dfar == base - 4
-    ok_guard = guard == base - 4096
-    ok_dfsr = c_fs == 0x07
+    clean_control = b["control"] and b["silent"] and not b["abort"] and b["alive"]
+    unmapped_ok = clean_control and c["abort"] and ok_guard and ok_dfar and ok_fs and c["wnr"] == 1
 
-    print(f"  B(无 guard)无异常且看到静默损坏 : {b_control and b_silent and not b_abort}")
-    print(f"  B 内核仍在推进                  : {b_alive}")
-    print(f"  C(有 guard)报 Data Abort       : {c_abort}")
-    print(f"  探针 guard == base-4096         : {ok_guard}")
-    print(f"  C 的 DFAR == base-4             : {ok_dfar}   "
-          f"(DFAR=0x{c_dfar:08X} 期望=0x{base - 4:08X})" if c_dfar is not None else "")
-    print(f"  C 的 WnR == 1(写)              : {c_wnr == 1}")
-    print(f"  C 的 FS[4:0] == 0x07            : {ok_dfsr}")
+    if unmapped_ok:
+        print("\n  ✅ A/B 1(guard = 不映射):同一地址、同一段代码,只差这一页能不能访问 ——")
+        print("     行为从『静默损坏』变成『当场 Data Abort,DFAR 落在 guard 页里』。")
+    else:
+        print("\n  ❌ A/B 1(guard = 不映射)不成立:")
+        print(f"     对照组干净(无异常+静默损坏可见+内核仍推进) = {clean_control}")
+        print(f"     C 报错={c['abort']}  guard 几何={ok_guard}  DFAR 对={ok_dfar}  FS 对={ok_fs}")
 
-    if (b_control and b_silent and not b_abort and b_alive and c_abort and ok_guard and ok_dfar
-            and ok_dfsr and c_wnr == 1):
-        print("\n  ✅ 同一个地址、同一段代码,只在 guard 页映射与否上不同 ——")
-        print("     行为随之从『静默损坏』变成『当场 Data Abort,DFAR 落在 guard 页里』。")
-        print("     guard page 是承重的,第三级证据成立。")
+    # ==================================================================
+    # 第二次加载:D(guard 用 AP=0b000 实现)—— 两组里更紧的一组
+    # ==================================================================
+    ap_ran = do_load
+    ap_ok = False
+
+    if do_load:
+        print("\n" + "=" * 68)
+        print("第二次加载:阶段 D —— guard 改用 AP=0b000")
+        print("=" * 68)
+
+        log = open_boot(True)
+        if log is None:
+            return 2
+        if not stage_report(log):
+            log.close()
+            return 2
+
+        d = stage_trip(log, SEL_GUARD_AP, 0x0F, "D")
+        log.close()
+
+        probe = probe_of(d, None)
+        ok_guard = ok_dfar = False
+        if probe:
+            pbase, _ptop, pguard = probe
+            ok_guard = pguard == pbase - 4096
+            ok_dfar = d["dfar"] == pbase - 4
+            print(f"\n  探针 guard == base-4096 : {ok_guard}")
+            print(f"  D 的 DFAR == base-4     : {ok_dfar}   "
+                  f"(DFAR={f'0x{d[chr(100) + chr(102) + chr(97) + chr(114)]:08X}' if d['dfar'] is not None else '?'}"
+                  f" 期望=0x{pbase - 4:08X})")
+        print(f"  D 的 FS[4:0] == 0x0F    : {d['fs'] == 0x0F}"
+              "   (permission fault, level 2 —— 不是 0x07)")
+        print(f"  D 的 WnR == 1(写)       : {d['wnr'] == 1}")
+
+        ap_ok = (bool(probe) and d["abort"] and ok_guard and ok_dfar and d["fs"] == 0x0F
+                 and d["wnr"] == 1)
+        if ap_ok:
+            print("\n  ✅ A/B 2(guard = AP=0b000):两阶段里 guard 页**都是映射着的**,")
+            print("     唯一差别就是 AP 是不是 0b000 —— 行为随之从『无异常』变成")
+            print("     『permission fault, level 2』。")
+            print("     这同时证明:**DACR = client 模式下 AP 确实被硬件执行** ——")
+            print("     那是 M2-4 当年只做过推理、没做过验证的一条。")
+        else:
+            print("\n  ❌ A/B 2(guard = AP=0b000)不成立")
+
+    # ==================================================================
+    print("\n" + "=" * 68)
+    print("判定")
+    print("=" * 68)
+    print(f"  A/B 1  guard = 不映射(选择器 6 vs 8)  : {'成立' if unmapped_ok else '不成立'}")
+    if ap_ran:
+        print(f"  A/B 2  guard = AP=0b000(选择器 7 vs 8): {'成立' if ap_ok else '不成立'}")
+    else:
+        print("  A/B 2  guard = AP=0b000                : 未跑(需要 --load,它要第二次加载)")
+
+    if unmapped_ok and ap_ok:
+        print("\n  ✅ guard page 是承重的 —— 第三级证据成立")
+        print("     (两条独立实现路径各有一组对照,而且第二组比第一组更紧:")
+        print("      两阶段里那一页都映射着,只差 AP)")
         return 0
 
-    if c_abort and not b_control:
-        print("\n  ⚠ C 报了异常但 B 的表现不干净 —— 无法排除『这一段代码本来就会炸』。")
-        print("     重跑;若重现,说明异常来源不是 guard。")
-        return 2
+    if unmapped_ok and not ap_ran:
+        print("\n  ⚠ 只验了 A/B 1。加 --load 才能把 A/B 2 也跑掉。")
+        return 0
 
-    if not c_abort:
-        print("\n  ❌ guard 没有生效:关掉它会静默损坏,打开它也不报错。")
+    if not unmapped_ok:
+        print("\n  ❌ A/B 1 不成立 —— guard 没生效,或异常来源不是 guard。")
         return 1
 
-    print("\n  ❌ 异常发生了,但 DFAR / DFSR 与 guard 页对不上 —— 不是 guard 拦下来的。")
+    print("\n  ❌ A/B 2 不成立 —— AP=0b000 没有拦住访问。")
+    print("     最可能的原因:DACR 不在 client 模式(manager 模式下 AP 被完全忽略)。")
     return 1
 
 
