@@ -141,7 +141,14 @@ _Static_assert(ARM_EXC_OFF_SVC_LR == 13u * 4u, "r0-r12 之后必须紧跟 svc_lr
 _Static_assert(ARM_EXC_OFF_RET == ARM_EXC_OFF_SVC_LR + 4u, "ret 紧跟 svc_lr");
 _Static_assert(ARM_EXC_OFF_SPSR == ARM_EXC_OFF_RET + 4u, "spsr 紧跟 ret(RFEIA 的 [sp+4])");
 _Static_assert(ARM_EXC_FRAME_BYTES == 64u, "异常帧大小变了,vectors.S 的偏移也要改");
-_Static_assert(ARM_EXC_FRAME_BYTES % 8u == 0u, "异常帧不是 8 的倍数,调用 C 时 SP 会不对齐");
+/*
+ * ⚠ 这条断言**不再是为了 AAPCS**,保留它只是因为 64 是个整齐的数、
+ *   而 `被中断的 SP == 帧基址 + ARM_EXC_FRAME_BYTES` 这个等式要成立。
+ *   原先的理由写的是"帧不是 8 的倍数,调用 C 时 SP 会不对齐" —— 错的:
+ *   帧的对齐由它**建在哪**决定,与帧多大无关;那个边界现在由
+ *   `_vec_irq` 的 `bic sp, sp, #7` 显式保证(见 D7)。
+ */
+_Static_assert(ARM_EXC_FRAME_BYTES % 4u == 0u, "帧必须是 4 的倍数(槽全是 u32)");
 _Static_assert(sizeof(arm_exc_frame_t) == ARM_EXC_FRAME_BYTES, "结构体与偏移宏不一致");
 _Static_assert(offsetof_arm(arm_exc_frame_t, svc_lr) == ARM_EXC_OFF_SVC_LR, "svc_lr 偏移与汇编不一致");
 _Static_assert(offsetof_arm(arm_exc_frame_t, ret) == ARM_EXC_OFF_RET, "ret 偏移与汇编不一致");

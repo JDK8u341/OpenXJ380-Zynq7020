@@ -2072,7 +2072,7 @@ switched=30 preempted=27 invalid=0
 | D4 | **`select_next_task` 被简化成"取队首"** | `src/sched.c` 的 `sched_pick` | 等权 + 纯占用负载下结果与源 OS 相同 | **M4-10**。源 OS 的 `select_next_task_safe` 还有 avg_vruntime 闸门、fallback 扫描、`mark_task_dispatched`、`wake_sleeping_task(current)` —— **那是简化，不是等价** |
 | D5 | **`is_task_schedulable` 省掉了 `parent_group` 两条** | `src/sched.c` | 内核对线程还没有进程组（M7 才有） | M7。照抄会让**每一个**线程都不可调度（`parent_group == NULL`），所以只能先省 |
 | D6 | **`sched_tick` 里的 CPU0 护栏** | `src/sched_kern.c` | `g_runq[1]` 与 CPU1 的 idle 都还没建，放 CPU1 过去会两个核同时往一个上下文里塞现场 | **M4-10**（每核队列 + 每核 idle）|
-| D7 | **异常帧可能不是 8 字节对齐** | `boot/vectors.S` 的 `EXC_FRAME_ENTER` | 本板实测扛得住（被拒绝那一轮里 `sched_tick` 在 4-mod-8 的 SP 上跑了 3 万多次没出错）| 需要时。根治要把帧从 16 字加宽到 18 字、把原始 SP 存进帧里。用 `irq_frame_unaligned8` 量出的规模（一轮 **20** 次）决定值不值得做 |
+| ~~D7~~ | ~~**异常帧可能不是 8 字节对齐**~~ | `boot/vectors.S` 的 `_vec_irq`/`_vec_svc` | — | **已结案（D7）**。量出的规模是**一轮 1688 次**（早先"20~28"是在启动早期取的，低估了）。<br>★ **修法与计划里猜的不同**：计划写的是"帧 16→18 字 + 存原始 SP"，那是想岔了 —— 问题不在"帧落在哪"，而在**调 C 的那个边界**。帧**不能挪**（`EXC_FRAME_LEAVE` 靠 `帧基址 + 64 == S` 还原被中断的 SP），而 C 函数拿到的是 **r0 里的帧指针**、不是 SP ⇒ 只要 `bic sp, sp, #7` 一条指令，回来 `mov sp, r0` 恢复即可，不动帧、不动偏移、不动断言。<br>判据是新增的硬自检 `c_handler_sp_aligned`（必须 0）：处理函数入口读自己的 SP。实测 0（修复前必然等于 1688）|<br>PLACEHOLDER**错误因果**：帧大小是不是 8 的倍数**决定不了** SP 对齐；M4-2 那次 Undefined 是 FPU 没使能，与对齐无关 |
 | ~~D8~~ | ~~**VFP 上下文根本没保存/恢复**~~ | — | — | **已结案(M4-9.5,`53da560`)**。见下面「VFP 现场:补账」一节 —— 判据在板上成立(65/0),且有破坏性 A/B |
 | ~~D9~~ | ~~**`runtime_ticks` 从不累加**~~ | — | — | **已清(M4-9.5)**：照源 OS `scheduler.cpp:398` 每 tick 加一 |
 | ~~D10~~ | ~~**`sched_tick_account()` 成了死函数**~~ | — | — | **已删(M4-9.5)** |

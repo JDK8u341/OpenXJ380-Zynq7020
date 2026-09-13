@@ -280,6 +280,12 @@ void gic_eoi(u32 intid)
  */
 static void irq_frame_check(const arm_exc_frame_t *frame);
 
+/*
+ * D7 的判据:处理函数入口的 SP 必须是 8 字节对齐。
+ * 与上面同理 —— 校验要在最前面做,但它定义在文件靠后(说明和它放在一起)。
+ */
+static void c_handler_sp_check(void);
+
 arm_exc_frame_t *c_irq_handler(arm_irq_frame_t *frame)
 {
     u32       intid;
@@ -294,6 +300,7 @@ arm_exc_frame_t *c_irq_handler(arm_irq_frame_t *frame)
      * 代价是每个 tick 几次比较(1kHz),可以忽略。
      */
     irq_frame_check(frame);
+    c_handler_sp_check(); /* ★ D7:进来时的 SP 必须是 8 字节对齐 ★ */
 
     intid     = gic_acknowledge();
     cpu_intid = intid & 0x3FFu; /* ICCIAR 的 [9:0] 才是 INTID */
@@ -757,6 +764,38 @@ u32 irq_frame_unaligned8(void)
     return g_irq_frame_unaligned8;
 }
 
+/* ------------------------------------------------------------------ */
+/* ★ D7 的**直接**判据:C 处理函数入口的 SP 必须 8 字节对齐 ★          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * `_vec_irq` / `_vec_svc` 在 `bl` 之前会 `bic sp, sp, #7`(见 vectors.S 的说明)。
+ * 这一条**直接量那件事有没有生效** —— 不再靠"帧基址是不是 8 对齐"去间接推。
+ *
+ * ★ 为什么可以在这里读 SP ★
+ *   读到的不是"bl 那一刻的 SP",而是本函数**序言跑完之后**的 SP。两者相差
+ *   序言压栈的字节数;而编译器在 ARM 态下维持 SP 的 8 字节对齐,压栈量必然是
+ *   8 的倍数 —— 所以"入口 8 对齐"与"这里 8 对齐"是同一件事。
+ *   (`bic` 那一步若被删掉,入口是 4 mod 8,这里读到的也还是 4 mod 8 ⇒ 必然检出。)
+ *
+ * ⚠ 这条判据会随编译器改变序言而失效吗:不会。它依赖的只有"ARM 态下序言
+ *   压栈量是 8 的倍数",而那是 AAPCS 对**编译器自己**的要求 —— 编译器若违反,
+ *   它生成的所有调用都会出问题,远早于这里被发现。
+ */
+static u32 g_c_handler_sp_bad;
+
+u32 c_handler_sp_violations(void)
+{
+    return g_c_handler_sp_bad;
+}
+
+static void c_handler_sp_check(void)
+{
+    if ((arch_read_sp() & 7u) != 0u) {
+        g_c_handler_sp_bad++;
+    }
+}
+
 /* ret 必须落在内核 .text 里(链接脚本给的界)*/
 extern char __text_start[];
 extern char __text_end[];
@@ -828,6 +867,7 @@ arm_exc_frame_t *c_svc_handler(arm_irq_frame_t *frame)
 {
     u32 imm = 0u;
 
+    c_handler_sp_check(); /* ★ D7:与 c_irq_handler 同一条判据 ★ */
     g_last_pc_fix = ARM_EXC_PC_FIX_SVC;
     if (frame != NULL) {
         g_last_svc_frame = (u32)(uintptr_t)frame;

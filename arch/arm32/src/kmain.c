@@ -2465,6 +2465,15 @@ void kmain(void)
      */
     console_printf(" Irq frame   : 4-mod-8 SP seen %u times (legal, informational)\n",
                    irq_frame_unaligned8());
+    /*
+     * ★ D7:被中断的 SP 是 4 mod 8 是**合法**的(所以上面那条只统计、不判失败),
+     *   但**调 C 处理函数那个边界**必须 8 字节对齐 —— 那是硬的,由
+     *   `_vec_irq`/`_vec_svc` 里的 `bic sp, sp, #7` 保证。
+     *   这里打出来是为了让"修之前/之后"在日志上直接可比;
+     *   真正的判据是报告里的 `c_handler_sp_aligned`。
+     */
+    console_printf(" Irq frame   : C handler entry SP misaligned %u times (修复前它应当等于上面那个数)\n",
+                   c_handler_sp_violations());
 
     selftest_begin();
     /*
@@ -2604,6 +2613,16 @@ void kmain(void)
      * 不是抽样。必须恒为 0。
      */
     selftest_report("irq_frame_violations", irq_frame_violations(), 0u, SELFTEST_EQ);
+
+    /*
+     * ---- ★ D7:C 处理函数入口的 SP 必须 8 字节对齐 ★ ----
+     *
+     * AAPCS 要求"公开接口处 SP 8 字节对齐",而异常帧的位置是 `S - 64`,
+     * 会继承被中断栈的对齐 —— 实测一轮启动里有 20~28 次 S 是 4 mod 8
+     * (被中断的代码在 libgcc 的 Thumb 函数 `__udivmoddi4` 里)。
+     * 修法是在 `bl` 之前把 SP 对齐(帧不动),这一条直接量它。
+     */
+    selftest_report("c_handler_sp_aligned", c_handler_sp_violations(), 0u, SELFTEST_EQ);
 
     /*
      * ---- 协作式上下文切换原语(M4-7 后半段)----
