@@ -31,6 +31,7 @@
 #include <arch/palloc.h>
 #include <arch/percpu.h>
 #include <arch/platform.h>
+#include <arch/sched.h>
 #include <arch/selftest.h>
 #include <arch/shell.h>
 #include <arch/tcb.h>
@@ -181,6 +182,58 @@ static int g_svc_frame_check = -1;
 
 /* M4-6:TCB 里 ctx 偏移的运行时自检结果(-1 = 没跑过) */
 static int g_tcb_ctx_check = -1;
+
+/* ---- M4-8.3:协作式调度的自检状态 ---- */
+static arm_task_ctx_t g_sched_return; /* 测试的"回程点" */
+static arm_task_ctx_t g_sched_throw;  /* 线程离开时的丢弃槽 */
+static u32            g_yield_a;
+static u32            g_yield_b;
+static u32            g_yield_ok;
+static u32            g_yield_switches;
+static u32            g_yield_local_ok;
+
+#define YIELD_ROUNDS 8u
+
+/*
+ * 两个探针线程:各自累加一个计数,然后主动让出。
+ *
+ * 它们**故意不做别的事** —— 这一步要验的是"协作式切换本身"能不能工作,
+ * 把业务混进来只会让失败时不好归因。真正的工作负载在 M4-8.4(1Hz 状态行)。
+ *
+ * 干完活之后**切回测试的回程点**而不是停在原地:线程没有"退出"这个概念,
+ * 停在这里就等于把一个死线程留在就绪队列里。
+ */
+static void yield_probe_a(void *arg)
+{
+    u32 i;
+
+    (void)arg;
+    for (i = 0; i < YIELD_ROUNDS; i++) {
+        g_yield_a++;
+        sched_yield();
+    }
+
+    arch_ctx_switch(&g_sched_throw, &g_sched_return); /* 交回测试 */
+    for (;;) {
+        arch_wfi();
+    }
+}
+
+static void yield_probe_b(void *arg)
+{
+    u32 i;
+
+    (void)arg;
+    for (i = 0; i < YIELD_ROUNDS; i++) {
+        g_yield_b++;
+        sched_yield();
+    }
+
+    arch_ctx_switch(&g_sched_throw, &g_sched_return);
+    for (;;) {
+        arch_wfi();
+    }
+}
 
 /* M4-7:异常帧是否落在 SVC 栈区(1 = 在,0 = 不在)*/
 static u32 g_exc_frame_on_svc_stack;
@@ -1636,6 +1689,56 @@ void kmain(void)
         }
     }
 
+    /* ---- 9.8 协作式调度(M4-8.3) ---- */
+    /*
+     * 位置:必须在**自检报告之前**,这样它的结论能进报告 ——
+     * 而它本身又必须在所有"启动期基础设施"之后(palloc / heap / 栈池),
+     * 因为线程要用它们。
+     *
+     * 做法:把当前(启动)上下文当成一个可回程的参与者 ——
+     * `arch_ctx_save` 设一个回程点,然后把控制权交给调度器。
+     * 两个线程各跑 8 轮、互相让出,最后切回回程点。
+     *
+     * 判据(全部是二值的):
+     *   - 两个计数都正好到 8:说明两个线程都真的跑到了,
+     *     而且**互相让出**都成功了(少一次让出后面这个数就到不了)
+     *   - 切换次数明显大于轮数:说明切换真的在发生
+     *   - 回程之后 kmain 的局部变量完好:说明切换没有踩坏别人的栈
+     */
+    {
+        volatile u32 local_check = 0xC0FFEE00u;
+
+        sched_kern_bind(&g_kstack, &g_heap);
+        sched_kern_init();
+
+        g_yield_a = 0u;
+        g_yield_b = 0u;
+
+        if (sched_kthread_create(yield_probe_a, NULL, "ya") == NULL ||
+            sched_kthread_create(yield_probe_b, NULL, "yb") == NULL) {
+            console_puts(" Sched       : kthread_create FAILED\n");
+        } else {
+            console_printf(" Sched       : 2 threads created, stack pool used=%u\n",
+                           g_kstack.used_slots);
+
+            if (arch_ctx_save(&g_sched_return) == 0u) {
+                g_sched_return.r[0] = 1u;
+                sched_kern_start(); /* 不返回:交棒给第一个线程 */
+            }
+
+            g_yield_switches  = sched_switch_count();
+            g_yield_local_ok  = (local_check == 0xC0FFEE00u) ? 1u : 0u;
+            g_yield_ok        = ((g_yield_a == YIELD_ROUNDS) && (g_yield_b == YIELD_ROUNDS) &&
+                                 (g_yield_switches > YIELD_ROUNDS)) ? 1u : 0u;
+
+            console_printf(" Sched       : a=%u/%u b=%u/%u switches=%u local=%s\n", g_yield_a,
+                           YIELD_ROUNDS, g_yield_b, YIELD_ROUNDS, g_yield_switches,
+                           g_yield_local_ok ? "PASS" : "FAIL");
+            console_printf(" Sched       : cooperative switching = %s\n",
+                           g_yield_ok ? "PASS" : "FAIL");
+        }
+    }
+
     /* ---- 10. 启动自检总账 ---- */
     /*
      * 位置:所有自检都跑完之后、主循环之前。
@@ -1785,6 +1888,16 @@ void kmain(void)
      *   stack      最要紧的一项:B 跑在**别人的栈**上(不换栈不会报任何错)
      *   switch_ab  上面那条判据**承重性**的对照:故意不换栈时必须能检出
      */
+    /*
+     * ---- 协作式调度(M4-8.3)----
+     *
+     * 三项分开:计数到没到、切换有没有真发生、切换有没有踩坏别人的栈。
+     * 第三项是 M4-7 那套判据的复用 —— 调度器错了往往先表现在这里。
+     */
+    selftest_report("sched_yield_rounds", g_yield_ok, 1u, SELFTEST_EQ);
+    selftest_report("sched_switches", (g_yield_switches > YIELD_ROUNDS) ? 1u : 0u, 1u, SELFTEST_EQ);
+    selftest_report("sched_caller_intact", g_yield_local_ok, 1u, SELFTEST_EQ);
+
     selftest_report("switch_ctx_a", g_sw_ctx_a_ok, 1u, SELFTEST_EQ);
     selftest_report("switch_ctx_b", g_sw_ctx_b_ok, 1u, SELFTEST_EQ);
     selftest_report("switch_stack_isolated", g_sw_stack_ok, 1u, SELFTEST_EQ);
