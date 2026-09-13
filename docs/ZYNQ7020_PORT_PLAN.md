@@ -1548,6 +1548,20 @@ D3（FP 上下文）那一次的经历值得作为规程固定下来：
 (睡醒的任务应当排在纯占用的任务之前 → 可二值判定)。
 剩下的(LED / shell / 心跳)仍留到 M4-11。
 
+#### M4-8 的执行分解(按此顺序做,每步都能单独交代)
+
+| # | 内容 | 验收 |
+|---|---|---|
+| **M4-8.1** | 补 §4.7 记下的接口缺口:`spin_t` 加 CPSR 字段 + `spin_init`/`spin_lock_no_irqsave`/`spin_unlock_no_irqstore`/`barrier`;`percpu_t` 加 `sched_queue` 与 `scheduler_ticks` | 宿主测 + 偏移断言 |
+| **M4-8.2** | **纯逻辑调度器** `src/sched.c`:`sched_account_run`(计费 vruntime/deadline)、`sched_pick`(deadline 最小者,同 deadline 按 vruntime)、`sched_wakeup`(睡醒补偿)、`sched_slice`(夹到 [MIN,BASE])、就绪队列的插入/摘除不变量 | **宿主穷尽测**(这是策略的**唯一**判据,见上面的验证分工) |
+| **M4-8.3** | 接进内核:`src/sched_hw.c` 切栈(走 M4-7 的 `arch_ctx_switch`)+ 就绪队列 + **idle 线程(WFI)** | 板上:idle 路径自旋计数不涨而 tick 照常来 |
+| **M4-8.4** | **把 1Hz 状态行改成内核线程**(第一个真活) | 板上:它仍在输出,且与一个纯占用线程按顺序交替 |
+| **M4-8.5** | 无饥饿判据:每 N 个 tick 内每个可运行线程都推进过 ≥1 | 板上二值 |
+
+**注意 M4-8.3 与 M4-9 的分界**:M4-8 的切换是**协作式**的(线程自己让出),
+M4-9 才在异常返回路径上做抢占。所以 M4-8 的 `arch_ctx_switch` 不需要动 CPSR ——
+这与 M4-7 定下的分工一致。
+
 **④ M4-10 不挪** —— 严格按 M4-8 → M4-9 → M4-10 → M4-11 一路做完单核到 SMP。
 理由:可睡眠的 `mutex`(M4-11)要先在单核上定形,若先做 fs 再回头做 SMP 调度,
 可能会反过来改 `mutex` 的语义。

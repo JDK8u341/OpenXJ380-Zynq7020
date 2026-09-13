@@ -282,7 +282,15 @@ struct arm_thread_control_block
 
     /* ---- 架构无关(继续照抄 `pcb.h:175-219`) ---- */
     u32 queue_index;      /* `pcb.h:175` size_t 调度队列索引 */
-    void *sched_node;     /* `pcb.h:176` lock_node*(M4-8 的调度队列节点)*/
+    /*
+     * 就绪队列的侵入式节点(M4-8)。
+     *
+     * 源 OS 用 `lock_node *sched_node`(`pcb.h:176`)指向队列自己分配的节点。
+     * ARM 侧改成**内嵌的 next 指针**:队列不需要额外分配,宿主测试里
+     * 也就不需要构造一个分配器。语义(能被挂进一个按 deadline 有序的队列、
+     * 能被摘下来)是一样的。
+     */
+    tcb_t sched_next;
     u32 group_index;      /* `pcb.h:177` size_t 进程队列索引 */
     u32 main;             /* `pcb.h:178` uint64_t 线程入口地址 */
     u32 user_stack;       /* `pcb.h:179` 用户栈 */
