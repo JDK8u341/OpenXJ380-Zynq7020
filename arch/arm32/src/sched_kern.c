@@ -216,51 +216,46 @@ tcb_t sched_kthread_create(void (*entry)(void *), void *arg, const char *name)
     t->ctx.pc   = (u32)(uintptr_t)entry;
 
     /*
-     * ★★★ 先修:模式位 ★★★
+     * ★★★ 先修:模式位 —— 以及它引出的第二次修正 ★★★
+     *
+     * ## 第一次修正(用户点名的那处)
      *
      * 这里原本写的是 `0u`,注释说"协作式切换不动 CPSR,这里只是记录"。
      * 那句话在 M4-8 成立,在 M4-9 **不再成立** —— 帧路径会用 `rfeia`
      * 把这个值**真的装进 CPSR**。
      *
-     * ## `0` 到底是什么(这一条我先前写错了,已按架构改正)
+     * 而 `0` 的 CPSR.M[4:0] = **0b00000**,不是一个已分配的模式编码
+     * (AArch32 里每个合法模式的 bit4 都是 1,见 taskctx_asm.h 的 ARM_MODE_*),
+     * 按架构把它装回 CPSR 是 UNPREDICTABLE。
      *
-     * 我先前的说法是"0 = User 模式 + 中断全开"。**不对。**
-     * AArch32 的 CPSR.M[4:0] 里,**每一个已分配的模式编码 bit4 都是 1**:
+     * ## 第二次修正(上板打回来的)
      *
-     *     USR 0b10000   FIQ 0b10001   IRQ 0b10010   SVC 0b10011
-     *     MON 0b10110   ABT 0b10111   HYP 0b11010   UND 0b11011   SYS 0b11111
+     * 我先改成 `ARM_MODE_SVC | ARM_CPSR_F_BIT` = **0x53**,推理是
+     * "模式要 SVC、I 要为 0 否则抢占无效、F 要为 1 因为 start.S 是这么设的"。
+     * 听起来完整,但**漏了一位**:上板后切到新线程的**第一条指令**就
+     * Data Abort(FS = 0x16,异步外部中止),而 ctx.sp / ctx.pc 全是对的。
+     * JTAG 读回真值:
      *
-     * (本项目的表就在 arch/taskctx_asm.h 的 ARM_MODE_*,一眼可核。)
+     *     内核真实 CPSR(idle 被抢占时收进 ctx 的)= 0x80000153
+     *     我造出来的                              = 0x00000053
+     *                                              ^^^ bit8 = A
      *
-     * `0` 的 M[4:0] = **0b00000**,bit4 = 0 —— 它**不是任何一个模式**,
-     * 而是一个未分配的编码。按架构,把这样一个值装回 CPSR 是
-     * **UNPREDICTABLE**。
+     * `A`(bit 8,异步中止屏蔽)是复位值 1,而 **`msr cpsr_c` 碰不到 bit8**
+     * (`cpsr_c` 只含 bits[7:0])—— 所以 start.S 那句 `MODE_SVC|I|F`
+     * 从头到尾没动过 A,内核跑起来之后 A 恒为 1。
+     * 把它写成 0 = 在切过去的那一刻解除了异步外部中止的屏蔽。
      *
-     * ⇒ 真正的理由不是"它会变成用户态",而是**它什么都不是**:
-     *   代码的意图是"内核线程跑在 SVC 模式",而写下来的却是一个未定义值。
-     *   本项目**刻意没有去实测** Cortex-A9 遇到它会怎样 ——
-     *   那是故意制造 UB,不是值得花上板时间的问题。
-     *
-     * ## 正确值从哪来
-     *
-     * ← 源 OS 造内核线程时写的是 `context0.rflags = 0x202`(bit9 IF = 1,
-     *   即"中断开着"),段选择子 `cs = 0x8` 是**内核**代码段。
-     *   两者合起来的语义 = "SVC 模式 + IRQ 使能"。
-     *
-     * ARM 侧的对应值:
-     *     ARM_MODE_SVC | ARM_CPSR_F_BIT  =  0x13 | 0x40  =  0x53
+     * ⇒ 所以现在**不再手拼这个值**,用唯一的那个常量 `ARM_CPSR_KERNEL`
+     *   (定义与完整经过在 arch/taskctx.h),并且由
+     *   `sched_ctx_switchable()` 在每次切换前核对 A/T/模式位 ——
+     *   写错了会被**拒绝切换**(可诊断),而不是让核心带着一个错的 CPSR 跑。
+     *   板级还有一条 `sched_cpsr_kernel` 自检,拿这个常量与
+     *   "收现场时真的读到的 CPSR"对账。
      *
      * ⚠ I 位必须**为 0**:I=1 的线程永远不会被 tick 打断,抢占对它无效 ——
      *   而且那不会报错,只表现为"这个线程独占 CPU"。
-     * ⚠ F 位必须**为 1**(屏蔽 FIQ):本内核所有中断都走 IRQ,GIC 也没配
-     *   FIQ 组。`start.S` 从建立模式栈那一刻起就一直是 `MODE_SVC|I|F`,
-     *   正常内核代码跑起来时 `arch_ctx_save` 读到的 CPSR 就是 **0x53** ——
-     *   新线程与"被抢占的线程"于是有同一个 CPSR,两条路径不会分叉。
-     *
-     * 这个值不再是"只是记录":`sched_ctx_switchable()` 会核对它的模式位,
-     * 写错了在那里就会被拒绝切换,而不是让一个未定义的 CPSR 上 CPU。
      */
-    t->ctx.cpsr = ARM_MODE_SVC | ARM_CPSR_F_BIT;
+    t->ctx.cpsr = ARM_CPSR_KERNEL;
 
     /* ---- 调度状态 ---- */
     sched_entity_init(t, sched_queue_avg_vruntime(q, NULL, 0u));
@@ -405,12 +400,17 @@ void sched_register_boot_idle(void)
     g_boot_idle_tcb.ctx.sp       = arch_read_sp();
     g_boot_idle_tcb.ctx.pc       = 0u; /* ★ 0 = 上下文无效(第一次切走前)★ */
     /*
-     * ⚠ cpsr 必须显式写成内核的正常 CPSR(0x53 = SVC + 屏蔽 FIQ)。
+     * ⚠ cpsr 必须写成内核的规范 CPSR(见 arch/taskctx.h 的 ARM_CPSR_KERNEL)。
+     *
      *   留成 0 会让 `sched_ctx_switchable()` 判定"不可切换",
      *   于是 idle 被切走一次之后就永远回不来了 —— 自检报告再也打不出来。
-     *   (与 sched_kthread_create 里那个"先修"是同一条理由。)
+     *
+     *   注意:**这个值不久之后就会被真实值覆盖** —— 第一次从 idle 切走时
+     *   `sched_ctx_from_frame()` 会把现场帧里的 spsr 收进来(板上实测是
+     *   0x80000153)。所以它只在"被第一次切走之前"这一段有效,
+     *   而恰好就是那一段需要它(A/T/模式位要能过 `sched_ctx_switchable`)。
      */
-    g_boot_idle_tcb.ctx.cpsr    = ARM_MODE_SVC | ARM_CPSR_F_BIT;
+    g_boot_idle_tcb.ctx.cpsr    = ARM_CPSR_KERNEL;
     g_boot_idle_tcb.owns_kstack = false; /* 它就是启动栈,不归栈池管 */
     for (i = 0; i < sizeof(g_boot_idle_tcb.name) - 1u && "idle"[i] != '\0'; i++) {
         g_boot_idle_tcb.name[i] = "idle"[i];
@@ -597,6 +597,25 @@ arm_exc_frame_t *sched_tick(arm_exc_frame_t *frame)
         return frame;
     }
 
+    /*
+     * ---- 3b. 新帧先在**只读**的前提下算出来 ----
+     *
+     * ⚠ 顺序上这一句必须在状态迁移之前。第一版把它放在迁移之后,于是
+     *   "算不出帧"那一支就成了一个**半途而废的切换**:cur 已经重新入队、
+     *   next 已经被摘下来并置成 RUNNING —— 放弃之后 current 反而是个
+     *   队列成员,next 则永远不再被挑中。那种状态歪得很安静,比"不切换"
+     *   难查得多。
+     *
+     *   现在两步都只依赖 `sched_ctx_switchable()`,所以第二步在正常路径上
+     *   不可能失败;真失败了也没有任何状态被改过,直接返回即可。
+     */
+    nf = sched_frame_for(next);
+    if (nf == NULL) {
+        g_tick_invalid_ctx++;
+        pc->scheduler_ticks = 0u;
+        return frame;
+    }
+
     /* ---- 4. 状态与队列(← `timer_handle:436-441`)---- */
     if (cur->status == RUNNING) {
         cur->status = START;
@@ -626,19 +645,7 @@ arm_exc_frame_t *sched_tick(arm_exc_frame_t *frame)
      */
     sched_ctx_from_frame(cur, frame);
 
-    /* 5b. 在**目标任务自己的栈上**搭新帧 */
-    nf = sched_frame_for(next);
-    if (nf == NULL) {
-        /*
-         * 第 3 步已经查过一遍,理论上到不了这里。
-         * 真到了就**放弃切换**而不是硬写 —— `nf` 是野指针时写 64 字节
-         * 会静默踩坏别的栈,那种错比"不切换"难查得多。
-         * (状态已经改了,世界会有点歪;但那一支本来就表示"有更严重的错"。)
-         */
-        g_tick_invalid_ctx++;
-        pc->scheduler_ticks = 0u;
-        return frame;
-    }
+    /* 5b. 在**目标任务自己的栈上**搭新帧(地址已在 3b 算好)*/
     (void)sched_frame_from_ctx(next, nf);
 
     sched_set_current(next);

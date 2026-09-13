@@ -196,6 +196,8 @@ static u32 g_tick_switched;    /* tick 里真的搬了帧的次数 */
 static u32 g_tick_preempted;   /* 其中被换下的是真实线程的次数 */
 static u32 g_tick_invalid_ctx;
 static u32 g_idle_pc_was_zero;   /* 注册时 idle->ctx.pc == 0(还没被切走过)*/
+static u32 g_cpsr_kernel_ok;     /* 手写的 ARM_CPSR_KERNEL 与板上实测的 CPSR 一致 */
+static u32 g_cpsr_seen;          /* 板上实测的 CPSR(被抢占时收进 idle 的 ctx)*/
 static u32 g_idle_pc_harvested;  /* 跑完之后 != 0(启动现场真的被收进了 ctx)*/
 static u32 g_spin_ok;            /* 两个见证都成立 */
 static u32 g_spin_sp_isolated;   /* 两个线程的 sp 都没掉出自己栈区 */
@@ -1942,6 +1944,7 @@ void kmain(void)
          *  判据写错了不是代码错了。)
          */
         if (sched_kthread_create(acc_probe, NULL, "acc") == NULL) {
+            sched_enable();
             console_puts(" Sched acc   : kthread_create FAILED\n");
         } else {
             sched_enable();
@@ -1955,22 +1958,35 @@ void kmain(void)
         }
 
         /* ---- 相 1:陷阱式让出(svc #ARM_SVC_YIELD)---- */
+        /*
+         * ⚠ `sched_disable()` 与 `sched_enable()` **必须成对** ——
+         *   包括创建失败那一支。第一版只在成功分支里 enable,于是
+         *   一旦 kthread_create 失败(堆或栈池满了),调度器就被永久关掉:
+         *   已经建好的线程永远不会被切到,这一相"什么也没测到",
+         *   而输出看起来只是一条 FAIL。下一相又会把它打开,
+         *   于是错误会以一个和根因毫无关系的样子往下传。
+         */
         sched_disable();
-        if (sched_kthread_create(yield_probe_a, NULL, "ya") == NULL ||
-            sched_kthread_create(yield_probe_b, NULL, "yb") == NULL) {
-            console_puts(" Sched       : kthread_create FAILED\n");
-        } else {
-            /*
-             * 两个线程各让出 8 轮。判据是**两边都正好到 8** ——
-             * 等号而不是"大于零":少一次说明让出丢了,多一次说明有重入。
-             *
-             * 跑完之后它们**挂起自己**(sched_park_self),队列于是变空,
-             * 调度器兜底挑 idle —— 而 idle 就是 kmain,于是控制权回到这里。
-             * 整个过程没有一句"手动切回测试点"的代码:这是 M4-9 与 M4-8
-             * 最本质的差别。
-             */
+        {
+            tcb_t ya = sched_kthread_create(yield_probe_a, NULL, "ya");
+            tcb_t yb = sched_kthread_create(yield_probe_b, NULL, "yb");
+
             sched_enable();
-            timer_delay_ms(200);
+
+            if (ya == NULL || yb == NULL) {
+                console_puts(" Sched       : kthread_create FAILED\n");
+            } else {
+                /*
+                 * 两个线程各让出 8 轮。判据是**两边都正好到 8** ——
+                 * 等号而不是"大于零":少一次说明让出丢了,多一次说明有重入。
+                 *
+                 * 跑完之后它们**挂起自己**(sched_park_self),队列于是变空,
+                 * 调度器兜底挑 idle —— 而 idle 就是 kmain,于是控制权回到这里。
+                 * 整个过程没有一句"手动切回测试点"的代码:这是 M4-9 与 M4-8
+                 * 最本质的差别。
+                 */
+                timer_delay_ms(200);
+            }
         }
 
         g_yield_switches = sched_switch_count();
@@ -1999,10 +2015,11 @@ void kmain(void)
             tcb_t sa = sched_kthread_create(spin_probe_a, NULL, "sa");
             tcb_t sb = sched_kthread_create(spin_probe_b, NULL, "sb");
 
+            sched_enable();
+
             if (sa == NULL || sb == NULL) {
                 console_puts(" Sched preempt: kthread_create FAILED\n");
             } else {
-                sched_enable();
                 timer_delay_ms(SPIN_BUDGET_US / 1000u + 300u);
 
                 g_tick_switched    = sched_tick_switched();
@@ -2017,6 +2034,20 @@ void kmain(void)
                 g_spin_sp_isolated   = ((g_spin[0].sp_bad == 0u) && (g_spin[1].sp_bad == 0u)) ? 1u : 0u;
                 g_preempt_switches_ok = (g_tick_preempted >= 2u) ? 1u : 0u;
                 g_idle_pc_harvested  = (sched_boot_idle()->ctx.pc != 0u) ? 1u : 0u;
+                /*
+                 * ★ 手写常量 vs 板上实测:对一次账 ★
+                 *
+                 * `idle->ctx.cpsr` 是**被抢占那一刻**从现场帧里收进来的
+                 * 真实 CPSR(idle 的初值早已被它覆盖),所以拿它去问
+                 * "ARM_CPSR_KERNEL 描述的是内核真正在跑的状态吗" 是一个
+                 * 不依赖任何推理的判据。
+                 *
+                 * 这条判据的由来就是 M4-9 的那次故障:我把新线程的 CPSR
+                 * 拼成 0x53,漏了 A 位(真值 0x153),切过去第一条指令
+                 * 就吃了异步外部中止。见 arch/taskctx.h 的 ARM_CPSR_KERNEL。
+                 */
+                g_cpsr_kernel_ok = sched_cpsr_matches_kernel(sched_boot_idle()->ctx.cpsr) ? 1u : 0u;
+                g_cpsr_seen      = sched_boot_idle()->ctx.cpsr;
 
                 console_printf(" Sched preempt: a=%u b=%u saw=(%u,%u) sp_bad=(%u,%u) done=%u\n",
                                g_spin[0].count, g_spin[1].count, g_spin[0].saw_other,
@@ -2025,6 +2056,9 @@ void kmain(void)
                 console_printf(" Sched preempt: switched=%u preempted=%u invalid=%u idle_ctx=%s\n",
                                g_tick_switched, g_tick_preempted, g_tick_invalid_ctx,
                                g_idle_pc_harvested ? "harvested" : "STILL-INVALID");
+                console_printf(" Sched preempt: cpsr_kernel=0x%08X vs real=0x%08X -> %s\n",
+                               (u32)ARM_CPSR_KERNEL, g_cpsr_seen,
+                               g_cpsr_kernel_ok ? "PASS" : "FAIL(常量与内核实际状态不符!)");
                 console_printf(" Sched preempt: interleaving witness = %s\n",
                                g_spin_ok ? "PASS" : "FAIL");
             }
@@ -2045,6 +2079,21 @@ void kmain(void)
      * 而不是把一个本来能跑的系统拦在启动阶段。
      * 失败项数会写进心跳,挂死时用 JTAG 也能读到结论。
      */
+    /*
+     * ⚠ `irq_frame_unaligned8` **故意不作为自检项**,而且**必须打在报告区间之外**。
+     *
+     * 它不是"错了多少次",而是"有多少次被中断的代码 SP 是 4 mod 8"——
+     * 而那完全合法(AAPCS 只要求调用点 8 字节对齐)。把它写成
+     * `expect 0` 会让一个正常现象变成一条 FAIL,而 FAIL 多了就没人看了。
+     *
+     * 位置放在 `selftest_begin()` **之前**:验证脚本对报告区间内的非 CHECK 行
+     * 是**拒绝**的(它宁可报错也不肯漏检),所以信息性输出不能夹在里面 ——
+     * 这一点第一次就被它当场抓到了。
+     * (心跳区 32 个槽已经用满,所以只打印、不占槽。)
+     */
+    console_printf(" Irq frame   : 4-mod-8 SP seen %u times (legal, informational)\n",
+                   irq_frame_unaligned8());
+
     selftest_begin();
 
     selftest_report("uart_present", uart_present ? 1u : 0u, 1u, SELFTEST_EQ);
@@ -2232,6 +2281,15 @@ void kmain(void)
     selftest_report("sched_idle_ctx_harvested", g_idle_pc_harvested, 1u, SELFTEST_EQ);
     selftest_report("sched_idle_pc_was_zero", g_idle_pc_was_zero, 1u, SELFTEST_EQ);
     /*
+     * ---- 手写的 CPSR 常量 vs 板上实测 ----
+     *
+     * 这一条防的不是"代码写错了",而是"**我推理出来的那几位不全**"。
+     * M4-9 就栽在这里:新线程的 CPSR 我拼成 0x53,真值是 0x153 ——
+     * 差的 A 位一被清掉,异步外部中止立刻在随机位置投递。
+     * 完整经过见 arch/taskctx.h 的 ARM_CPSR_KERNEL。
+     */
+    selftest_report("sched_cpsr_kernel", g_cpsr_kernel_ok, 1u, SELFTEST_EQ);
+    /*
      * `invalid_ctx` 必须恒为 0:它不是"发生过多少件坏事"的计数,
      * 而是"调度器有没有挑到过不可切换的上下文"。挑了就是有 bug ——
      * 正常路径上 idle 的 pc==0 只在注册与第一次切走之间成立,
@@ -2344,13 +2402,43 @@ void kmain(void)
         cb = sched_kthread_create(spin_ctl_b, NULL, "cb");
 
         if (ca == NULL || cb == NULL) {
+            sched_enable();
             console_puts(" Preempt A/B : kthread_create FAILED\n");
         } else {
-            u32 switched_before = sched_tick_switched();
+            u32            sw_before;
+            u32            inv_before;
+            u32            inv_after;
+            arm_task_ctx_t idle_ctx_backup;
+
+            /*
+             * ★ 先把 idle 的现场**抄一份**再进对照组 ★
+             *
+             * 对照组期间 `current_task` 会在两个 ctl 线程之间轮转,而
+             * `sched_tick` 每次都把**发指令那一刻 kmain 的现场**收进
+             * "当时的 current" —— 其中就包括 idle。等对照组结束,
+             * `idle->ctx` 里装的是**窗口中间某一刻**的快照:sp 指向
+             * kmain 栈上某个已经不成立的调用深度。
+             *
+             * 现在不会用到它(队列空 + current==idle ⇒ 直接早退),
+             * 但那是"碰巧安全",不是"设计安全":将来任何一相只要造一个
+             * 会挂起的线程,idle 就会被重新挑中,`rfeia` 会拿着那个陈旧
+             * 快照从 `timer_delay_ms` 中间把 kmain 重新跑起来 ——
+             * 而它的栈已经退掉了。所以老老实实备份再还原。
+             */
+            idle_ctx_backup = sched_boot_idle()->ctx;
+
+            sw_before  = sched_tick_switched();
+            /*
+             * ⚠ 两个计数都要**在窗口前后各取一次**再打差值,不能只打一个
+             *   末值 —— 理由见下面"慢串口"那段。
+             */
+            inv_before = sched_tick_invalid_ctx();
 
             g_reloc_skip = 1u; /* ★ 对照组:决策照做,不交出目标帧 ★ */
             sched_enable();
             timer_delay_ms(SPIN_BUDGET_US / 1000u + 200u);
+
+            inv_after = sched_tick_invalid_ctx();
             g_reloc_skip = 0u;
 
             g_reloc_ctl_a = g_spin_ctl[0].count;
@@ -2361,34 +2449,76 @@ void kmain(void)
              *   1. 两个探针计数都是 0(线程一次都没跑起来);
              *   2. 这期间**确实做了切换决策**(否则"没跑起来"只是因为
              *      压根没人被挑中,那就什么也证明不了)。
+             *
+             * ⚠ 这一相里**完整的切换只有头两次**,而且判据里那个 `>`
+             *   比较的就是"这期间到底有没有真的搬过帧"。别再把它写成
+             *   "current_task 轮转了好几遍" —— 那是错的说法:实测窗口内
+             *   `switched` 只涨 2、`invalid` 一次都没涨(见下面那段留痕)。
+             *
+             * ⚠★ 慢串口效应:**打印本身要花掉几十毫秒,而那期间系统还在跑。**
+             *   9600 波特下一行 60 多个字符要传 60~80ms,约等于几十到上百发 tick。
+             *   所以"先打印一个计数、之后再从 JTAG 读同一个计数"必然对不上 ——
+             *   差的不是误差,是**打印期间真的又发生了事情**。
+             *   办法就是窗口前后各取一次、打差值(下面收拾挪到打印之前,
+             *   也是同一个道理:别让"半复位状态"横跨慢 I/O)。
              */
             g_reloc_ctl_detected =
                 ((g_reloc_ctl_a == 0u) && (g_reloc_ctl_b == 0u) &&
-                 (sched_tick_switched() > switched_before))
+                 (sched_tick_switched() > sw_before))
                     ? 1u
                     : 0u;
-
-            console_printf(" Preempt A/B : skip_frame -> a=%u b=%u switched=%u\n", g_reloc_ctl_a,
-                           g_reloc_ctl_b, sched_tick_switched() - switched_before);
-            console_printf(" Preempt A/B : 未搬帧 -> %s(这就是「决策说切了、执行流没动」的样子)\n",
-                           g_reloc_ctl_detected ? "检出" : "未检出 —— 判据不承重!");
 
             /*
              * ---- 收拾:对照组把状态搅歪了,必须复位 ----
              *
-             * 两个 ctl 线程**从来没跑过**,它们的 ctx 在对照组期间被
-             * 收进去的是 **kmain 的现场**(因为 `current_task` 被轮转到了
-             * 它们身上)—— 那是垃圾,所以只能把它们挂起,不能留着。
-             * 队列里也可能还挂着它们,所以整队复位。
+             * ⚠ **收拾必须在任何打印之前。**
+             *
+             * 9600 波特下一行要传 60~80ms,而这期间 tick 一直在跑。窗口结束时
+             * `current_task` 还指着 ctl 线程、就绪队列里还挂着另一个 ——
+             * 于是每一发 tick 都走进"决策 → 目标上下文不可切换 → 拒绝"，
+             * `invalid` 在**打印过程中**一路涨。
+             *
+             * 实测:窗口前后各取一次是 `invalid=0->0`,而同一轮结束后从 JTAG
+             * 读同一个计数是 **78** —— 差的全部来自打印与收尾之间那几百毫秒。
+             * 这既是"先打印再复位"的直接后果，也说明**慢串口会让'打印之后再读'
+             * 这种取数方式必然对不上**。
+             *
+             * 另外两个 ctl 线程**从来没跑过**,它们的 ctx 在对照组期间被收进去的
+             * 是 kmain 那一刻的现场(那发 IRQ 的帧在 kmain 的启动栈上,
+             * 落在它们自己那块栈区之外) —— 那是垃圾,只能挂起,不能留着。
              */
             ca->status      = WAIT;
             ca->wakeup_time = 0u;
+            ca->sched_next  = NULL;
             cb->status      = WAIT;
             cb->wakeup_time = 0u;
+            cb->sched_next  = NULL;
+            g_reloc_skip    = 0u;
 
             sched_set_current(sched_boot_idle());
             sched_boot_idle()->status = RUNNING;
+            sched_boot_idle()->ctx    = idle_ctx_backup; /* ★ 见上面那段说明 ★ */
             sched_kern_init();
+
+            console_printf(" Preempt A/B : skip_frame -> a=%u b=%u switched=%u invalid=%u->%u\n",
+                           g_reloc_ctl_a, g_reloc_ctl_b, sched_tick_switched() - sw_before,
+                           inv_before, inv_after);
+            console_printf(" Preempt A/B : 未搬帧 -> %s(这就是「决策说切了、执行流没动」的样子)\n",
+                           g_reloc_ctl_detected ? "检出" : "未检出 —— 判据不承重!");
+            /*
+             * ⚠ 一条**没有查清**的观察,如实记下来而不是编个解释:
+             *
+             *   窗口内 `switched` 只涨 2(第 1 次 idle→ca、第 2 次 ca→cb),
+             *   而 `invalid` 一次都没涨。按代码推演,第 2 次之后 ca 的 ctx 已经
+             *   被收成了 kmain 的现场,`sched_ctx_switchable(ca)` 应当开始
+             *   持续拒绝它 —— 也就是说 `invalid` 应当在窗口内就涨起来。
+             *   **实测是 0**,原因未查清。
+             *
+             *   它不影响任何判据:检出的两个条件(线程一次没跑、决策确实发生过)
+             *   都由实测值支撑,而且对照组窗口内的 `switched=2 > 0` 是真的。
+             *   但"推演与实测不符"这件事本身要留痕,交给 M4-10(每核队列 +
+             *   负载均衡会重写这一片)去查,别让它悄悄消失。
+             */
         }
     }
 

@@ -103,7 +103,19 @@ typedef struct
      * 就绪队列本体在 sched_kern.c 里(每核一个 `sched_queue_t`)。
      * 要在 JTAG 上看队列,读那个静态数组的地址即可。
      */
-    u64 scheduler_ticks; /* 本核已调度的 tick 数(诊断用,不是派生量)*/
+    /*
+     * 本核的调度时间片计数。
+     *
+     * ⚠ 它**不是一个只增不减的累计量** —— 它就是源 OS 的
+     *   `cpu->scheduler_ticks`(`scheduler.cpp:403`):current 每跑一个 tick
+     *   加一,到 `TIME_SLICE` 就触发一次"该换人了",然后**被清零**;
+     *   `sched_yield()` 也会把它直接设成 `TIME_SLICE` 来表达"这一片用完了"。
+     *
+     *   (这里原来写的是"本核已调度的 tick 数(诊断用)",那是 M4-8 的旧说法:
+     *    当时它只被读取、从不参与判断。M4-9 起它是抢占的判据之一,
+     *    累计量是 `percpu_t.ticks`。)
+     */
+    u64 scheduler_ticks;
 } percpu_t;
 
 /* 把 current_task 取成 tcb_t。集中在一处,避免散落的强制转换 */

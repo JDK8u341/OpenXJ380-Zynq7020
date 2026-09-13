@@ -391,25 +391,58 @@ int main(void)
 
         /* ---- 12b. sched_ctx_switchable:四条拒绝理由,逐条钉 ---- */
 
-        /* (1) pc == 0 = 上下文无效(启动上下文在被第一次切走之前) */
+        /* (1) pc == 0 = 上下文无效(启动上下文在被第一次切走之前)
+         *     ⚠ cpsr 给一个**合法**值,否则这一条会同时踩中理由 2,
+         *       判据就不专一了(失败时看不出是哪一条拦下的)。*/
         t.ctx.pc   = 0u;
         t.ctx.sp   = sp32;
-        t.ctx.cpsr = ARM_MODE_SVC;
+        t.ctx.cpsr = ARM_CPSR_KERNEL;
         CHECK(!sched_ctx_switchable(&t));
         CHECK(sched_frame_for(&t) == NULL);
 
-        /* (2) ★ cpsr 的模式位不是 SVC ★
+        /* (2) ★ cpsr 的 A / T / 模式位必须与内核一致 ★
          *
-         *     `0` 的 CPSR.M[4:0] = 0b00000。AArch32 里**每一个已分配的
-         *     模式编码 bit4 都是 1**(USR 0b10000、SVC 0b10011、SYS 0b11111…),
-         *     所以 0 不是"User 模式",而是**一个未分配的编码** ——
-         *     按架构把它装回 CPSR 是 UNPREDICTABLE。
+         *     这一条是被一次真实的上板故障逼出来的,判据也照着那次事故写:
          *
-         *     这正是 M4-9 开工时 `sched_kthread_create` 里真实写着的值
-         *     (注释还写着"协作式切换不动 CPSR,这里只是记录" ——
-         *     那句话在帧路径上线的那一刻就失效了)。
-         *     所以它必须有一条判据,而且判据要钉的是"**必须是 SVC**",
-         *     不是"必须是某个我们猜的模式"。 */
+         *       内核真实 CPSR(被抢占时从现场帧收进来的)= 0x80000153
+         *       我手写的新线程 CPSR                      = 0x00000053
+         *                                                 ^^^ bit8 = A
+         *
+         *     `msr cpsr_c` 只含 bits[7:0],所以 start.S 那句
+         *     `MODE_SVC|I_BIT|F_BIT` 从来没动过 A;A 是复位值 1。
+         *     把它写成 0 = 在切过去的一瞬间解除了异步外部中止的屏蔽,
+         *     于是第一条指令就吃了 FS=0x16 的异步中止(而 DFAR 是垃圾值)。
+         */
+        CHECK(ARM_CPSR_KERNEL == 0x153u);
+        CHECK((ARM_CPSR_KERNEL & ARM_CPSR_MODE_MASK) == ARM_MODE_SVC);
+        CHECK((ARM_CPSR_KERNEL & ARM_CPSR_A_BIT) != 0u); /* ★ A=1 ★ */
+        CHECK((ARM_CPSR_KERNEL & ARM_CPSR_F_BIT) != 0u); /* FIQ 屏蔽 */
+        CHECK((ARM_CPSR_KERNEL & ARM_CPSR_I_BIT) == 0u); /* ★ I=0,否则抢占无效 ★ */
+        CHECK((ARM_CPSR_KERNEL & ARM_CPSR_T_BIT) == 0u); /* ARM 态 */
+
+        /* 板上实测到的那个真值必须满足同一条谓词 */
+        CHECK(sched_cpsr_matches_kernel(0x80000153u)); /* idle 被抢占时收的现场 */
+        CHECK(sched_cpsr_matches_kernel(0x00000153u));
+        /* ★ 我第一版拼出来的那个值必须被拒绝 ★ */
+        CHECK(!sched_cpsr_matches_kernel(0x00000053u));
+        /* I 位不参与:关中断的临界区里发生 svc 陷阱是合法的 */
+        CHECK(sched_cpsr_matches_kernel(0x000001D3u)); /* A|I|F|SVC */
+        /*
+         * ★ T 位也不参与 ★ —— 这一条是**板上打回来的第二次**。
+         *
+         * 第一版把 T 纳入了判定,理由是"内核是 .arm 编的,T 必然是 0"。
+         * 上板立刻否掉:一个被抢占的探针线程 ctx.cpsr 读回来是 0x173
+         * (**T=1**),pc 落在 `__udivmoddi4` 里 —— 那是 libgcc 的 **Thumb**
+         * 代码,而 `timer_read_us()` 的 64 位除法就会进到它里面。
+         * 于是每一个这样的上下文都被拒绝,invalid_ctx 涨到 45965,
+         * 线程卡在就绪队列里,启动流程再也回不来。
+         */
+        CHECK(sched_cpsr_matches_kernel(0x00000173u)); /* A|T|F|SVC:Thumb 态 */
+        CHECK(sched_cpsr_matches_kernel(0x20000173u)); /* 板上实测的那个值 */
+        /* 模式位参与 */
+        CHECK(!sched_cpsr_matches_kernel(0x00000153u & ~ARM_CPSR_MODE_MASK));
+        CHECK(!sched_cpsr_matches_kernel(0x00000153u & ~ARM_CPSR_A_BIT));
+
         t.ctx.pc   = 0x1234u;
         t.ctx.cpsr = 0u;
         CHECK((0u & ARM_CPSR_MODE_MASK) != ARM_MODE_SVC);
@@ -422,16 +455,35 @@ int main(void)
         CHECK(!sched_ctx_switchable(&t));
         t.ctx.cpsr = ARM_MODE_SYS; /* 特权,但**不是** SVC —— 同样拒绝 */
         CHECK(!sched_ctx_switchable(&t));
-        /* 中断屏蔽位不参与判定:FIQ 屏蔽开着才是内核的正常状态 */
-        t.ctx.cpsr = ARM_MODE_SVC | ARM_CPSR_F_BIT;
+        /* ★ A=0 必须被拒绝 —— 这正是那次上板故障的形态 ★ */
+        t.ctx.cpsr = 0x00000053u;
+        CHECK(!sched_ctx_switchable(&t));
+        /* 内核的规范值接受 */
+        t.ctx.cpsr = ARM_CPSR_KERNEL; /* 0x153 */
         CHECK(sched_ctx_switchable(&t));
-        t.ctx.cpsr = ARM_MODE_SVC; /* I=0/F=0 也接受 —— 只看模式域 */
+        /* I=1 也接受 —— 只看 A/模式域(见 ARM_CPSR_MUST_MATCH 的说明)*/
+        t.ctx.cpsr = ARM_CPSR_KERNEL | ARM_CPSR_I_BIT;
+        CHECK(sched_ctx_switchable(&t));
+        /* ★ T=1 也接受 —— libgcc 的 Thumb 代码就是这种形态 ★ */
+        t.ctx.cpsr = 0x20000173u;
         CHECK(sched_ctx_switchable(&t));
 
-        /* (3) sp 必须 8 字节对齐(AAPCS)与非 0 */
-        t.ctx.cpsr = ARM_MODE_SVC;
-        t.ctx.sp   = sp32 + 4u;
+        /* (3) sp 必须 **4** 字节对齐(帧里全是 u32)与非 0
+         *
+         *     ⚠ 不是 8 —— 这一条也是上板打回来的。被中断的代码在 libgcc 的
+         *       Thumb 函数 `__udivmoddi4` 里(`push {r4,r5,lr}` = 12 字节),
+         *       函数体内 SP 合法地是 4 mod 8;AAPCS 只要求**调用点** 8 字节
+         *       对齐,而异常可以落在任意指令边界。
+         *       按 8 判会把每一个这样的上下文都拒掉 —— 实测 invalid_ctx
+         *       涨到 30716,线程永远卡在就绪队列里。 */
+        t.ctx.cpsr = ARM_CPSR_KERNEL;
+        t.ctx.sp   = sp32 + 2u; /* 连 4 都不对齐:拒绝 */
         CHECK(!sched_ctx_switchable(&t));
+        t.ctx.sp = sp32 + 4u; /* 4 对齐但 4 mod 8:**接受**(板上就是这种) */
+        CHECK(sched_ctx_switchable(&t));
+        t.ctx.sp = sp32 + 4u + 0x1000u;
+        CHECK(((t.ctx.sp & 7u) != 0u));
+        CHECK(sched_ctx_switchable(&t));
         t.ctx.sp = 0u;
         CHECK(!sched_ctx_switchable(&t));
 
@@ -475,7 +527,7 @@ int main(void)
         }
         fr->svc_lr = 0xDEADBEEFu;
         fr->ret    = 0x00101904u;
-        fr->spsr   = ARM_MODE_SVC; /* 被中断时在 SVC 模式 */
+        fr->spsr   = ARM_CPSR_KERNEL; /* 被中断时内核的真实 CPSR(含 A=1)*/
 
         memset(&t, 0, sizeof(t));
         sched_ctx_from_frame(&t, fr);
@@ -484,7 +536,7 @@ int main(void)
         }
         CHECK(t.ctx.lr == 0xDEADBEEFu);
         CHECK(t.ctx.pc == 0x00101904u);
-        CHECK(t.ctx.cpsr == ARM_MODE_SVC);
+        CHECK(t.ctx.cpsr == ARM_CPSR_KERNEL);
         /*
          * ★★ 这一行就是"搬帧"的全部内容 ★★
          *
@@ -513,7 +565,7 @@ int main(void)
             }
             CHECK(fr2.svc_lr == 0xDEADBEEFu);
             CHECK(fr2.ret == 0x00101904u);
-            CHECK(fr2.spsr == ARM_MODE_SVC);
+            CHECK(fr2.spsr == ARM_CPSR_KERNEL);
 
             /* 逐字节相同:16 个字全部被写到,没有哪个槽漏了 */
             CHECK(memcmp(&fr2, fr, sizeof(fr2)) == 0);

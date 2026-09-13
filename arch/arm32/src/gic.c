@@ -361,13 +361,33 @@ arm_exc_frame_t *c_irq_handler(arm_irq_frame_t *frame)
     }
 
     gic_eoi(intid);
+
     /*
      * ★ M4-9:在 tick 里做调度决策 ★
      *
      * 位置:在 EOI 之后 —— 中断已经应答完,这时改动现场帧不会影响
      * GIC 的状态机。返回值决定"从哪个帧离开"。
+     *
+     * ⚠ **只对定时器中断做调度,不是每个中断都做。**
+     *
+     * 源 OS 里调度器挂在 `timer_handle` 上,也就是**定时器向量**而已;
+     * 别的中断(键盘、磁盘…)进来时压根不碰调度器。
+     *
+     * 本函数是所有 IRQ 的公共入口,第一版在这里无条件调用 `sched_tick()`,
+     * 而 `sched_tick()` 会给 current 记 1ms 的 vruntime 并把抢占用的
+     * 时间片计数 +1 —— 于是**每一个非定时器中断都会凭空扣掉 1ms 的
+     * 运行时间和一个时间片**。
+     *
+     * 现在只有私有定时器(PPI 29)与 SMP 的 IPI 注册了处理函数,所以
+     * 这个错还没露面;等第一个 UART/GEM 中断源接进来,它就会变成
+     * "某个线程的 vruntime 莫名其妙地涨、时间片莫名其妙地短",
+     * 而那时离这里已经很远了。
      */
-    return sched_tick(frame);
+    if (cpu_intid == GIC_INTID_A9_PRIVATE_TIMER) {
+        return sched_tick(frame);
+    }
+
+    return frame;
 }
 
 
@@ -485,7 +505,18 @@ static const char *fsr_status_text(u32 fsr)
     case 0x10: return "TLB conflict abort";
     case 0x14: return "implementation defined fault (lockdown)";
     case 0x15: return "implementation defined fault (unsupported exclusive access)";
-    case 0x16: return "SError exception";
+    /*
+     * ⚠ 0x16 是**异步**外部中止(ARMv8 的 AArch32 里叫 SError interrupt)。
+     *
+     *   "异步"是关键:**DFAR 对它没有意义** —— 它不是当前这条指令造成的,
+     *   而是更早某笔失败的 AXI 事务被延迟上报,投递点是任意的。
+     *
+     *   这一点真实误导过一次排查:实测 pc 落在一条 `push` 上、
+     *   DFAR = 0x043B6FFC,于是往"栈指针是野的"方向查了很久 ——
+     *   而真正的原因是一次 `rfeia` 把 CPSR 的 **A 位(异步中止屏蔽)**
+     *   从 1 清成了 0。见 arch/taskctx.h 的 ARM_CPSR_KERNEL。
+     */
+    case 0x16: return "asynchronous external abort (DFAR is MEANINGLESS for this one)";
     case 0x18: return "SError exception from parity or ECC error";
     case 0x19: return "synchronous parity or ECC error on memory access";
     case 0x1C: return "synchronous parity or ECC error on translation table walk, level 1";
@@ -537,6 +568,21 @@ static void dump_regs(arm_irq_frame_t *frame)
     console_printf("  ret      = 0x%08X   (preferred return address)\n", frame->ret);
     console_printf("  pc       = 0x%08X   (faulting/interrupted instruction)\n",
                    arm_exc_pc(frame, g_last_pc_fix));
+    /*
+     * ★ 出错上下文的 SP ★
+     *
+     * 帧里**没有** SP 这个槽(ARM 的 SP 按模式 banked,硬件不压),
+     * 但帧的**位置**就编码了它:`EXC_FRAME_ENTER` 把帧压在被中断者的
+     * SVC 栈上,所以 `帧基址 + 64` 恰好是异常发生那一刻的 SP。
+     *
+     * 为什么要专门打它:`ctx.sp` 错是调度类故障的头号原因,而
+     * "SP 是野的"与"SP 对但别的地方错"在串口上原本长得一模一样。
+     * M4-9 那次上板就是靠 JTAG 读 TCB 才把这条信息挖出来的 ——
+     * 有这一行的话,一个串口日志就够了(而且还省掉一次"读到的
+     * DFAR 是异步中止的垃圾值"的误导)。
+     */
+    console_printf("  sp       = 0x%08X   (SP of the faulting context = frame + %u)\n",
+                   (u32)(uintptr_t)frame + ARM_EXC_FRAME_BYTES, ARM_EXC_FRAME_BYTES);
     console_printf("  svc_lr   = 0x%08X   (interrupted LR —— bl 会踩掉它,所以存进帧里)\n",
                    frame->svc_lr);
     console_printf("  spsr     = 0x%08X   (mode %u, %s)\n", frame->spsr, frame->spsr & ARM_CPSR_MODE_MASK,
@@ -681,10 +727,34 @@ u32 irq_last_svc_frame_addr(void)
  * 它每秒被检查上千次(每个 tick 一次),所以"偶尔跳错"也躲不过去。
  */
 static u32 g_irq_frame_violations;
+static u32 g_irq_frame_unaligned8; /* 帧不是 8 字节对齐的次数 —— 只统计,不判失败 */
 
 u32 irq_frame_violations(void)
 {
     return g_irq_frame_violations;
+}
+
+/*
+ * 现场帧**不是** 8 字节对齐的次数。
+ *
+ * 为什么要统计它而不是直接断言"必须 8 对齐":
+ *
+ * 帧基址 = 异常入口那一刻的 SP - 64,所以"帧 8 对齐"等价于
+ * "被中断那一刻 SP 是 8 字节对齐的"。而 **SP 可以合法地是 4 mod 8** ——
+ * AAPCS 只要求"**在调用公开接口的那一刻**"8 字节对齐,函数体内部允许
+ * 4 字节对齐。实测就是如此:被中断的代码在 libgcc 的 Thumb 函数
+ * `__udivmoddi4` 里,它的 `push {r4,r5,lr}` 是 12 字节。
+ *
+ * 这个计数器的用处是**量出它到底有多常见**,而不是猜。如果它很大,
+ * 说明"异常入口把帧对齐、并把原始 SP 存进帧里"这件事值得做
+ * (那要加宽帧,16 → 18 字)。
+ *
+ * ⚠ 真正**不可违反**的是 4 字节对齐:帧的 16 个槽全是 u32。
+ *   那一条在 irq_frame_check() 里硬判。
+ */
+u32 irq_frame_unaligned8(void)
+{
+    return g_irq_frame_unaligned8;
 }
 
 /* ret 必须落在内核 .text 里(链接脚本给的界)*/
@@ -717,6 +787,25 @@ static void irq_frame_check(const arm_exc_frame_t *frame)
     /* 被中断时应当仍在 SVC(内核)模式;用户态支持是 M7 的事 */
     if ((frame->spsr & ARM_CPSR_MODE_MASK) != ARM_MODE_SVC) {
         g_irq_frame_violations++;
+        return;
+    }
+
+    /*
+     * ★ 4 字节对齐是硬要求,8 字节只是统计 ★
+     *
+     * 帧的每个槽都是 u32,4 字节不对齐会直接导致 `ldmia` 出问题 ——
+     * 那是真违例。而 8 字节对齐**做不到保证**:它等价于"被中断那一刻
+     * SP 是 8 对齐",而 SP 在函数体内部合法地可以是 4 mod 8
+     * (libgcc 的 Thumb `__udivmoddi4` 就是)。所以这里分开处理:
+     *   - `& 3` 不对 → 违例(计数,自检里必须为 0)
+     *   - `& 7` 不对 → 只统计(量出规模,决定要不要加宽帧)
+     */
+    if (((u32)(uintptr_t)frame & 3u) != 0u) {
+        g_irq_frame_violations++;
+        return;
+    }
+    if (((u32)(uintptr_t)frame & 7u) != 0u) {
+        g_irq_frame_unaligned8++;
     }
 }
 

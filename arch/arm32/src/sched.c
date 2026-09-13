@@ -328,21 +328,57 @@ bool sched_ctx_switchable(const tcb_t t)
     }
 
     /*
-     * 2. ★ CPSR 的模式位必须是 SVC ★
+     * 2. ★ CPSR 的 A 位必须是 1,模式位必须是 SVC ★
      *
-     * 这一条是绊线。造新线程时这里原本写的是 `0` —— 而 `0` 的
-     * CPSR.M[4:0] = 0b00000,**不是任何一个已分配的模式编码**
-     * (AArch32 每个合法模式的 bit4 都是 1),按架构把它装回 CPSR 是
-     * UNPREDICTABLE。与其让核心带着一个未定义的 CPSR 跑起来,
-     * 不如在这里直接拒绝切换 —— 拒绝是二值的,UB 不是。
+     * 这一条是绊线,而且**真的抓到过两次**(两次都是我自己写错的,
+     * 两次都是同一类:把"应该是这样"当成"就是这样"):
+     *
+     *   (a) 造新线程时这里原本写的是 `0`(一个未分配的模式编码,UB);
+     *   (b) 我先改成 `ARM_MODE_SVC | ARM_CPSR_F_BIT`(0x53)—— 模式对了,
+     *       但 **A 位(bit8,异步中止屏蔽)是 0**,而内核实际跑在 0x153。
+     *       `msr cpsr_c` 碰不到 bit8,所以 A 从复位起一直是 1;
+     *       我把它写成 0,等于切过去的那一刻解除了异步外部中止的屏蔽,
+     *       于是第一条指令就吃了 FS=0x16 的异步中止,而 DFAR 是 meaningless
+     *       的,排查方向被带偏了一整轮。
+     *
+     * ⚠ 这里**不查 I 位**(可以合法地是 1:`svc` 陷阱能在关中断的临界区里
+     *   发生,而那个值必须原样还回去),**也不查 T 位** —— 内核会合法地跑在
+     *   Thumb 态里(libgcc 的 `__udivmoddi4` 就是 Thumb,而 `timer_read_us()`
+     *   的 64 位除法会进到它里面)。第一版把 T 也纳入判定,结果拒绝了每一个
+     *   这样的上下文,`invalid_ctx` 涨到 45965。
+     *
+     * 完整经过写在 arch/taskctx.h 的 `ARM_CPSR_KERNEL` 与
+     * `ARM_CPSR_MUST_MATCH` 上面。
      */
-    if ((t->ctx.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_SVC) {
+    if (arm_cpsr_must(t->ctx.cpsr) != arm_cpsr_must(ARM_CPSR_KERNEL)) {
         return false;
     }
 
-    /* 3. AAPCS 要求 SP 8 字节对齐;帧是 64 字节,所以帧也跟着对齐 */
+    /*
+     * 3. ★ SP 只需 **4 字节**对齐,不是 8 ★
+     *
+     * 这一条也是上板打回来的 —— 同一类错误的**第四次**:我按"栈指针当然
+     * 是 8 字节对齐的"写了检查,而板上的真值是 `0x0299FFA4`(4 mod 8)。
+     *
+     * 为什么 4 mod 8 是**正常**的:被中断的那条指令在 `__udivmoddi4` 里,
+     * 那是 libgcc 的 **Thumb** 代码,它的序言是 `push {r4,r5,lr}` ——
+     * **12 字节**,于是函数体里 SP 就是 4 mod 8。
+     * AAPCS 只要求"**在调用公开接口的那一刻** SP 8 字节对齐",
+     * 函数体内部可以 4 字节对齐;而异常可以在**任意指令边界**发生。
+     *
+     * 帧本身需要的只是 4 字节对齐:它的 16 个槽全是 u32。
+     * ARMv7-A 上 `ldr/str` 4 字节、`ldrd/strd` 4 字节、VFP 传输 4 字节,
+     * 所以按 4 对齐搬这个帧没有任何问题。
+     *
+     * ⚠ 仍然存疑、并已记入待办的一点:`bl c_xxx_handler` 之后 C 处理函数
+     *   就在一个 4 mod 8 的 SP 上跑,严格来说违反 AAPCS 的"公开接口处
+     *   8 字节对齐"。本板实测它扛得住(被拒绝的那一轮里 `sched_tick`
+     *   在这个状态下执行了 3 万多次而没有出错),但这属于"没观察到问题",
+     *   不是"证明没问题"。真要根治得让异常入口把帧对齐并把**原始 SP**
+     *   存进帧里 —— 那是加宽帧(16 → 18 字)的改动,不该顺手做。
+     */
     sp = t->ctx.sp;
-    if (sp == 0u || (sp & 7u) != 0u) {
+    if (sp == 0u || (sp & 3u) != 0u) {
         return false;
     }
 
@@ -422,4 +458,22 @@ arm_exc_frame_t *sched_frame_from_ctx(tcb_t t, arm_exc_frame_t *dst)
     dst->spsr   = t->ctx.cpsr;
 
     return dst;
+}
+
+bool sched_cpsr_matches_kernel(u32 cpsr)
+{
+    /*
+     * 与 `ARM_CPSR_KERNEL` 在"A / T / 模式位"上一致吗 ——
+     * 也就是"这个 CPSR 描述的是内核正常运行的状态吗"。
+     *
+     * ★ 存在的理由:那个常量是**手写的**,而手写的东西必须与真实对一次账。
+     *   判据不是"我认为内核跑在 0x153",而是"**收现场时真的读到的那个值**
+     *   满足同一条谓词" —— 后者是在板上量出来的,不是推出来的。
+     *
+     *   M4-9 就是因为在这一点上只做了前者(而且只推理了 I/F 两位),
+     *   把 A 位写成了 0,白跑了一整轮上板。完整经过见 arch/taskctx.h。
+     *
+     * 不算 I:见 ARM_CPSR_MUST_MATCH 的说明。
+     */
+    return arm_cpsr_must(cpsr) == arm_cpsr_must(ARM_CPSR_KERNEL);
 }
