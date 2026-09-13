@@ -1166,6 +1166,30 @@ u32 mmu_l2_small_page_attr(ap3, tex, c, b, shareable, xn);
 不是打包好的属性值;拆段时用这些参数分别构造两种描述符。
 `vmap_split_section()` 的签名要相应改成接收参数结构体。
 
+
+**接进 kmain 做真实页表验证时又遇到一个待查的问题(2026-09-13)**:
+
+合成页表上的自检 **45 项全过**;但把同一套代码接到内核真实页表上时,
+`vmap_split_section()` 在**已保留的一段真实 1MB 上**失败了 ——
+`vmap_board_split = 0`、`vmap_board_live = 0`(自检 33 passed / 2 failed)。
+
+已经排除的:
+
+- `vmap_init()` 的参数应当都合法(池 1KB 对齐、区间 4KB 对齐、容量非 0);
+- 那一段来自 `palloc_alloc_pages(256)`,地址在 DDR 内、必然已被区域表映射。
+
+**待查方向**(下一轮从这里开始):
+
+1. 在拆段前后各打印一次 `g_mmu_l1_table[vmap_l1_index(region)]`,确认它到底
+   是不是 `MMU_L1_TYPE_SECTION` —— 如果根本不是段,`vmap_split_section()`
+   会返回 `IS_SECTION` 而不是去拆;
+2. 确认 `g_mmu_l1_table` 在内核里确实可写(它是 `.mmu_tbl` 段,`NOLOAD`,由
+   `mmu_build_l1_table()` 填充)—— 有没有可能被映射成了只读?
+3. 拆分失败时把 `vmap_split_section()` 的返回码打印出来 —— 现在的结果是
+   二值化的 `split_ok`,把错误码吃掉了,这是当时为了省事写的,现在看是个失误。
+
+**kmain 里的接入已撤回**,板子回到 32 passed / 0 failed;模块本身(宿主已验证)
+保留在树里。
 **另外两条已在第一版里解决、可直接沿用的结论**:
 
 1. **指针与物理地址必须在结构体里分成两个字段**。描述符里存的是 32 位物理地址,
