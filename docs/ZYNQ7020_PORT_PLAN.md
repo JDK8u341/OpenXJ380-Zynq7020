@@ -23,17 +23,19 @@ M4-1/2/3/4 完成，其中 M4-4 在压缩前刚板上验证通过（35 passed / 
 
 | 阶段 | 提交 | 板上证据 |
 |---|---|---|
-| M0 工具链 | — | 能出 ELF 并 JTAG 加载 |
-| M1 心跳 + 中断 + 串口 | `m1-verified` 标签 | 自检全过 |
-| M2 MMU + 缓存 | `4603d5` 等 | L2 受控 A/B：on=11212 off=15989 on-again=11213 |
-| M3 设备描述层 | `688311d` `8788af5` `bb508f0` `9af869e` `17e26c0` `b627c44` | 两次破坏性 A/B（LED 全灭）|
-| M3-7 串口命令通道 | `9a713f3` `b8f...` | `shell_test.py --load` 10/10 |
-| XSA 修复 | `9ad839c` `4fa0edf` `73185f7` | 17 passed / 0 failed |
-| AM3 双核 | `8c85301` `7f0bb7a` | 26 passed / 0 failed；A/B：不放 CPU1 → 5 项全 FAIL |
+| M0 工具链骨架 | `9db665c` | 能出 ELF 并 JTAG 加载 |
+| M1 心跳 + 异常 + 串口 | `378a0a4` `6c45328` `f05119d` `bb5a0da` `8c15a77`（标签 `m1-verified`）| 自检全过；故障注入逐类复验 |
+| M2-1..M2-4 页表 + MMU | `cca786b` `ff7db50` `06ad713` `9fbc85b` | 恒等映射开起来，属性细化 |
+| M2-5 缓存 | `db0a6a4` `18237ce` `1997dfb` `90f579a` `f4603d5` | L2 受控 A/B：on=11212 off=15989 on-again=11213 |
+| M3-1..M3-5 设备描述层 | `688311d` `8788af5` `bb508f0` `9af869e` `17e26c0` | 两次破坏性 A/B（改覆盖表 → LED 全灭）|
+| M3-6 自检报告 | `b627c44` | `verify_board.py --load` 一条命令判过 |
+| M3-7 串口 RX 命令通道 | `9a713f3` | 环回自检 |
+| XSA 电压修复 + RX 打通 | `a04783e` `a37e079` `9ad839c` `4fa0edf` `73185f7` | `shell_test.py --load` 10/10；17 passed / 0 failed |
+| AM3 双核 | `8c85301` `8ba193a` | 26 passed / 0 failed；A/B：不放 CPU1 → 5 项全 FAIL |
 | M4-1 krlibc | `2103ab3` | 宿主 2 passed；errno 与源 OS 逐值比对 |
-| M4-2 页分配器 | `6642292` | 29 passed / 0 failed |
+| M4-2 页分配器 | `6642292` | 29 passed / 0 failed（顺带炸出 FPU 雷）|
 | M4-3 内核堆 | `273c2cc` | 32 passed / 0 failed |
-| M4-4 细粒度映射 | `fb0c3d9` `8bde8aa` | **35 passed / 0 failed** |
+| M4-4 细粒度映射 | `fb0c3d9` `051d712` `65b2061` `8bde8aa` | **35 passed / 0 failed** |
 
 ### 0.5.3 构建与验证命令（照抄即可）
 
