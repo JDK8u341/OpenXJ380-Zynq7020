@@ -86,9 +86,16 @@ git diff --name-only 08e5c9c HEAD -- kernel include driver user lib boot kmod re
 
 ## 构建（ARM 分支）
 
-**环境**：Windows + Vitis 2025.2（自带 `arm-xilinx-eabi-gcc` 13.3.0）+ Python 3 + Ninja。
+> ★ **换一台机器只需要改一个文件：仓库根目录的 [`config.py`](config.py)。**
+> 完整步骤（要改哪几个值、去哪找、怎么自检、怎么排错）见
+> **[`docs/BUILD_ARM32.md`](docs/BUILD_ARM32.md)**。★
+
+**环境**：Windows + Vitis 2025.2（自带 GNU ARM 工具链，文件名是 `arm-none-eabi-gcc.exe`；
+`--version` 自报 `arm-xilinx-eabi-gcc` 13.3.0）+ Python 3 + Ninja。
 
 ```bash
+python config.py                      # ★ 先改 config.py 顶部那段，再自检（会逐项指出缺什么）
+
 # 生成 ARM 构建图（与上游 x86 图完全独立，互不影响）
 python tools/gen_ninja.py --out build-arm.ninja --arch arm32
 
@@ -114,17 +121,18 @@ ninja -f build-arm.ninja arm32
 | 层 | 命令 | 判据 |
 |---|---|---|
 | 宿主单元测试 | `python -m pytest tests/ -q` | **9 failed / 74 passed** —— 9 项**预先存在且与本移植无关**（busybox 合规/许可清单/DMA 计划/QEMU 固件） |
-| 板级自检 | `python tmp-test/verify_board.py --load` | 97 项 `CHECK` 全绿 **+ 必须出现 ` Boot complete:`**（"报告全绿但整机中途崩掉"会被判失败） |
+| 板级自检 | `python tmp-test/verify_board.py --load --seconds 75` | 97 项 `CHECK` 全绿 **+ 必须出现 ` Boot complete:`**（"报告全绿但整机中途崩掉"会被判失败）。★ `--seconds` **必须给够**：默认 8 秒会截断在半行，报"找不到 SELF-TEST BEGIN"（看着像内核坏了，其实只是窗口太短）★ |
 | 串口命令通道 | `python tmp-test/shell_test.py --load` | **10/10** |
-| 原始串口抓取 | `python tmp-test/run_and_capture.py COM4 9600 60` | hex + ASCII 双份，用于排查"波特率/线路/静默"三类问题 |
+| 原始串口抓取 | `python tmp-test/run_and_capture.py <串口> 9600 60` | hex + ASCII 双份，用于排查"波特率/线路/静默"三类问题。★ hex 那份是无损的，正文那份会把非 ASCII 打成 `U+FFFD` ★ |
 | 破坏性 A/B | 固件内置 8 组 | 搬帧 / VFP 现场 / 扫描唤醒 / 无饥饿 / 选核 / 不换栈 / 串口锁 / 线程退出 |
 
 **两层分工（本项目最贵的一课）**：
 **策略**（选取顺序、补偿、不变量）的判据在**宿主**（板上证明不了策略 —— 等权负载下任何策略都会通过）；
 **机制**（切换、抢占、双核、锁、退出路径）的判据在**板上**，而且只认**破坏性 A/B**。
 
-板级前提（换环境会踩）：PS UART1 @ `0xE0001000` / MIO48-49 / **9600 8N1** / 主机 `COM4`；JTAG 用 Vitis `xsdb`；
-PL LED 在 `0x41200000`；心跳区 OCM `0x00020000`（32 槽已满）。
+板级前提（换环境会踩）：PS UART1 @ `0xE0001000` / MIO48-49 / **9600 8N1** / 主机串口见 `config.py`；JTAG 用 Vitis `xsdb`；
+PL LED 在 `0x41200000`；心跳区 OCM `0x00020000`（32 槽已满）。这些**因机器而异**的值全部集中在
+[`config.py`](config.py)，改法与排错见 [`docs/BUILD_ARM32.md`](docs/BUILD_ARM32.md)。
 
 ---
 
