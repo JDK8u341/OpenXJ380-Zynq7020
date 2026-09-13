@@ -22,6 +22,7 @@
 #include <arch/cpu.h>
 #include <arch/fault_test.h>
 #include <arch/heartbeat.h>
+#include <arch/heap.h>
 #include <arch/io.h>
 #include <arch/irq.h>
 #include <arch/led.h>
@@ -63,9 +64,21 @@ extern char __stack_top[];
 u32      g_palloc_bitmap[PALLOC_BITMAP_WORDS];
 palloc_t g_palloc;
 
+/*
+ * 内核堆(M4-3)。
+ *
+ * HEAP_PAGES 取 8192 页 = 32MB。一次要足的原因见上面 use 处的说明 ——
+ * 增长区必须与堆区紧邻,而 palloc 不保证这一点。
+ */
+#define HEAP_PAGES 8192u
+
+heap_t g_heap;
+
 /* 物理页分配器的自检与冒烟结果,供自检报告使用 */
 static u32 g_palloc_selftest;
 static u32 g_palloc_smoke;
+static u32 g_heap_selftest;
+static u32 g_heap_smoke;
 
 /* SMP 压力测试的结果,供自检报告使用 */
 static smp_stress_result_t g_smp_stress;
@@ -762,6 +775,63 @@ void kmain(void)
         }
     }
 
+    /* ---- 9.45 内核堆(M4-3) ---- */
+    /*
+     * 堆区**一次性拿一大块连续内存**,不依赖"用完再要一页接上"。
+     *
+     * 为什么:堆是一条贯穿整个区域的链表,增长区必须与堆区**紧邻**,
+     * 而 palloc_alloc_pages() 返回的页不保证相邻 —— 那条路根本走不通。
+     * 所以这里用 palloc_alloc_pages(HEAP_PAGES) 一次要足。
+     *
+     * 32MB 对 1GB 的板子不算什么,而且它换来的是"堆永不碎片化到无法增长"。
+     */
+    {
+        uintptr_t heap_base = 0;
+        palloc_err_t pe = palloc_alloc_pages(&g_palloc, HEAP_PAGES, &heap_base);
+
+        if (pe == PALLOC_OK) {
+            console_printf(" Kernel heap : %u KB at 0x%08X\n",
+                           (u32)((HEAP_PAGES * PALLOC_PAGE_SIZE) >> 10), (u32)heap_base);
+
+            if (heap_init(&g_heap, heap_base, (size_t)HEAP_PAGES * PALLOC_PAGE_SIZE) != HEAP_OK) {
+                console_puts(" Heap        : init FAILED\n");
+            }
+        } else {
+            console_printf(" Heap        : palloc FAILED err=%u\n", (u32)pe);
+        }
+
+        g_heap_selftest = heap_selftest();
+
+        /*
+         * 真实内存冒烟:自检跑的是合成实例,证明逻辑对;
+         * 这一步才证明**这块物理内存真的能用**(与 palloc 的冒烟同理)。
+         */
+        g_heap_smoke = 0u;
+        if (pe == PALLOC_OK) {
+            u8  *p1 = (u8 *)heap_alloc(&g_heap, 1000u);
+            u8  *p2 = (u8 *)heap_alloc(&g_heap, 4000u);
+            u32  i;
+            u32  ok = 1u;
+
+            if (p1 == NULL || p2 == NULL || p1 == p2) {
+                ok = 0u;
+            } else {
+                for (i = 0; i < 1000u; i++) { p1[i] = (u8)(i & 0xFFu); }
+                for (i = 0; i < 4000u; i++) { p2[i] = (u8)((i * 7u) & 0xFFu); }
+                for (i = 0; i < 1000u; i++) { if (p1[i] != (u8)(i & 0xFFu)) { ok = 0u; break; } }
+                for (i = 0; i < 4000u; i++) { if (p2[i] != (u8)((i * 7u) & 0xFFu)) { ok = 0u; break; } }
+                if (heap_check(&g_heap) != HEAP_OK) { ok = 0u; }
+                if (heap_free(&g_heap, p1) != HEAP_OK) { ok = 0u; }
+                if (heap_free(&g_heap, p2) != HEAP_OK) { ok = 0u; }
+                if (heap_check(&g_heap) != HEAP_OK) { ok = 0u; }
+            }
+
+            g_heap_smoke = ok;
+            console_printf(" Heap smoke  : alloc/write/readback/free 2 blocks = %s\n",
+                           ok ? "PASS" : "FAIL");
+        }
+    }
+
     /* ---- 9.5 第二个核(AM3-1/2/3) ---- */
     /*
      * 位置:MMU 与缓存都已就绪之后。
@@ -900,6 +970,11 @@ void kmain(void)
      * 起来了但没置 online),而心跳里的 stage 槽正好区分它们。
      * 合成一项会把这条线索丢掉。
      */
+    selftest_report("heap_selftest", g_heap_selftest, 0u, SELFTEST_EQ);
+    selftest_report("heap_smoke", g_heap_smoke, 1u, SELFTEST_EQ);
+    /* 至少 32MB 可用 —— 判据写小了等于没判 */
+    selftest_report("heap_size_ok", (g_heap.total_bytes >= (32u * 1024u * 1024u)) ? 1u : 0u, 1u, SELFTEST_EQ);
+
     selftest_report("palloc_selftest", g_palloc_selftest, 0u, SELFTEST_EQ);
     selftest_report("palloc_smoke", g_palloc_smoke, 1u, SELFTEST_EQ);
     /* 池至少要有 100000 页(约 390MB)—— 数字写小了等于没判 */
