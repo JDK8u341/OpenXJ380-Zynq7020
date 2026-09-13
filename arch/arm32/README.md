@@ -1963,6 +1963,101 @@ _Static_assert(_Alignof(struct arm_thread_control_block) == 8u,
 `boot/context.S` 的布局自检用**返回码**而不是"打印后停机"：
 布局错了应该报 FAIL 后继续跑，一次看到全部问题，而不是把内核弄停。
 
+### 11. M4-9：抢占（搬帧）—— 已完成，板上 62/0
+
+**这一步的核心是一句架构事实**：
+
+> ARM 的异常帧里**没有 SP**。`EXC_FRAME_LEAVE` 的收尾是
+> `add sp, sp, #0x38; rfeia sp!`，所以返回后的 SP **恒等于帧基址 + 64**。
+> ⇒ **帧在谁的栈上，谁就被恢复。**
+
+于是"切换任务"在 ARM 上就是**在目标任务的栈上另搭一个帧**，
+再把那个帧交回 `rfeia` —— 而不是 x86 那样就地改写一个帧
+（x86 的帧里有 `rsp`/`ss`，`iretq` 从帧里取，所以就地改就够了）。
+
+| 文件 | 职责 |
+|---|---|
+| `src/sched.c` | **纯逻辑**：帧搬迁的数据搬运（`sched_ctx_from_frame` / `sched_frame_for` / `sched_frame_from_ctx`）+ 四条可切换性绊线 + 可调度性判据。宿主穷尽测 |
+| `src/sched_kern.c` | 接真实 TCB/栈池/队列；`sched_tick` 里"收现场 → 搭新帧 → 切 current" |
+| `boot/vectors.S` | `_vec_irq` / `_vec_svc` 共用协议：**返回值就是"要从哪个帧离开"**（`mov sp, r0`），照抄 x86 `call timer_handle; mov rsp, rax` |
+| `boot/context.S` | `arch_svc_yield`（陷阱式让出）；`arch_ctx_save` / `arch_ctx_switch`（原语，调度器已不用）|
+
+#### 唯一的一条切换路径
+
+```
+timer IRQ ──┐
+            ├──> c_irq_handler / c_svc_handler ──> sched_tick(frame)
+svc #YIELD ─┘                                            │
+                                  ┌──────────────────────┘
+                     "从哪个帧离开" ← 不切换：原 frame
+                                     切换：在目标栈上新搭的帧
+```
+
+**源 OS 只有一个切换点**（`timer_handle`），而 `scheduler_yield()` 也不是例外 ——
+它是 `scheduler_ticks = TIME_SLICE; int $32`，软中断进同一个入口。
+ARM 侧对应 `svc #ARM_SVC_YIELD`。
+
+⚠ 为什么用 SVC 而不是 GIC 的 SGI：**`int n` 不受 IF 屏蔽**，而 SGI 是一条 IRQ，
+`CPSR.I=1` 时会被挂起。源 OS 的 `scheduler_sleep_ns()` 是
+`do { yield(); } while (WAIT);` —— 在关中断的上下文里用 SGI 会**空转不切换**。
+
+M4-8 那套 `arch_ctx_switch` 让出**已退场**：两套机制保存的寄存器集不同
+（协作式只存 r4-r11+r0），被抢占过的线程若被协作式切回来，r1-r3/r12 就是垃圾，
+而且**不报任何错**。
+
+#### ★ 这一步踩的四个坑，是同一类错误 ★
+
+四次都是**凭"应该是这样"去写死一个硬件的位，而那个值在板上可以读出来核对**：
+
+| 我断言的 | 板上真值 | 症状 |
+|---|---|---|
+| "`cpsr=0` 是 User 模式" | **不是任何模式**（0b00000 未分配）| 发现得早，只改注释 |
+| "内核 CPSR 是 `0x53`" | **`0x153`**（A 位是复位值 1，`msr cpsr_c` 碰不到它）| 新线程**第一条指令**异步外部中止。DFAR 还是垃圾值（FS=0x16 时 DFAR 无意义），把方向带偏一整轮 |
+| "内核是 `.arm`，T 位必为 0" | **`0x173`（Thumb）** —— libgcc 的 `__udivmoddi4` 就是 Thumb，`timer_read_us()` 的 64 位除法会进去 | `invalid_ctx` 涨到 45965，线程卡在就绪队列里 |
+| "SP 必然 8 字节对齐" | **`0x0299FFA4`**（4 mod 8）—— Thumb 的 `push {r4,r5,lr}` 是 12 字节 | `invalid_ctx` 涨到 30716，启动流程回不来 |
+
+**规程**：要写"硬件一定如此"的常量或判据之前，先问**"这个值我在板上读过吗"**。
+没读过就先读，或者写成"只统计不判失败"。
+
+**正确的做法也有样本了**：`ARM_CPSR_KERNEL` 这个手写常量配一条
+`sched_cpsr_kernel` 自检，把它与"板上真读到的 CPSR"直接对账 ——
+手写常量 + 板上对账，比"推理得更仔细些"可靠。
+
+#### 验收判据：为什么不能是"两个计数都大于零"
+
+没有抢占时，先跑的那个线程会**一路跑完再挂起**，然后另一个才开始 ——
+两个计数照样都是正的。所以判据必须是**交错**，而交错可以由线程自己见证：
+
+```c
+/* 我在跑的时候，对方是不是已经跑过了？ */
+if (*p->other != 0u) p->saw_other = 1u;
+```
+
+无抢占时**第一个跑的线程永远见证不到**；判据要求**两个见证同时为 1**，
+所以与"谁先跑"无关。
+
+板上实测：
+
+```
+a=14073 b=14047 saw=(1,1) sp_bad=(0,0) done=1
+switched=30 preempted=27 invalid=0
+```
+
+三条独立的量互相印证：计数几乎相等（公平）、两个见证都成立（真的交错）、
+`sp_bad` 全 0（每一刻都跑在自己的栈上）。
+
+#### 破坏性 A/B：`g_reloc_skip`
+
+置 1 时 `sched_tick` **照做完一切**（计费、挑下一个、改状态、挪队列、收现场、
+搭新帧），只在最后一步**不把新帧交出去**。
+
+| | 两个探针线程 |
+|---|---|
+| 搬帧开 | `a=14073 b=14047`，`saw=(1,1)` |
+| 搬帧关 | **`a=0 b=0`** —— 一次都没跑起来 |
+
+同一段代码、同一对线程、同一段时间预算，只差这一步 ⇒ **搬帧是承重的。**
+
 ### 11. 退化实现清单（M4 期间必须持续维护）
 
 **这张表是 M4 计划里明确要求的东西。** 理由：M4 期间会有若干处"先退化顶上"
@@ -1974,6 +2069,10 @@ _Static_assert(_Alignof(struct arm_thread_control_block) == 8u,
 |---|---|---|---|---|
 | D1 | **`errno` 是全局变量，不是每任务** | `src/krlibc.c` | M4-1 阶段还没有线程可谈 | **M4-6 有了 TCB 之后**，改成 per-task（与 Linux 的 `current->errno` 同构）|
 | D2 | **`strtok` 的状态是全局静态变量** | `src/krlibc.c` | fs 层只有 `vfs.cpp` 的 2 处调用，暂时可控 | M4-11 有了可睡眠原语与任务之后。两个任务同时 strtok 会互相踩 —— 旧 XJ380 也是这个实现，所以不是移植引入的，但必须记下来 |
+| D4 | **`select_next_task` 被简化成"取队首"** | `src/sched.c` 的 `sched_pick` | 等权 + 纯占用负载下结果与源 OS 相同 | **M4-10**。源 OS 的 `select_next_task_safe` 还有 avg_vruntime 闸门、fallback 扫描、`mark_task_dispatched`、`wake_sleeping_task(current)` —— **那是简化，不是等价** |
+| D5 | **`is_task_schedulable` 省掉了 `parent_group` 两条** | `src/sched.c` | 内核对线程还没有进程组（M7 才有） | M7。照抄会让**每一个**线程都不可调度（`parent_group == NULL`），所以只能先省 |
+| D6 | **`sched_tick` 里的 CPU0 护栏** | `src/sched_kern.c` | `g_runq[1]` 与 CPU1 的 idle 都还没建，放 CPU1 过去会两个核同时往一个上下文里塞现场 | **M4-10**（每核队列 + 每核 idle）|
+| D7 | **异常帧可能不是 8 字节对齐** | `boot/vectors.S` 的 `EXC_FRAME_ENTER` | 本板实测扛得住（被拒绝那一轮里 `sched_tick` 在 4-mod-8 的 SP 上跑了 3 万多次没出错）| 需要时。根治要把帧从 16 字加宽到 18 字、把原始 SP 存进帧里。用 `irq_frame_unaligned8` 量出的规模（一轮 **20** 次）决定值不值得做 |
 | ~~D3~~ | ~~内核用硬浮点编译~~ | — | — | **已结案：不是退化，是照源 OS 的设计。** 见下方「FP 上下文」一节 |
 
 
