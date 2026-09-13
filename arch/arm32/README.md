@@ -13,25 +13,74 @@ OpenXJ380 移植到 ARMv7-A 的第一块地基。对应 `docs/ZYNQ7020_PORT_PLAN
 ```
 arch/arm32/
 ├── boot/
-│   ├── start.S        启动汇编：屏蔽中断、建立各模式栈、清 BSS、跳 kmain
-│   └── kernel.ld      链接脚本：加载到 DDR 0x00100000
+│   ├── start.S          启动汇编:屏蔽中断、使能 FPU、建各模式栈、清 BSS、跳 kmain
+│   │                    （另含 cpu1_entry:第二个核的入口）
+│   ├── vectors.S        异常向量表 + 各异常的处理外壳（致命异常停在 wfe 自旋）
+│   └── kernel.ld        链接脚本:加载到 DDR 0x00100000,两个核各自的栈区,
+│                        L1 页表 16KB 对齐的 .mmu_tbl 段
 ├── include/arch/
-│   ├── types.h        定宽类型（freestanding，不依赖 stdint.h）
-│   ├── io.h           MMIO 读写 + 屏障语义
-│   ├── cpu.h          架构接缝：中断/CP15/缓存/自旋锁
-│   ├── platform.h     板级常量（Zynq-7020 / AC850+AC880）
-│   ├── timer.h        全局定时器（nanoTime 的替代）
-│   ├── uart_ps.h      Cadence UARTPS 驱动
-│   ├── console.h      最小格式化输出
-│   └── led.h          LED / 拨码开关
+│   ├── types.h          定宽类型（freestanding 不依赖 stdint.h,hosted 借用 libc）
+│   ├── io.h             MMIO 读写 + 屏障语义
+│   ├── cpu.h            架构接缝:中断/CP15/缓存/TLB/自旋锁
+│   ├── platform.h       板级常量 + 心跳区/故障选择器的物理地址
+│   ├── mmu.h            ARMv7 短描述符定义、属性构造函数、区域表
+│   ├── percpu.h         每核结构（cpu_id/online/ticks/ipi_count/栈顶）
+│   ├── smp.h            第二个核的释放与在线等待、IPI、压力测试
+│   ├── irq.h            GIC 抽象 + 中断注册/统计
+│   ├── timer.h          全局定时器（nanoTime 的替代）
+│   ├── uart_ps.h        Cadence UARTPS 驱动
+│   ├── uart_baud.h      波特率闭环标定（纯逻辑,宿主可测）
+│   ├── console.h        最小格式化输出
+│   ├── led.h            LED / 拨码开关
+│   ├── heartbeat.h      ★ 跨模块契约:OCM 心跳槽位定义（只能有一处）
+│   ├── selftest.h       启动自检报告的判定逻辑（纯函数）+ 输出接口
+│   ├── shell.h          串口命令通道
+│   ├── fault_test.h     故障注入选择器（含 guard page 的三个）
+│   ├── board.h /
+│   │   board_devices.h  M3 设备描述层:从 xparameters.h 生成的节点表
+│   ├── plat_device.h    device_t / plat_driver_t / probe 匹配（纯逻辑）
+│   ├── axi_gpio.h       PL AXI GPIO 驱动（描述层上的第一个真驱动）
+│   ├── palloc.h         M4-2 物理页分配器（2 bit/页）
+│   ├── heap.h           M4-3 内核堆（空闲链表,自检会核对统计一致性）
+│   ├── vmap.h           M4-4 细粒度映射（段 -> 小页的属性**翻译**）
+│   ├── kstack.h         M4-5 内核栈池 + guard page
+│   ├── krlibc.h         M4-1 的 15 个纯函数 + errno
+│   └── errno.h          与 x86 侧逐值一致的 errno 定义
 └── src/
-    ├── kmain.c        内核入口
-    ├── timer.c
-    ├── uart_ps.c
-    ├── console.c
-    └── led.c
+    ├── kmain.c          内核入口(启动顺序见下)
+    ├── board.c          板级胶水:心跳、故障选择器、时钟
+    ├── board_devices.c  设备描述表(生成物)
+    ├── plat_device.c    描述层匹配逻辑（不含 MMIO,宿主可测）
+    ├── axi_gpio.c       AXI GPIO 驱动
+    ├── led.c             PL LED（走描述层）与 PS LED
+    ├── timer.c           全局定时器 + 周期中断
+    ├── uart_ps.c         UART 驱动
+    ├── uart_baud.c       波特率标定（纯）
+    ├── console.c         最小 printf 风格的输出
+    ├── gic.c             GIC + 异常现场打印 + FSR 译码
+    ├── fault_test.c      故障注入
+    ├── cache.c/.h        缓存几何与维护原语（纯）
+    ├── cache_hw.c        CP15 缓存维护
+    ├── mmu.c             描述符编解码与区域表（纯）
+    ├── mmu_hw.c          MMU 使能、TTBR0/DACR
+    ├── percpu.c/.h       每核表（纯）
+    ├── percpu_hw.c       TPIDRPRW
+    ├── smp.c             第二个核
+    ├── selftest.c        自检报告输出
+    ├── shell.c           命令通道
+    ├── palloc.c          物理页分配器（纯）
+    ├── heap.c            内核堆（纯）
+    ├── vmap.c            细粒度映射（纯）
+    ├── kstack.c          栈池（纯,TLB 通过钩子外置）
+    ├── kstack_hw.c       TLB 维护钩子（CP15）
+    └── krlibc.c          krlibc 子集 + errno
 ```
 
+**分层约定（不是洁癖,是"能不能在宿主机上把最容易错的地方钉死"）**:
+标了「纯」的文件**不含任何 MMIO / CP15 / 内联汇编**,由宿主编译器直接编译
+并跑自检 —— 见 `tests/test_arm32_*.py`。需要 CP15 的那一半单独一个 `*_hw.c`。
+唯一一处**刻意**的偏离是 `kstack.c`:它自己拥有 TLB 维护这件事,
+但做成函数指针(理由见「M4-5」一节)。
 ## 构建
 
 ```bash
@@ -134,16 +183,29 @@ freestanding 构建自带 `size_t`/`uintptr_t`/`bool` 等定义。
 ## 启动顺序（`kmain`）
 
 ```
-1. led_init()                LED 先起来 —— 它不依赖未知时钟，是最可靠的反馈手段
-2. 写 OCM 心跳 magic         JTAG 立刻可确认"内核活了"
-3. timer_init()              ⚠ 必须早于任何 timer_delay_*
-4. LED 上电自检              全亮 -> 全灭
-5. uart_probe()              探测串口是否存在
-6. 闭环收敛 UART 参考时钟 -> 初始化 -> 打印横幅
-7. gic_init()                关中断下配置 Distributor / CPU Interface
-8. irq_register() + 启动定时器 + gic_enable_irq()
-9. irq_global_enable()       最后一步才打开 CPU 中断响应
-10. 主循环                   跑马灯 + PS LED 慢闪 + 心跳刷新 + 周期串口输出
+ 1. led_init()                  LED 先起来 —— 它不依赖未知时钟,是最可靠的反馈手段
+ 2. 写 OCM 心跳 magic           JTAG 立刻可确认"内核活了"
+ 3. timer_init()                ⚠ 必须早于任何 timer_delay_*
+ 4. LED 上电自检                全亮 -> 全灭
+ 5. uart_probe()                探测串口是否存在
+ 6. 闭环收敛 UART 参考时钟 -> 初始化 -> 环回自检 -> 打印横幅
+    ⚠ 环回自检必须**在横幅之前**:它会在本机 TX 上留下探针字节,
+      把行首的 CHECK 污染成 UCHECK,而报告解析是按行首 ^CHECK 匹配的
+ 7. gic_init()                  关中断下配置 Distributor / CPU Interface
+ 8. irq_register() + 启动定时器 + gic_enable_irq()
+ 9. irq_global_enable()         最后一步才打开 CPU 中断响应
+10. mmu_enable()                段映射恒等映射,只开地址转换
+11. 缓存几何发现 -> L1 -> SCU/ACTLR -> PL310 L2
+12. 设备描述层                  从 xparameters.h 生成的节点表 -> probe 匹配
+13. 9.4  物理页分配器 palloc   池 = [_kernel_end 向上对齐, DDR 末尾)
+14. 9.44 细粒度映射 vmap        真实页表上拆段 + 改映射 + TLB 失效后读回
+15. 9.45 内核堆                32MB 一次性要足（增长区必须紧邻,而 palloc 不保证）
+16. 9.46 内核栈池 + guard page 32 槽 x 1MB,每槽一页 guard
+17. 9.5  放出 CPU1              per-CPU 表就绪 -> 释放 -> 等在线 -> IPI 压力
+18. 自检报告                  固定格式回传,由 verify_board.py 判退出码
+19. shell_init() / banner      命令通道（在报告之后:此前串口还在标定,回显会乱）
+20. 主循环                     跑马灯 + PS LED 慢闪 + 心跳 + 周期输出
+                               + fault_test_poll() + shell_poll()
 ```
 
 另有 `start.S` 在清 BSS 之前调用 `vectors_install()` 写 VBAR ——
