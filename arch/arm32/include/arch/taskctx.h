@@ -87,12 +87,7 @@
 #include <arch/taskctx_asm.h>
 #include <arch/types.h>
 
-/*
- * freestanding 下没有 <stddef.h>。C11 的经典写法((type*)0)->member 是
- * "未定义但所有编译器都支持"的形式,而 GCC/Clang 都提供 __builtin_offsetof ——
- * 直接用它,把"靠编译器"这件事写在明处。
- */
-#define offsetof_arm(type, member) __builtin_offsetof(type, member)
+/* (offsetof_arm 现在定义在 taskctx_asm.h —— percpu.h 也要用它) */
 
 /* ------------------------------------------------------------------ */
 /* 帧一:异常帧                                                        */
@@ -166,6 +161,12 @@ _Static_assert(ARM_CTX_OFF_LR == ARM_CTX_OFF_SP + 4u, "lr 紧跟 sp");
 _Static_assert(ARM_CTX_OFF_PC == ARM_CTX_OFF_LR + 4u, "pc 紧跟 lr");
 _Static_assert(ARM_CTX_OFF_CPSR == ARM_CTX_OFF_PC + 4u, "cpsr 紧跟 pc");
 _Static_assert(ARM_CTX_BYTES == 68u, "任务上下文大小变了,汇编里的偏移也要改");
+/*
+ * boot/context.S 用 `ldr r12, [r1, r2, lsl #2]` 遍历 r[],这要求 r[] 在开头。
+ * 那里的 `.error` 也钉了同一条;两边都写是有意的 ——
+ * C 侧改了字段顺序时,报错的地方越靠近改动点越好。
+ */
+_Static_assert(ARM_CTX_OFF_R0 == 0u, "r[] 必须在任务上下文开头(context.S 的遍历假设)");
 _Static_assert(sizeof(arm_task_ctx_t) == ARM_CTX_BYTES, "结构体与偏移宏不一致");
 _Static_assert(offsetof_arm(arm_task_ctx_t, sp) == ARM_CTX_OFF_SP, "sp 偏移与汇编不一致");
 _Static_assert(offsetof_arm(arm_task_ctx_t, pc) == ARM_CTX_OFF_PC, "pc 偏移与汇编不一致");
@@ -215,3 +216,20 @@ static inline const char *arm_mode_text(u32 cpsr)
  * (CPSR 的读取在 arch/cpu.h 的 arch_read_cpsr(),不在这里重复声明。)
  */
 u32 arch_read_sp(void);
+
+/* ------------------------------------------------------------------ */
+/* 汇编实现的布局自检(实现在 boot/context.S)                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 对一个 `arm_task_ctx_t` 做一次"按宏读出来核对"的往返:
+ * C 侧先把 17 个字段写成 ARM_FRAME_CHECK_PATTERN + 下标 的图案。
+ *
+ * 存在的理由:`_Static_assert` 钉得住"C 结构体 == 宏",钉不住
+ * "**汇编里用的是那个宏**" —— 手滑写错一个宏名,编译器不会有任何意见。
+ * 见 boot/context.S 顶部。
+ *
+ * 返回:0 = 全对;1..13 = 第几个 r 槽不对;14 = sp;15 = lr;16 = pc;17 = cpsr。
+ * **不会停机** —— 布局错了应该报 FAIL 后继续跑,而不是把内核弄停。
+ */
+u32 arch_ctx_layout_check(const arm_task_ctx_t *ctx);

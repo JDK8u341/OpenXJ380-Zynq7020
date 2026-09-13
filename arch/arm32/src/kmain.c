@@ -33,6 +33,7 @@
 #include <arch/platform.h>
 #include <arch/selftest.h>
 #include <arch/shell.h>
+#include <arch/tcb.h>
 #include <arch/smp.h>
 #include <arch/timer.h>
 #include <arch/vmap.h>
@@ -170,6 +171,9 @@ static u32 g_kstack_ap_ok;
 
 /* M4-6:异常帧布局的运行时自检结果(-1 = 没跑过) */
 static int g_svc_frame_check = -1;
+
+/* M4-6:TCB 里 ctx 偏移的运行时自检结果(-1 = 没跑过) */
+static int g_tcb_ctx_check = -1;
 
 static u32 g_kstack_selftest;
 static u32 g_kstack_slots_ok;
@@ -1270,7 +1274,7 @@ void kmain(void)
          * CPU0 这里可以直接 publish:它的缓存早就开了(见上面缓存那一节),
          * 所以这次写入走 SCU 一致性路径,CPU1 起来后看到的是干净的值。
          */
-        if (percpu_init_self((uintptr_t)__stack_top) != NULL) {
+        if (percpu_init_self((u32)(uintptr_t)__stack_top) != NULL) {
             percpu_publish_self();
         }
 
@@ -1344,6 +1348,50 @@ void kmain(void)
         } else {
             console_printf(" Exc frame   : %s (result=%d)\n",
                            (g_svc_frame_check == 0) ? "PASS" : "FAIL", g_svc_frame_check);
+        }
+    }
+
+    /* ---- 9.49 TCB 里 ctx 偏移的运行时自检(M4-6) ---- */
+    /*
+     * `_Static_assert` 钉住的是"C 结构体 == taskctx_asm.h 的宏";
+     * 它钉不住"boot/context.S 里用的是那个宏"。这一步补上后者。
+     *
+     * TCB 从**内核堆**分配而不是开一个静态的:顺带验证
+     *   - TCB 的大小堆得下;
+     *   - `heap_alloc` 给的 8 字节对齐满足 TCB 的自然对齐
+     *     (`_Alignof(...) == 8`,由 tcb.h 的绊线断言保证)。
+     * 用静态实例会把这两件事都跳过。
+     *
+     * ⚠ 跨语言边界传的是 `&tcb->ctx`(**指针**),不是"TCB 加某个偏移" ——
+     *   理由见 arch/tcb.h 里那一节:TCB 有指针字段,宿主与目标布局不同,
+     *   而汇编本来也不需要知道 ctx 在 TCB 里的位置。
+     */
+    {
+        struct arm_thread_control_block *tcb = (struct arm_thread_control_block *)heap_alloc(
+            &g_heap, (size_t)sizeof(struct arm_thread_control_block));
+
+        if (tcb == NULL) {
+            console_puts(" Tcb ctx     : heap_alloc FAILED\n");
+        } else {
+            u32 i;
+
+            /* C 侧写入已知图案 —— 图案里带下标,所以"读到了别的槽"能被认出 */
+            for (i = 0; i < 13u; i++) {
+                tcb->ctx.r[i] = ARM_FRAME_CHECK_PATTERN + i;
+            }
+            tcb->ctx.sp   = ARM_FRAME_CHECK_PATTERN + 100u;
+            tcb->ctx.lr   = ARM_FRAME_CHECK_PATTERN + 101u;
+            tcb->ctx.pc   = ARM_FRAME_CHECK_PATTERN + 102u;
+            tcb->ctx.cpsr = ARM_FRAME_CHECK_PATTERN + 103u;
+
+            g_tcb_ctx_check = (int)arch_ctx_layout_check(&tcb->ctx);
+
+            console_printf(" Tcb ctx     : sizeof=%u align_ok=%u -> %s (result=%d)\n",
+                           (u32)sizeof(struct arm_thread_control_block),
+                           (((uintptr_t)tcb & 7u) == 0u) ? 1u : 0u,
+                           (g_tcb_ctx_check == 0) ? "PASS" : "FAIL", g_tcb_ctx_check);
+
+            (void)heap_free(&g_heap, tcb);
         }
     }
 
@@ -1455,6 +1503,15 @@ void kmain(void)
      */
     selftest_report("exc_frame_layout", (u32)((g_svc_frame_check < 0) ? 0xFFFFFFFFu
                                                                      : (u32)g_svc_frame_check),
+                    0u, SELFTEST_EQ);
+
+    /*
+     * ---- TCB 里 ctx 的偏移(M4-6)----
+     *
+     * 同样是 == 0 而不是 >= 0:-1(没跑过)必须算失败。
+     */
+    selftest_report("tcb_ctx_layout", (u32)((g_tcb_ctx_check < 0) ? 0xFFFFFFFFu
+                                                                 : (u32)g_tcb_ctx_check),
                     0u, SELFTEST_EQ);
 
     selftest_report("smp_cpu1_online", g_percpu[1].online, 1u, SELFTEST_EQ);

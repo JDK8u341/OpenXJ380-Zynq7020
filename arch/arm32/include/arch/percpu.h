@@ -26,6 +26,7 @@
  * 这样"越界 id 不能写坏别人"这类最容易出错的地方能在宿主机上钉住。
  */
 
+#include <arch/taskctx_asm.h>
 #include <arch/types.h>
 
 /*
@@ -53,8 +54,49 @@ typedef struct
     u32 last_intid;  /* 本核最后处理的中断号 */
     u32 spin_retry;  /* 本核加锁重试次数(锁竞争诊断) */
 
-    uintptr_t stack_top; /* 本核栈区顶部,start.S 用的同一值 */
+    /*
+     * ★ 地址字段一律用 `u32`,不用 `uintptr_t` / 指针 ★
+     *
+     * ARM 上地址就是 32 位,用 u32 是**如实**。但更重要的理由是:
+     * 宿主的指针是 8 字节,只要这个结构体里出现一个指针宽度的字段,
+     * 宿主上的布局就与目标板**不同** —— 而汇编按固定偏移访问它,
+     * 于是"在宿主机上验证偏移"这件事就做不成了
+     * (本项目已经在 heap_block_t 的 sizeof 上踩过一次同样的坑)。
+     *
+     * 用 u32 之后两个平台的布局一致,下面的 _Static_assert 在宿主上
+     * 校验的就是**目标板的真实偏移**。
+     */
+    u32 stack_top; /* 本核栈区顶部,start.S 用的同一值 */
+
+    /*
+     * 本核当前正在跑的线程的**地址**(M4-6 加,M4-7 开始用)。
+     *
+     * 对应 x86 的 `PROCESSOR_INFO.current_task`(`include/smp/smp.h:43`)。
+     * x86 按 `%gs:0x4c0` 访问它,而那个偏移**没有任何 static_assert**
+     * (见计划 §4.7.6)。ARM 用 TPIDRPRW 拿到本结构体指针之后按
+     * `ARM_PERCPU_OFF_CURRENT_TASK` 访问 —— 由下面的断言钉住,
+     * 而且宿主上验的就是目标偏移。
+     *
+     * 类型是 u32(地址)而不是 `tcb_t`:见上面那条规则。
+     * 取用处统一走 `percpu_task_ptr()` 做转换,不要到处写强制转换。
+     */
+    u32 current_task;
 } percpu_t;
+
+/* 把 current_task 取成 tcb_t。集中在一处,避免散落的强制转换 */
+struct arm_thread_control_block;
+#define percpu_task_ptr(p) ((struct arm_thread_control_block *)(uintptr_t)((p)->current_task))
+
+/* ------------------------------------------------------------------ */
+/* ★ 把汇编用到的偏移钉死 ★                                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 这一条是补 x86 的短板:x86 的 per-CPU 偏移(handler.S:29-31)
+ * 被汇编硬编码却零编译期保护。ARM 侧加一个字段忘了改汇编,在这里就会报错。
+ */
+_Static_assert(offsetof_arm(percpu_t, current_task) == ARM_PERCPU_OFF_CURRENT_TASK,
+               "current_task 的偏移变了 —— 同步改 arch/taskctx_asm.h 的 ARM_PERCPU_OFF_CURRENT_TASK");
 
 extern percpu_t g_percpu[PERCPU_MAX_CPUS];
 
@@ -86,7 +128,7 @@ u32 percpu_online_count(void);
  * 返回本核的结构体;核号越界或已初始化过则返回 NULL。
  * 必须在使用任何 percpu_self() 之前调用。
  */
-percpu_t *percpu_init_self(uintptr_t stack_top);
+percpu_t *percpu_init_self(u32 stack_top);
 
 /* 取本核结构体(TPIDRPRW)。未初始化时返回 NULL */
 percpu_t *percpu_self(void);

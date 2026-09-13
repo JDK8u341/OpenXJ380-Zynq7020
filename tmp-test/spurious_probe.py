@@ -38,7 +38,47 @@ OFF_UNHANDLED = 0x08
 
 # percpu_t 里 ticks 的偏移(见 include/arch/percpu.h)
 OFF_PC_TICKS = 0x10
-PERCPU_SIZE = 40  # 10 个 u32(含 stack_top)
+
+
+def percpu_layout() -> tuple[int, int]:
+    """从**当前头文件**算出 sizeof(percpu_t) 与 ticks 的偏移。
+
+    ⚠ 原来这两个数是硬编码的(40 / 0x10),而 M4-6 往 percpu_t 里加了
+      current_task 之后 40 就过期了 —— 本脚本会安静地去读 CPU1 结构体
+      错位后的字节,读出来的数看着像模像样,其实毫无意义。
+      这种"工具自己过期"的坑不值得再踩一次,所以改成每次现算。
+
+    做法:让宿主编译器算好再用 objdump/nm 不方便,直接用 clang 编一个
+    只打印这两个数的临时程序。宿主与目标在 percpu_t 上布局一致,因为
+    该结构体**只含 u32 字段**(这是 arch/percpu.h 里的刻意约束)。
+    """
+    import subprocess as sp
+    import tempfile
+
+    src = """
+int printf(const char *fmt, ...);
+#include <arch/percpu.h>
+int main(void)
+{
+    printf("%u %u\\n", (unsigned)sizeof(percpu_t),
+           (unsigned)__builtin_offsetof(percpu_t, ticks));
+    return 0;
+}
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        c = Path(tmp) / "p.c"
+        exe = Path(tmp) / "p.exe"
+        c.write_text(src, encoding="utf-8")
+        for cc in ("clang", "gcc", "cc"):
+            r = sp.run([cc, "-std=c11", "-w", "-I", str(ROOT / "arch/arm32/include"), str(c),
+                        "-o", str(exe)], capture_output=True, text=True)
+            if r.returncode == 0:
+                out = sp.run([str(exe)], capture_output=True, text=True).stdout.split()
+                return int(out[0]), int(out[1])
+    raise RuntimeError("算不出 percpu_t 的布局:没有可用的宿主 C 编译器")
+
+
+PERCPU_SIZE, OFF_PC_TICKS = percpu_layout()
 
 
 def sym(name: str) -> int:

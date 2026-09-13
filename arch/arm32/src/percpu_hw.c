@@ -7,7 +7,7 @@
 #include <arch/cpu.h>
 #include <arch/percpu.h>
 
-percpu_t *percpu_init_self(uintptr_t stack_top)
+percpu_t *percpu_init_self(u32 stack_top)
 {
     u32       mpidr = arch_read_mpidr();
     u32       id    = mpidr & 0x3u;
