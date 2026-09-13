@@ -26,6 +26,7 @@
 #include <arch/irq.h>
 #include <arch/led.h>
 #include <arch/mmu.h>
+#include <arch/palloc.h>
 #include <arch/percpu.h>
 #include <arch/platform.h>
 #include <arch/selftest.h>
@@ -51,6 +52,20 @@ extern char __stack_top[];
  * 已经踩过一次同样的坑。
  */
 #define CPU1_BOOT_TIMEOUT_US 200000u
+
+/*
+ * 物理页分配器实例与其 bitmap(M4-2)。
+ *
+ * 放在这里而不是模块内部:bitmap 是 64KB,必须是**静态分配**的 ——
+ * 分配器不能给自己分配存储,那是先有鸡还是先有蛋。
+ * 64KB 在 .bss 里,落在内核镜像之内,所以不会被池自己发出去。
+ */
+u32      g_palloc_bitmap[PALLOC_BITMAP_WORDS];
+palloc_t g_palloc;
+
+/* 物理页分配器的自检与冒烟结果,供自检报告使用 */
+static u32 g_palloc_selftest;
+static u32 g_palloc_smoke;
 
 /* SMP 压力测试的结果,供自检报告使用 */
 static smp_stress_result_t g_smp_stress;
@@ -672,6 +687,81 @@ void kmain(void)
     }
     console_puts("\n");
 
+    /* ---- 9.4 物理页分配器(M4-2) ---- */
+    /*
+     * 池的范围 = [_kernel_end 向上对齐, DDR 末尾)。
+     *
+     * 为什么从 _kernel_end 开始而不是从 DDR 基址:内核镜像、页表、两个核的
+     * 栈、L2 基准缓冲区全都在镜像之内(链接脚本定义的符号),所以镜像之后
+     * 的才是真正没主的物理内存。**不需要**再逐个 palloc_reserve ——
+     * 那些区域根本不在池范围内,reserve 它们只会是空操作。
+     *
+     * ⚠ 但这个"不需要"依赖一件事:**任何将来新增的静态占用都必须落在
+     *   镜像之内**(即通过链接脚本而不是运行时分配)。将来若有人把某个
+     *   大缓冲区放在镜像之外的固定物理地址上,必须在这里补一条 reserve。
+     */
+    {
+        extern char         _kernel_end[];
+        extern u32          g_palloc_bitmap[PALLOC_BITMAP_WORDS];
+        extern palloc_t     g_palloc;
+
+        uintptr_t   pool_base;
+        size_t      pool_size;
+        palloc_err_t e;
+
+        pool_base = ((uintptr_t)_kernel_end + PALLOC_PAGE_SIZE - 1u) & ~(uintptr_t)(PALLOC_PAGE_SIZE - 1u);
+        pool_size = (size_t)(PLAT_DDR_END - pool_base);
+        pool_size &= ~(size_t)(PALLOC_PAGE_SIZE - 1u);
+
+        e = palloc_init(&g_palloc, pool_base, pool_size, g_palloc_bitmap, PALLOC_BITMAP_WORDS);
+
+        if (e == PALLOC_OK) {
+            console_printf(" Page alloc  : %u pages (%u MB) at 0x%08X\n",
+                           g_palloc.page_count,
+                           (u32)(((uintptr_t)g_palloc.page_count * PALLOC_PAGE_SIZE) >> 20), (u32)pool_base);
+        } else {
+            console_printf(" Page alloc  : FAILED err=%u\n", (u32)e);
+        }
+
+        g_palloc_selftest = palloc_selftest();
+
+        /*
+         * 真实内存冒烟:分配一页、写一个图案、读回来、释放。
+         *
+         * 自检跑的是**合成实例**(基址 0x10000000,在宿主上也能跑),
+         * 它证明分配器的逻辑对,但证明不了"这段物理内存真的能用"。
+         * 这一步才是对真实 RAM 的读写 —— 与缓存那节"写回读"同一个道理。
+         */
+        g_palloc_smoke = 0u;
+        if (e == PALLOC_OK) {
+            uintptr_t page = 0;
+
+            if (palloc_alloc(&g_palloc, &page) == PALLOC_OK) {
+                volatile u32 *w = (volatile u32 *)page;
+                u32           i;
+                u32           ok = 1u;
+
+                for (i = 0; i < (PALLOC_PAGE_SIZE / 4u); i++) {
+                    w[i] = 0xA5A50000u ^ i;
+                }
+                for (i = 0; i < (PALLOC_PAGE_SIZE / 4u); i++) {
+                    if (w[i] != (0xA5A50000u ^ i)) {
+                        ok = 0u;
+                        break;
+                    }
+                }
+
+                if (palloc_free(&g_palloc, page) != PALLOC_OK) {
+                    ok = 0u;
+                }
+
+                g_palloc_smoke = ok;
+                console_printf(" Page smoke  : alloc/write/readback/free at 0x%08X = %s\n", (u32)page,
+                               ok ? "PASS" : "FAIL");
+            }
+        }
+    }
+
     /* ---- 9.5 第二个核(AM3-1/2/3) ---- */
     /*
      * 位置:MMU 与缓存都已就绪之后。
@@ -810,6 +900,11 @@ void kmain(void)
      * 起来了但没置 online),而心跳里的 stage 槽正好区分它们。
      * 合成一项会把这条线索丢掉。
      */
+    selftest_report("palloc_selftest", g_palloc_selftest, 0u, SELFTEST_EQ);
+    selftest_report("palloc_smoke", g_palloc_smoke, 1u, SELFTEST_EQ);
+    /* 池至少要有 100000 页(约 390MB)—— 数字写小了等于没判 */
+    selftest_report("palloc_pages_ok", (g_palloc.page_count >= 100000u) ? 1u : 0u, 1u, SELFTEST_EQ);
+
     selftest_report("smp_cpu1_online", g_percpu[1].online, 1u, SELFTEST_EQ);
     selftest_report("smp_cpu1_stage", HB[HB_SLOT_CPU1_STAGE], HB_CPU1_STAGE_ONLINE, SELFTEST_EQ);
 

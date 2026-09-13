@@ -48,6 +48,8 @@
 
 #define PLAT_DDR_BASE     0x00100000u /* 设备树 memory@00100000 */
 #define PLAT_DDR_SIZE     0x3FF00000u /* 1GB 减去低端保留区 */
+/* DDR 的上界(不含)。物理页分配器用它算池的大小 */
+#define PLAT_DDR_END      (PLAT_DDR_BASE + PLAT_DDR_SIZE)
 
 /* 内核加载地址:ps7_init 完成 DDR 初始化后由 JTAG 直接下载至此 */
 #define PLAT_KERNEL_LOAD  0x00100000u

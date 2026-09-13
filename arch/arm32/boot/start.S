@@ -41,6 +41,44 @@
     .section .text.boot, "ax"
 
 /*
+ * 使能 VFP/NEON(CP10 与 CP11)。
+ *
+ * ⚠ 这一段不是"可选优化",漏了会直接崩,而且是**极难联想到根因**的崩法:
+ *
+ *   内核用 -mfpu=vfpv3 -mfloat-abi=hard 编译。只要某个函数大到让 GCC
+ *   决定用 VFP 寄存器做块拷贝(实测 palloc_selftest 里的 64KB 静态数组
+ *   初始化就触发了),生成出来的就是 vldr/vstr 一类的指令。
+ *   而 CPACR 没放开时,这些指令会以 **Undefined Instruction** 异常收场 ——
+ *   报错现场指向的是那条 vldr,看起来像"编译器生成错了代码",
+ *   实际是**内核少做了一步初始化**。
+ *
+ *   这颗雷从 M1 一直埋到 M4-2,只因为之前没有任何函数大到跨过那个阈值。
+ *
+ * 两个寄存器都要动:
+ *   CPACR(c1,c0,2) bits[23:20] —— 允许 PL0/PL1 访问 CP10/CP11;
+ *   FPEXC.EN(bit30)           —— VFP 本身的使能位。
+ *   只做其中一个仍然会 undefined。
+ *
+ * FPEXC 用 CP15 形式(p10,7,c8,c0,0)写,不依赖汇编器的 VFP 助记符支持。
+ *
+ * ⚠ CPACR 与 FPEXC 都是**每核**寄存器,所以 CPU1 也要调一次。
+ *
+ * r0 被破坏。本子程序不使用栈。
+ */
+    .type   enable_fpu, %function
+enable_fpu:
+    mrc     p15, 0, r0, c1, c0, 2      /* r0 = CPACR */
+    orr     r0, r0, #(0xF << 20)       /* CP10 与 CP11 全访问 */
+    mcr     p15, 0, r0, c1, c0, 2
+    isb
+
+    ldr     r0, =0x40000000            /* FPEXC.EN = bit30 */
+    mcr     p10, 7, r0, c8, c0, 0      /* FMXR FPEXC, r0 */
+    isb
+    bx      lr
+    .size   enable_fpu, . - enable_fpu
+
+/*
  * 建立一个核的全部模式栈。
  *
  *   r0 = 该核栈区的顶部
@@ -108,6 +146,13 @@ _start:
     ldr     r0, =__stack_top
     bl      setup_mode_stacks
 
+    /* ---- 2.5 使能 VFP ---- */
+    /*
+     * 必须排在**任何 C 代码之前** —— 编译器可能在任何函数里生成 VFP 指令。
+     * 放在建栈之后只是为了不破坏 __stack_top 那个 r0,顺序本身不敏感。
+     */
+    bl      enable_fpu
+
     /* ---- 3. 尽早安装异常向量表 ---- */
     /*
      * 必须在任何可能出错的 C 代码之前完成:VBAR 复位值是 0,
@@ -168,6 +213,9 @@ cpu1_entry:
 
     ldr     r0, =__stack1_top
     bl      setup_mode_stacks
+
+    /* CPACR 与 FPEXC 都是每核寄存器 —— CPU1 必须自己开一次 VFP */
+    bl      enable_fpu
 
     /* VBAR 是每核寄存器,CPU1 必须自己装一次 */
     bl      vectors_install
