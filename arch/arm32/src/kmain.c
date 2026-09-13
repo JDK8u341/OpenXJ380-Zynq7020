@@ -224,6 +224,8 @@ static u32 g_wake_ctl_detected;
 static u32 g_reloc_ctl_a;
 static u32 g_reloc_ctl_b;
 static u32 g_reloc_ctl_detected;
+static u32 g_reloc_ctl_inv_delta; /* ★ 对照组窗口内 invalid 的增长量(有上界)*/
+static u32 g_reloc_ctl_inv_ok;    /* ★ 它在"派发次数"这个上界之内吗 */
 
 /* ---- M4-10:两核调度的自检状态 ---- */
 static u32 g_cpu1_sched_ready;   /* CPU1 的 idle + 队列都登记好了 */
@@ -235,6 +237,11 @@ static u32 g_smp_cpu1_preempted_at;
 static u32 g_smp_cpu0_preempted_at;
 static u32 g_smp_made;              /* 相 6 真的造出来的线程数(非空转的判据之一)*/
 static u32 g_smp_place_bad;         /* ★ 落在"不是更短的那个队列"上的线程数(应当 0)*/
+static u32 g_smp_app_cpu;           /* ★ 应用级线程落在哪个核(必须是 0)*/
+static u32 g_smp_app_created;
+static u32 g_smp_fp_bad;            /* 相 6 探针里浮点图案被破坏的总次数(应当 0)*/
+static u32 g_smp_fp_bad_cpu1;       /* ★ 其中落在 **CPU1** 上的那些(应当 0)*/
+static u32 g_smp_fp_ck_cpu1;        /* ★ CPU1 上真的核对过多少次(非空转:必须 > 0)*/
 static u32 g_smp_ap_idle_harvested; /* CPU1 的 idle 现场被收过(ctx.pc != 0)*/
 static u32 g_smp_ap_idle_back;      /* ★ 线程挂起之后 CPU1 **回到了 idle**(loops 还在涨)*/
 static u32 g_smp_ctl_detect;        /* A/B:置 pick_cpu0 之后 CPU1 一次都没切 */
@@ -1051,36 +1058,100 @@ static void starve_monitor(void *arg)
 /*
  * ★ M4-10:两核调度相用的探针 ★
  *
- * 它比前面那些探针都简单,因为这一相要证的事不在"线程内部":
- * **它自己观测到自己在哪个核上跑** —— 这是"两个核都真的在跑线程"
- * 唯一不依赖我推理的证据(`percpu_self()->cpu_id` 只有本核能填对,
- * 与 AM3 用 MPIDR 而不是 cpu_id 判"CPU1 真的起来了"是同一条规矩)。
+ * 它比前面那些探针多两件事,因为这一相要证的事不在"线程内部":
+ *
+ *   1. **它自己观测到自己在哪个核上跑** —— 这是"两个核都真的在跑线程"
+ *      唯一不依赖我推理的证据(`percpu_self()->cpu_id` 只有本核能填对,
+ *      与 AM3 用 MPIDR 而不是 `cpu_id` 判"CPU1 真的起来了"是同一条规矩)。
+ *
+ *   2. ★ **它顺手核对 d0-d31 还是不是自己的图案** ★
+ *      这一条补的是 M4-10 的一个**证据缺口**:10.6 把 VFP 的那个全局量
+ *      (`g_vfp_save_f`)换成了每核字段,理由是"两核同时调度时它会互相覆盖",
+ *      但 FP 探针(相 3 与 9.76)全都被钉在 CPU0 ——
+ *      **CPU1 上的浮点现场从没被任何判据检查过**。
+ *      而这一批探针按"最短队列"规则正好落在 CPU1 ⇒ 它们跑起来就把
+ *      "CPU1 的存/取对不对"这件事验了。
+ *
+ * ⚠ "图案只填一次"(与 M4-9.5 的 fp_probe 同一条规矩):每轮重填的话,
+ *   线程被切回来时会先把自己的图案写回去,"寄存器被对方改过"就被它自己
+ *   抹掉了 —— 判据永远通过。
  *
  * 墙钟预算很短(40ms),跑完就挂起 —— 两个核上的线程都必须会退出,
  * 否则 kmain 拿不回 CPU,"自检把系统挂住"。
  */
 #define SMP_SCHED_BUDGET_US 40000u
-#define SMP_SCHED_THREADS   3u
+#define SMP_SCHED_THREADS   3u /* 落到 CPU1 的那一批(按"最短队列"规则)*/
+#define SMP_APP_THREADS     1u /* ★ 应用级:必须落到 CPU0(哪怕 CPU1 更空)*/
+#define SMP_CTL_THREADS     2u /* 选核对照组:全塞 CPU0 */
 /* 对照组只要 2 个:一个占住 CPU0、一个备用。线程池只有 32 个槽(D14:没有退出路径)*/
-#define SMP_CTL_THREADS     2u
+#define SMP_PROBE_SLOTS (SMP_SCHED_THREADS + SMP_APP_THREADS + SMP_CTL_THREADS)
+
+typedef struct
+{
+    u32          pat[FP_TAG_WORDS];  /* 我的浮点图案(只填一次)*/
+    u32          snap[FP_TAG_WORDS]; /* 读回来的快照 */
+    u32          rmode;              /* 我的舍入模式 */
+    volatile u32 fp_bad;             /* 图案/舍入模式被破坏的次数(正常 0)*/
+    volatile u32 fp_checks;          /* 真核对过多少次(非空转的判据)*/
+    volatile u32 cpu_seen;           /* ★ 它**自己**观测到的核号(0xFFFFFFFF = 没跑)*/
+    volatile u32 done;
+} smp_probe_t;
+
+static smp_probe_t g_smp_probe[SMP_PROBE_SLOTS];
+
+static void smp_probe_reset(void)
+{
+    u32 i;
+    u32 j;
+
+    for (i = 0u; i < SMP_PROBE_SLOTS; i++) {
+        for (j = 0u; j < FP_TAG_WORDS; j++) {
+            /* 每个槽一个一眼可分的图案 —— 否则"读到别人的"看不出来 */
+            g_smp_probe[i].pat[j]  = 0x10000000u * (i + 1u) + j;
+            g_smp_probe[i].snap[j] = 0u;
+        }
+        g_smp_probe[i].rmode     = ((i & 1u) != 0u) ? 3u : 0u; /* 0 = 就近,3 = 向零 */
+        g_smp_probe[i].fp_bad    = 0u;
+        g_smp_probe[i].fp_checks = 0u;
+        g_smp_probe[i].cpu_seen  = 0xFFFFFFFFu;
+        g_smp_probe[i].done      = 0u;
+    }
+}
 
 static void smp_sched_probe(void *arg)
 {
-    u64       t0 = timer_read_us();
-    percpu_t *me = percpu_self();
-    u32       id = (me == NULL) ? 0xFFFFFFFFu : me->cpu_id;
+    smp_probe_t *p  = (smp_probe_t *)arg;
+    percpu_t    *me = percpu_self();
+    u64          t0 = timer_read_us();
+    u32          fpscr_dummy;
+    u32          j;
 
-    (void)arg;
+    /* d0-d31 <- 我的图案;FPSCR <- 我的舍入模式。**只填一次** */
+    arch_vfp_restore(p->pat, 0u);
+    arch_vfp_set_rmode(p->rmode);
 
     while ((timer_read_us() - t0) < (u64)SMP_SCHED_BUDGET_US) {
-        cpu_relax();
+        arch_vfp_save(p->snap, &fpscr_dummy);
+        p->fp_checks++;
+
+        for (j = 0u; j < FP_TAG_WORDS; j++) {
+            if (p->snap[j] != p->pat[j]) {
+                p->fp_bad++; /* ← 我的浮点现场被换掉了 */
+                break;
+            }
+        }
+        if (arch_vfp_get_rmode() != p->rmode) {
+            p->fp_bad++;
+        }
     }
 
-    /* ★ 只有本核能把自己的核号写对 ★ */
-    if (id < PERCPU_MAX_CPUS) {
-        g_smp_ran[id]++;
+    /* ★ 核号由**本核**自己写 ★ */
+    p->cpu_seen = (me == NULL) ? 0xFFFFFFFFu : me->cpu_id;
+    if (p->cpu_seen < PERCPU_MAX_CPUS) {
+        g_smp_ran[p->cpu_seen]++;
     }
 
+    p->done = 1u;
     thread_finish();
 }
 
@@ -1119,19 +1190,23 @@ static u32 starve_advanced(void)
  *   `while (ms--) timer_delay_us(1000)`,即 N 次**串行**的 1 毫秒等待。
  *   当前线程被抢占多久,它就多花多久。
  *
- *   上板实测(这个坑值得记下来,它是本项目第 39 个同类):
+ *   上板实测(坑 39):
  *     相 5 请求 1200ms、实际 **2880ms** —— 差额正好是被 4 个负载线程占住
  *     的那 1600ms;相 4 请求 3000ms、实际约 5.4s,状态线程于是"醒了 5 次"
  *     而不是 3 次(那个数从 M4-8.4 起就一直是 5,当时没人追问)。
  *
- *   **内核没有问题,是我用错了函数。** 但它让"相的长度"变成一个猜不出来的
- *   数,而这条判据的时序(负载活多久、粘住多久)全押在它上面。
- *   要"截止时刻"语义就得自己算一次绝对时间。
+ *   **内核没有问题,是用错了函数。** 但它让"相的长度"变成一个猜不出来的
+ *   数,而判据的时序(负载活多久、粘住多久)全押在它上面。
+ *
+ * ★ 所以本文件里**所有"等某个负载跑完"的等待都用它,不用 `timer_delay_ms`** ★
+ *   (相 0/2/3/4、以及三组对照组的窗口)。换来的是两样东西:
+ *     1. 相的长度可预测 —— `phase=XXXX ms` 现在是设计值,不是"看运气";
+ *     2. 启动更快 —— 相 4 从 5.4 s 变回 3.0 s,整机少等好几秒。
  *
  * ⚠ 这里**故意不让出**:相的长度必须由墙钟决定,而不是由"谁愿意让我跑"
  *   决定。被抢占时它会在恢复后立刻检查截止时刻并返回。
  */
-static void starve_wait_ms(u32 ms)
+static void wait_ms_wall(u32 ms)
 {
     u64 t0 = timer_read_us();
     u64 us = (u64)ms * 1000ull;
@@ -2722,7 +2797,7 @@ void kmain(void)
             console_puts(" Sched acc   : kthread_create FAILED\n");
         } else {
             sched_enable();
-            timer_delay_ms(100);
+            wait_ms_wall(100);
             g_tick_acc_ok = ((g_tick_acc_delta >= 10u * SCHED_TICK_NS) &&
                              (g_tick_acc_delta <= 40u * SCHED_TICK_NS))
                                 ? 1u
@@ -2759,7 +2834,7 @@ void kmain(void)
                  * 整个过程没有一句"手动切回测试点"的代码:这是 M4-9 与 M4-8
                  * 最本质的差别。
                  */
-                timer_delay_ms(200);
+                wait_ms_wall(200);
             }
         }
 
@@ -2794,7 +2869,7 @@ void kmain(void)
             if (sa == NULL || sb == NULL) {
                 console_puts(" Sched preempt: kthread_create FAILED\n");
             } else {
-                timer_delay_ms(SPIN_BUDGET_US / 1000u + 300u);
+                wait_ms_wall(SPIN_BUDGET_US / 1000u + 300u);
 
                 g_tick_switched    = sched_tick_switched();
                 g_tick_preempted   = sched_tick_preempted();
@@ -2857,7 +2932,7 @@ void kmain(void)
             if (fa == NULL || fb == NULL) {
                 console_puts(" Sched fp    : kthread_create FAILED\n");
             } else {
-                timer_delay_ms(FP_BUDGET_US / 1000u + 300u);
+                wait_ms_wall(FP_BUDGET_US / 1000u + 300u);
 
                 g_fp_done   = (g_fp[0].done && g_fp[1].done) ? 1u : 0u;
                 g_fp_bad    = g_fp[0].bad + g_fp[1].bad;
@@ -2900,7 +2975,7 @@ void kmain(void)
                 console_puts(" Sched sleep : kthread_create FAILED\n");
             } else {
                 /* 3 秒:够状态线程醒 2~3 次,也够负载线程跑完 2.4 秒 */
-                timer_delay_ms(3000u);
+                wait_ms_wall(3000u);
 
                 g_sleep_wakes_at   = g_status_wakes;
                 g_sleep_late_max_at = g_status_late_max_us;
@@ -2970,7 +3045,7 @@ void kmain(void)
 
             sw0  = sched_tick_switched();
             pre0 = sched_tick_preempted();
-            starve_wait_ms(STARVE_PHASE_MS);
+            wait_ms_wall(STARVE_PHASE_MS);
             t_wall = timer_read_us() - t_wall;
 
             g_starve_full_at    = g_starve_full;
@@ -3075,6 +3150,7 @@ void kmain(void)
      */
     {
         tcb_t st[SMP_SCHED_THREADS];
+        tcb_t at = NULL;
         u32   i;
         u32   sw0;
         u32   sw1;
@@ -3089,6 +3165,7 @@ void kmain(void)
         g_smp_ran[1] = 0u;
         g_smp_assign[0] = 0u;
         g_smp_assign[1] = 0u;
+        smp_probe_reset();
 
         sw0  = g_percpu[0].switched;
         sw1  = g_percpu[1].switched;
@@ -3101,7 +3178,7 @@ void kmain(void)
             u32 expect = (len1 < len0) ? 1u : 0u; /* 严格小于 ⇒ 平局给 CPU0 */
 
             sched_disable(); /* 每个线程各罩一次:不要把整个系统冻住一整段 */
-            st[i] = sched_kthread_create(smp_sched_probe, NULL, "smp");
+            st[i] = sched_kthread_create(smp_sched_probe, &g_smp_probe[i], "smp");
             sched_enable();
 
             if (st[i] == NULL) {
@@ -3117,12 +3194,41 @@ void kmain(void)
             }
         }
 
+        /*
+         * ★ 应用级线程:必须落到 CPU0 —— 哪怕 CPU1 的队列更短 ★
+         *
+         * 这一条是 M4-10.5 那条规则的**可执行判据**。没有它,那个 `if`
+         * 就是一段"编译过、今天不可能被执行"的代码 —— 而按本项目的规矩,
+         * 那不算实现(要在这台板上被跑过)。
+         *
+         * ⚠ 它落在 CPU0 之后会**正常跑起来**(应用级不是 idle,是可调度的),
+         *   所以它同时补上了另一件事:`ran[0] > 0`(CPU0 上真的跑过**我的**
+         *   探针,而不只是那个 1Hz 状态线程)。
+         */
+        {
+            tcb_t a;
+
+            sched_disable();
+            a = sched_kthread_create_level(smp_sched_probe, &g_smp_probe[SMP_SCHED_THREADS], "app",
+                                           TASK_APPLICATION_LEVEL);
+            sched_enable();
+
+            at = a;
+            if (a != NULL) {
+                made++;
+                g_smp_app_cpu = a->cpu_id;
+                if (a->cpu_id < PERCPU_MAX_CPUS) {
+                    g_smp_assign[a->cpu_id]++;
+                }
+            }
+        }
+
         {
             if (made == 0u) {
                 console_puts(" Sched smp   : kthread_create FAILED\n");
             } else {
                 /* 预算 40ms,给足 10 倍余量 —— 两个核都在抢 CPU,慢一点正常 */
-                starve_wait_ms(400u);
+                wait_ms_wall(400u);
 
                 /*
                  * ★ "CPU1 回到自己的 idle 了吗" ★
@@ -3142,7 +3248,7 @@ void kmain(void)
                 {
                     u32 l1a = g_percpu[1].loops;
 
-                    starve_wait_ms(100u);
+                    wait_ms_wall(100u);
                     g_smp_ap_idle_back = (g_percpu[1].loops > l1a) ? 1u : 0u;
                 }
 
@@ -3151,26 +3257,59 @@ void kmain(void)
                 g_smp_cpu0_preempted_at = g_percpu[0].preempted - pre0;
                 g_smp_place_bad         = place_bad;
                 g_smp_made              = made;
+                g_smp_app_created       = (at != NULL) ? 1u : 0u;
                 g_smp_ap_idle_harvested =
                     ((sched_idle_of(1u) != NULL) && (sched_idle_of(1u)->ctx.pc != 0u)) ? 1u : 0u;
+
+                /*
+                 * ★ 浮点现场:按"探针自己观测到的核号"分类汇总 ★
+                 *
+                 * 落在 **CPU1** 上的那些探针核对过 `fp_checks` 次,`fp_bad`
+                 * 必须为 0 —— 这一条补的正是"CPU1 的 VFP 存/取从没被验过"
+                 * 那个缺口(10.6 删掉全局 `g_vfp_save_f` 的理由就是它两核会互踩)。
+                 *
+                 * ⚠ `fp_checks_cpu1 > 0` 是**非空转**条件:没有它,
+                 *   "CPU1 上一个探针都没落"与"落了且全对"会长得一样。
+                 */
+                {
+                    u32 fp_bad_all = 0u;
+                    u32 fp_checks_cpu1 = 0u;
+                    u32 fp_bad_cpu1 = 0u;
+
+                    for (i = 0u; i < SMP_SCHED_THREADS + SMP_APP_THREADS; i++) {
+                        fp_bad_all += g_smp_probe[i].fp_bad;
+                        if (g_smp_probe[i].cpu_seen == 1u) {
+                            fp_bad_cpu1 += g_smp_probe[i].fp_bad;
+                            fp_checks_cpu1 += g_smp_probe[i].fp_checks;
+                        }
+                    }
+
+                    g_smp_fp_bad       = fp_bad_all;
+                    g_smp_fp_bad_cpu1  = fp_bad_cpu1;
+                    g_smp_fp_ck_cpu1   = fp_checks_cpu1;
+                }
 
                 g_smp_sched_ok =
                     ((g_smp_cpu1_switched_at > 0u) && (g_smp_cpu1_preempted_at > 0u) &&
                      (g_smp_cpu0_preempted_at > 0u) && (g_smp_ap_idle_harvested != 0u) &&
-                     (g_smp_ap_idle_back != 0u) && (g_smp_ran[1] > 0u) && (made == SMP_SCHED_THREADS))
+                     (g_smp_ap_idle_back != 0u) && (g_smp_ran[0] > 0u) && (g_smp_ran[1] > 0u) &&
+                     (made == SMP_SCHED_THREADS + SMP_APP_THREADS))
                         ? 1u
                         : 0u;
 
                 console_excl_begin();
                 console_printf(" Sched smp   : threads=%u/%u assign=(%u,%u) ran=(%u,%u) place_bad=%u\n",
-                               made, SMP_SCHED_THREADS, g_smp_assign[0], g_smp_assign[1], g_smp_ran[0],
-                               g_smp_ran[1], place_bad);
+                               made, SMP_SCHED_THREADS + SMP_APP_THREADS, g_smp_assign[0],
+                               g_smp_assign[1], g_smp_ran[0], g_smp_ran[1], place_bad);
                 console_printf(" Sched smp   : cpu1 switched=+%u preempted=+%u idle_harvested=%u back=%u\n",
                                g_smp_cpu1_switched_at, g_smp_cpu1_preempted_at,
                                g_smp_ap_idle_harvested, g_smp_ap_idle_back);
                 console_printf(" Sched smp   : cpu0 switched=+%u preempted=+%u  runq=(%u,%u)\n",
                                g_percpu[0].switched - sw0, g_smp_cpu0_preempted_at,
                                sched_cpu_runq_len(0u), sched_cpu_runq_len(1u));
+                console_printf(" Sched smp   : app_level cpu=%u (must be 0)  fp: bad_all=%u "
+                               "cpu1_bad=%u cpu1_checks=%u\n",
+                               g_smp_app_cpu, g_smp_fp_bad, g_smp_fp_bad_cpu1, g_smp_fp_ck_cpu1);
                 console_printf(" Sched smp   : two cores scheduling = %s\n",
                                g_smp_sched_ok ? "PASS" : "FAIL");
                 console_excl_end();
@@ -3515,9 +3654,28 @@ void kmain(void)
      *                        —— 也就是"切进过 CPU1 的 idle、又切走了"
      */
     selftest_report("smp_sched_two_cores", g_smp_sched_ok, 1u, SELFTEST_EQ);
-    selftest_report("smp_sched_created", g_smp_made, SMP_SCHED_THREADS, SELFTEST_EQ);
+    selftest_report("smp_sched_created", g_smp_made, SMP_SCHED_THREADS + SMP_APP_THREADS, SELFTEST_EQ);
     selftest_report("smp_sched_placement", (g_smp_place_bad == 0u) ? 1u : 0u, 1u, SELFTEST_EQ);
     selftest_report("smp_sched_cpu1_ran", (g_smp_ran[1] > 0u) ? 1u : 0u, 1u, SELFTEST_EQ);
+    selftest_report("smp_sched_cpu0_ran", (g_smp_ran[0] > 0u) ? 1u : 0u, 1u, SELFTEST_EQ);
+    /*
+     * ★ 应用级线程必须落在 CPU0(哪怕 CPU1 的队列更短)★
+     *
+     * M4-10.5 那条规则的**可执行判据**。判据取 1 而不是 0 是有意的:
+     *   `g_smp_app_cpu = 0` 才是对;写成 `== 1` 之类的反向断点会让人误读成
+     *   "落到 CPU1 才算过"。(所以这里显式比较 0,并且单独报"造出来了吗"。)
+     */
+    selftest_report("smp_app_level_cpu0",
+                    ((g_smp_app_created != 0u) && (g_smp_app_cpu == 0u)) ? 1u : 0u, 1u, SELFTEST_EQ);
+    /*
+     * ★ CPU1 上的浮点现场 ★ —— 这一条补的是 10.6 的证据缺口。
+     *
+     * `fp_ck_cpu1 > 0` 是非空转条件;`fp_bad_cpu1 == 0` 才是判据本身。
+     * 两个分开报,因为它们的失败含义完全不同。
+     */
+    selftest_report("smp_fp_cpu1_checked", (g_smp_fp_ck_cpu1 > 0u) ? 1u : 0u, 1u, SELFTEST_EQ);
+    selftest_report("smp_fp_cpu1_ok", (g_smp_fp_bad_cpu1 == 0u) ? 1u : 0u, 1u, SELFTEST_EQ);
+    selftest_report("smp_fp_all_ok", (g_smp_fp_bad == 0u) ? 1u : 0u, 1u, SELFTEST_EQ);
     selftest_report("smp_ap_idle", g_smp_ap_idle_harvested, 1u, SELFTEST_EQ);
     selftest_report("smp_ap_idle_back", g_smp_ap_idle_back, 1u, SELFTEST_EQ);
     selftest_report("smp_cpu1_sched_ready", g_cpu1_sched_ready, 1u, SELFTEST_EQ);
@@ -3697,7 +3855,7 @@ void kmain(void)
              * 现在不会用到它(队列空 + current==idle ⇒ 直接早退),
              * 但那是"碰巧安全",不是"设计安全":将来任何一相只要造一个
              * 会挂起的线程,idle 就会被重新挑中,`rfeia` 会拿着那个陈旧
-             * 快照从 `timer_delay_ms` 中间把 kmain 重新跑起来 ——
+             * 快照从 `wait_ms_wall` 的忙等中间把 kmain 重新跑起来 ——
              * 而它的栈已经退掉了。所以老老实实备份再还原。
              */
             idle_ctx_backup = sched_boot_idle()->ctx;
@@ -3724,7 +3882,7 @@ void kmain(void)
 
             g_reloc_skip = 1u; /* ★ 对照组:决策照做,不交出目标帧 ★ */
             sched_enable();
-            timer_delay_ms(SPIN_BUDGET_US / 1000u + 200u);
+            wait_ms_wall(SPIN_BUDGET_US / 1000u + 200u);
 
             inv_after = sched_tick_invalid_ctx();
             g_reloc_skip = 0u;
@@ -3738,10 +3896,31 @@ void kmain(void)
              *   2. 这期间**确实做了切换决策**(否则"没跑起来"只是因为
              *      压根没人被挑中,那就什么也证明不了)。
              *
-             * ⚠ 这一相里**完整的切换只有头两次**,而且判据里那个 `>`
-             *   比较的就是"这期间到底有没有真的搬过帧"。别再把它写成
-             *   "current_task 轮转了好几遍" —— 那是错的说法:实测窗口内
-             *   `switched` 只涨 2、`invalid` 一次都没涨(见下面那段留痕)。
+             * ⚠ 这一相里**完整的切换只有头两次**,判据里那个 `>` 比较的就是
+             *   "这期间到底有没有真的搬过帧"。
+             *
+             * ★ `invalid_ctx` 会涨 —— 而且**它应该涨**(曾经的"时序敏感点",
+             *   现在能算了)★
+             *
+             *   M4-8.4 的留痕写的是"invalid 一次都没涨",那是当时的事实;
+             *   M4-9.5 之后同样的对照里它涨到 **53**。差别在于:
+             *
+             *     `g_reloc_skip = 1` 只让"交出目标帧"这一步不发生,
+             *     **收现场那一步照做** —— 于是 ca/cb 的 ctx 每轮都被换成
+             *     kmain 的现场(sp 指向启动栈,而它们自己的栈在栈池里)。
+             *     下一发 tick 照样会挑中它们(它们从没跑过 ⇒ vruntime 极小
+             *     ⇒ deadline 最小),而 `sched_ctx_switchable()` 要求
+             *     "sp 必须落在自己的栈区里" ⇒ **拒绝** ⇒ `invalid_ctx++`。
+             *
+             *   ⇒ 它涨到多少是**可算的**:窗口里每 `TIME_SLICE` 个 tick 做一次
+             *     派发决策,所以上限 = 窗口毫秒 / (TIME_SLICE × tick 毫秒)。
+             *     实测 53、上限 59 ⇒ 几乎每一次派发都挑中了那两个被污染的
+             *     线程,与推演一致。
+             *
+             *   ★ 这条上界还守住一个**历史故障**:曾经 `invalid_ctx` 涨到
+             *     **85139**(对照组把常驻线程的 ctx 弄脏,它被永远拒绝),
+             *     那种数量级会被这条判据当场抓住 —— 而当时它是靠"状态行
+             *     不再出声"这种间接现象才被发现的。
              *
              * ⚠★ 慢串口效应:**打印本身要花掉几十毫秒,而那期间系统还在跑。**
              *   9600 波特下一行 60 多个字符要传 60~80ms,约等于几十到上百发 tick。
@@ -3750,6 +3929,14 @@ void kmain(void)
              *   办法就是窗口前后各取一次、打差值(下面收拾挪到打印之前,
              *   也是同一个道理:别让"半复位状态"横跨慢 I/O)。
              */
+            g_reloc_ctl_inv_delta = inv_after - inv_before;
+            {
+                u32 window_ms = SPIN_BUDGET_US / 1000u + 200u;
+                u32 slice_ms  = (u32)((SCHED_TIME_SLICE * SCHED_TICK_NS) / 1000000ull);
+                u32 bound     = (window_ms / ((slice_ms == 0u) ? 1u : slice_ms)) + 4u;
+
+                g_reloc_ctl_inv_ok = (g_reloc_ctl_inv_delta <= bound) ? 1u : 0u;
+            }
             g_reloc_ctl_detected =
                 ((g_reloc_ctl_a == 0u) && (g_reloc_ctl_b == 0u) &&
                  (sched_tick_switched() > sw_before))
@@ -3805,24 +3992,44 @@ void kmain(void)
                            inv_before, inv_after);
             console_printf(" Preempt A/B : 未搬帧 -> %s(这就是「决策说切了、执行流没动」的样子)\n",
                            g_reloc_ctl_detected ? "检出" : "未检出 —— 判据不承重!");
+            /*
+             * ★ `invalid` 的增长量:从"没定位的敏感点"变成"可算的上界" ★
+             *
+             * 窗口 220ms ÷ 片长 4ms ≈ 55 次派发决策 ⇒ 上界 59。
+             * 实测 53 ⇒ 几乎每一次派发都挑中了那两个被污染的线程。
+             * 它同时是"污染有没有**失控**"的哨兵:曾经的 85139 会被它抓住。
+             *
+             * ⚠ 它的结论**只能在这里打**(不能进自检报告):
+             *   报告在 9.75 **之前**就打完了(对照组会故意把调度状态搅歪,
+             *   放进报告区间会让别的项跟着歪 —— 见 9.75 开头那段)。
+             *   所以这条与另外五组 A/B 一样,以普通输出给出。
+             *   (第一版我把它写成了报告项,于是它读到的永远是初值 0 ⇒ 一条
+             *    假 FAIL —— 而"报告在对照组之前"这件事本来就是这个项目的
+             *    既有约定。)
+             */
+            console_printf(" Preempt A/B : invalid bound: delta=%u <= %u -> %s\n",
+                           g_reloc_ctl_inv_delta,
+                           (SPIN_BUDGET_US / 1000u + 200u) /
+                                   (u32)((SCHED_TIME_SLICE * SCHED_TICK_NS) / 1000000ull) +
+                               4u,
+                           g_reloc_ctl_inv_ok ? "PASS" : "FAIL(涨得比派发次数还多!)");
             console_excl_end();
             /*
-             * ⚠ 一个曾经留痕、现在有结果的观察:
+             * ⚠ 一个曾经留痕、**现在已定位**的观察(留作记录):
              *
              *   早先几轮里这一行打出过 `invalid=0->0` —— 窗口内 `switched`
-             *   涨了 2 而 `invalid` 一次都没涨,与"第 2 次之后 ca 的 ctx
-             *   被收成 kmain 的现场、于是持续被拒绝"的推演不符。
+             *   涨了 2 而 `invalid` 一次都没涨;M4-9.5 之后同样的对照变成
+             *   `0->53`。当时记的是"时序对代码改动敏感,敏感点还没定位"。
              *
-             *   **加入 M4-9.5 的浮点现场切换之后,它变成 `0->53`** ——
-             *   与推演一致(窗口 220ms ÷ 4 tick 片长 ≈ 55)。
-             *   先前那次为什么是 0 我没有查明,现象现在也不复现了。
-             *   记在这里是因为"当时的推演与实测不符"本身是信息:
-             *   它说明这条路径的时序对代码改动**敏感**,而敏感点还没定位。
-             *   交给 M4-10(每核队列会重写这一片)时一并看。
+             *   → 现在能算清楚了(见上面那段推导):`invalid` 的次数 =
+             *     窗口内"挑中了 ctx 已被污染的线程"的派发次数,其**上界**由
+             *     窗口长度 ÷ 片长决定(220ms ÷ 4ms ≈ 55,判据取 59)。
+             *     53 与 55 的差就是最前面那两次:那时 ca/cb 的 ctx 还是
+             *     它们**自己**的(刚造出来的合法上下文),于是 `switched` 涨 2
+             *     而没有被拒绝。**两个数现在是同一条账上的。**
              *
-             * ⚠ 无论取哪个值,都不影响检出判据:判据是
-             *   "两个探针计数**都是 0**"且"这段时间**确实搬过帧**",
-             *   两件事都由实测值直接支撑。
+             * ⚠ 无论取哪个值,检出判据都不受影响:它是"两个探针计数**都是 0**"
+             *   且"这段时间**确实搬过帧**",两件事都由实测值直接支撑。
              */
         }
     }
@@ -3863,7 +4070,7 @@ void kmain(void)
 
             g_vfp_skip = 1u; /* ★ 对照组:不换浮点现场 ★ */
             sched_enable();
-            timer_delay_ms(FP_BUDGET_US / 1000u + 300u);
+            wait_ms_wall(FP_BUDGET_US / 1000u + 300u);
             g_vfp_skip = 0u;
 
             console_excl_begin();
@@ -3941,7 +4148,7 @@ void kmain(void)
 
             g_wake_skip = 1u; /* ★ 对照组:扫描里不再唤醒 ★ */
             sched_enable();
-            timer_delay_ms(1500u);
+            wait_ms_wall(1500u);
             g_wake_skip = 0u;
 
             g_wake_ctl_detected = (g_status_ctl_wakes == before) ? 1u : 0u;
@@ -4036,7 +4243,7 @@ void kmain(void)
             u32 sticky_left;
             u64 t_wall = timer_read_us();
 
-            starve_wait_ms(STARVE_CTL_MS);
+            wait_ms_wall(STARVE_CTL_MS);
             t_wall = timer_read_us() - t_wall;
 
             ev          = g_starve_events;
@@ -4131,7 +4338,13 @@ void kmain(void)
 
         for (i = 0u; i < SMP_CTL_THREADS; i++) {
             sched_disable();
-            sa2[i] = sched_kthread_create(smp_sched_probe, NULL, "ab0");
+            /*
+             * ⚠ 探针槽接在相 6 后面用(SMP_SCHED_THREADS + SMP_APP_THREADS 起)——
+             *   探针**不看自己那格里的旧值**,只往里写(图案/核号/计数),
+             *   所以这里不必清;相 6 读过的那些值早就取走了。
+             */
+            sa2[i] = sched_kthread_create(smp_sched_probe,
+                                          &g_smp_probe[SMP_SCHED_THREADS + SMP_APP_THREADS + i], "ab0");
             sched_enable();
             if (sa2[i] == NULL) {
                 continue;
@@ -4159,7 +4372,7 @@ void kmain(void)
                            made, SMP_CTL_THREADS);
             console_excl_end();
         } else {
-            starve_wait_ms(400u); /* 截止时刻语义,不是 N 次串行 1ms —— 见坑 39 */
+            wait_ms_wall(400u); /* 截止时刻语义,不是 N 次串行 1ms —— 见坑 39 */
         }
 
         g_smp_ctl_cpu1_delta = g_percpu[1].switched - sw1_before;

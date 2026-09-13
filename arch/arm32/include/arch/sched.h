@@ -398,12 +398,27 @@ bool sched_is_enabled(void);
 u64 sched_off_total_ns(void);
 
 /*
- * 造一个内核线程并把本核就绪队列按 deadline 有序插入。
+ * 造一个内核线程,并把它放进**挑出来的那个核**的队列(见 sched_pick_cpu)。
  *
  * TCB 从内核堆取(不是静态数组 —— 线程数不能是编译期常量),
  * 内核栈从 M4-5 的栈池取(带 guard page)。两者任一失败就整体回滚。
  */
 tcb_t sched_kthread_create(void (*entry)(void *), void *arg, const char *name);
+
+/*
+ * 同上的**带任务等级**版本 —— 它是 M4-10.5 那条规则的判据入口。
+ *
+ * 源 OS 的等级来自 PCB(`pcb.h:113` 的 `task_level`),而 `add_task()` 里那句
+ * `if (new_task->task_level != TASK_APPLICATION_LEVEL)` 决定了
+ * **应用级线程永远落在 CPU0**。内核线程全是 `TASK_KERNEL_LEVEL`,所以:
+ *
+ *   - 平时走 `sched_kthread_create()`(它就是本函数 + `TASK_KERNEL_LEVEL`);
+ *   - **自检需要**造一个应用级线程去验证那条规则 —— 否则它就是一段
+ *     "编译过、今天不可能被执行"的代码(本项目对那种东西的规矩见 D10/D11)。
+ *
+ * ⚠ M7 有了用户进程之后,应用级线程就是走这条路创建的。
+ */
+tcb_t sched_kthread_create_level(void (*entry)(void *), void *arg, const char *name, i32 level);
 
 /*
  * 让出 CPU。**走的是陷阱,不是自己实现一套切换**。

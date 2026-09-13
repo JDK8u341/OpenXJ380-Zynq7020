@@ -399,6 +399,20 @@ static sched_queue_t *self_runq(void)
 
 tcb_t sched_kthread_create(void (*entry)(void *), void *arg, const char *name)
 {
+    return sched_kthread_create_level(entry, arg, name, TASK_KERNEL_LEVEL);
+}
+
+/*
+ * ★ M4-10.5:带任务等级的创建 —— 应用级线程必须落在 CPU0 ★
+ *
+ * 源 OS 的等级来自 PCB(`pcb.h:113`),`add_task()` 里那句
+ * `if (new_task->task_level != TASK_APPLICATION_LEVEL)` 让应用级**跳过整个
+ * 选核扫描** ⇒ 永远 CPU0。内核线程全是 `TASK_KERNEL_LEVEL`,所以平时走上面
+ * 那个薄包装;**自检**要造一个应用级线程去验这条规则(否则它就是一段
+ * "编译过、今天不可能被执行"的代码)。
+ */
+tcb_t sched_kthread_create_level(void (*entry)(void *), void *arg, const char *name, i32 level)
+{
     struct arm_thread_control_block *t;
     kstack_t                         stk;
     sched_queue_t                   *q;
@@ -427,7 +441,7 @@ tcb_t sched_kthread_create(void (*entry)(void *), void *arg, const char *name)
         return NULL;
     }
 
-    t->task_level    = TASK_KERNEL_LEVEL;
+    t->task_level    = level;
     t->status        = START;
     t->parent_group  = NULL;
     t->kernel_stack  = stk.top;
