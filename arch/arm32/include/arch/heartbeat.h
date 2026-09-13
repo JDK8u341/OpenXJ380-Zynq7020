@@ -84,7 +84,7 @@
 #define HB_SLOT_CACHESELFTEST 19u
 
 /*
- * L2 有效性:同一个 128KB 工作集在"关 L2"与"开 L2"下的耗时之比。
+ * L2 有效性:同一个 128KB 工作集在"关 L2"与"开 L2"下的耗时之比,**百分比**。
  *
  * 存在的理由与 HB_SLOT_CACHEBENCH 相同,但针对的是 L2 ——
  * 4KB 的工作集装得进 L1,根本碰不到 L2,所以那个加速比证明不了 L2 的事。
@@ -102,6 +102,25 @@
  */
 #define HB_SLOT_LEDCHECK  21u
 
+/*
+ * 设备描述层的 probe 结果:被驱动成功认领的设备数。
+ *
+ * 判据是"至少有一个被认领",而不是硬编码设备总数 ——
+ * 总数会随 XSA 变,写死它等于把一次硬件改动变成一次测试失败,
+ * 而那种失败没有任何信息量。
+ */
+#define HB_SLOT_PROBED    22u
+
+/*
+ * 启动自检的失败项数,0 = 全通过。
+ *
+ * 与串口上的自检报告是**互补**关系,不是重复:
+ *   - 串口报告:活着时给人和脚本一个总账,可自动判定;
+ *   - 这个槽:内核若在自检之后挂死,串口日志可能断在半截,
+ *     而 OCM 心跳仍在,JTAG 事后还能读到"到底有几项没过"。
+ */
+#define HB_SLOT_SELFTEST_FAILED 23u
+
 /* MMU 阶段的取值。0 表示还没开始 */
 #define HB_MMU_STAGE_IDLE       0u /* 尚未开始 */
 #define HB_MMU_STAGE_BUILT      1u /* 页表已填好 */
@@ -111,7 +130,7 @@
 #define HB_MMU_STAGE_FAILED     0xEEu /* 自检未通过,主动放弃开 MMU */
 
 /* 已定义的槽位数。越界写会踩到后面的故障注入选择器 */
-#define HB_SLOT_COUNT     22u
+#define HB_SLOT_COUNT     24u
 
 /* 心跳区预留的槽位容量(见 platform.h 的 PLAT_HEARTBEAT_REGION_SLOTS) */
 #define HB_SLOT_CAPACITY  PLAT_HEARTBEAT_REGION_SLOTS

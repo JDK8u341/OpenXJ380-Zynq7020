@@ -17,6 +17,7 @@
 #include <arch/cache.h>
 #include <arch/axi_gpio.h>
 #include <arch/board.h>
+#include <arch/board_devices.h>
 #include <arch/console.h>
 #include <arch/cpu.h>
 #include <arch/fault_test.h>
@@ -26,6 +27,7 @@
 #include <arch/led.h>
 #include <arch/mmu.h>
 #include <arch/platform.h>
+#include <arch/selftest.h>
 #include <arch/timer.h>
 #include <arch/types.h>
 #include <arch/uart_ps.h>
@@ -258,7 +260,7 @@ void kmain(void)
      */
     console_puts(" Device description layer\n");
     board_dump_devices();
-    (void)board_probe_all();
+    HB[HB_SLOT_PROBED] = board_probe_all();
     console_puts("\n");
 
     /*
@@ -571,7 +573,19 @@ void kmain(void)
                 console_puts(" L2 WARN     : no measurable benefit - L2 may not be caching\n");
             }
 
-            HB[HB_SLOT_L2BENCH] = (on_us > 0u) ? (off_us / on_us) : 0u;
+            /*
+             * 心跳槽里存**百分比**,不是比值。
+             *
+             * 实测比值是 1.42,取整后是 1 —— 而"1"这个数字写不出任何
+             * 有意义的判据:自检里若写 ">= 1" 就永远成立,等于没判。
+             * 存成 142 才能写出 ">= 120" 这种真正会失败的阈值。
+             *
+             * 这个不一致是被 tmp-test/verify_board.py 第一次跑就抓出来的:
+             * 判据写 ">= 100" 而槽里存 1,直接报 FAIL。
+             * 在此之前它不会以任何形式表现出来 —— 打印出来的
+             * "effective (off/on = 1.42x)" 看着完全正常。
+             */
+            HB[HB_SLOT_L2BENCH] = (on_us > 0u) ? ((off_us * 100u) / on_us) : 0u;
         }
     }
 
@@ -599,7 +613,62 @@ void kmain(void)
     }
     console_puts("\n");
 
-    /* ---- 10. 主循环 ---- */
+    /* ---- 10. 启动自检总账 ---- */
+    /*
+     * 位置:所有自检都跑完之后、主循环之前。
+     *
+     * 在此之前,"上板验证"靠人读日志判断"看起来没问题"——
+     * 既不可自动化(改一行就要重看一遍),判据也模糊
+     * ("speedup=6x 算不算通过"没有写在任何地方)。
+     * 这一段把判据写成代码并以固定格式回传,由 tmp-test/verify_board.py
+     * 解析并给出退出码。人只需要看最后那行 SUMMARY。
+     *
+     * 注意这里**只报告、不停机**:自检的意义是给出信息,
+     * 而不是把一个本来能跑的系统拦在启动阶段。
+     * 失败项数会写进心跳,挂死时用 JTAG 也能读到结论。
+     */
+    selftest_begin();
+
+    selftest_report("uart_present", uart_present ? 1u : 0u, 1u, SELFTEST_EQ);
+    selftest_report("uart_clock_source", clock_source, 1u, SELFTEST_EQ);
+    selftest_report("uart_baud_ppm", baud_result.error_ppm, 50u, SELFTEST_LE);
+
+    selftest_report("mmu_stage", HB[HB_SLOT_MMUSTAGE], HB_MMU_STAGE_ON, SELFTEST_EQ);
+    selftest_report("mmu_enabled", mmu_is_enabled() ? 1u : 0u, 1u, SELFTEST_EQ);
+
+    selftest_report("cache_dcache_on", cache_dcache_enabled() ? 1u : 0u, 1u, SELFTEST_EQ);
+    selftest_report("cache_icache_on", cache_icache_enabled() ? 1u : 0u, 1u, SELFTEST_EQ);
+    selftest_report("cache_speedup", HB[HB_SLOT_CACHEBENCH], 2u, SELFTEST_GE);
+    selftest_report("cache_maint_fail", HB[HB_SLOT_CACHESELFTEST], 0u, SELFTEST_EQ);
+    selftest_report("l2_enabled", l2_cache_is_enabled() ? 1u : 0u, 1u, SELFTEST_EQ);
+    selftest_report("l2_effect_pct", HB[HB_SLOT_L2BENCH], 120u, SELFTEST_GE);
+
+    /*
+     * 设备描述层。
+     *
+     * 判据是"**至少有一个设备被认领**",而不是硬编码的设备总数 ——
+     * 总数会随 XSA 变,写死它等于把一次硬件改动变成一次测试失败,
+     * 而那种失败没有任何信息量。
+     */
+    selftest_report("board_devices", g_board_device_count, 1u, SELFTEST_GE);
+    selftest_report("probe_probed", HB[HB_SLOT_PROBED], 1u, SELFTEST_GE);
+    selftest_report("led_writeback_fail", HB[HB_SLOT_LEDCHECK], 0u, SELFTEST_EQ);
+
+    /*
+     * 中断子系统。
+     *
+     * ticks 与 irq_count 必须相等:前者是处理函数里自增的,
+     * 后者是 GIC 实际转发次数。两者不符说明有中断被吞或未被 EOI,
+     * 而那种情况从单个计数器上看一切正常。
+     */
+    selftest_report("irq_ticks_eq_irq", (g_tick_seen == irq_get_stats()->irq_count) ? 1u : 0u, 1u,
+                    SELFTEST_EQ);
+    selftest_report("irq_spurious", irq_get_stats()->spurious_count, 0u, SELFTEST_EQ);
+
+    HB[HB_SLOT_SELFTEST_FAILED] = selftest_summary();
+    console_puts("\n");
+
+    /* ---- 11. 主循环 ---- */
     /*
      * 节奏完全由全局定时器决定,不依赖软件延时循环 ——
      * 这样即使 CPU 频率变化,闪烁频率也保持一致。
