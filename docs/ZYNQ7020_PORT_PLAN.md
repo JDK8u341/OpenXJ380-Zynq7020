@@ -191,6 +191,18 @@ THREAD_SYSCALL_USER_RSP = 0xb50
 
 ### 2.6 SMP：INIT-SIPI → `sev` + OCM
 
+> **阶段归属：本节内容已从 M3 拆出，后移到 AM3（After M3）执行。**
+> 顺序理由见 §4：SMP 的风险随系统复杂度成倍放大，应当放在
+> "描述层做完、调度器还没进来"的位置做，两个核面对的是同一份简单代码。
+>
+> **已提前完成的陆基**（在 M1/M2-5 期间顺手做掉了，AM3 不必再做）：
+> - SCU 已使能（`cortexa9_coherency_init()`，M2-5b）—— 它当初是为了让 L1 能缓存
+>   Shareable 的 DDR 而加，但正是 SMP 的前置条件；
+> - ACTLR 的 SMP 位（bit6）与缓存/TLB 维护广播位（bit0）已置；
+> - L1 + L2 缓存已使能并经基准验证（6~11x / 1.42x）；
+> - `arch/cpu.h` 里 `spin_t` / `arch_ldrex` / `arch_strex` / `spin_lock` 原语已写好，
+>   但**目前零调用者**——AM3 是它们的第一个用户。
+
 - `kernel/smp/smp_trapo.S`（163 行）是**16 位实模式 → 32 位保护模式 → 64 位长模式**
   的完整 AP 引导跳板：`.code16` 起点、`smsw`/`lmsw` 设 CR0.PE、`lidt/lgdt` 私有 GDT、
   `rdmsr 0xC0000080` 置 EFER.LME、最后 `jmpq *%r8`。**在 Cortex-A9 上零复用价值。**
@@ -203,6 +215,13 @@ THREAD_SYSCALL_USER_RSP = 0xb50
   换成 SCU/GIC 状态。
 - 每 CPU 寻址从 GS base（`write_kgsbase`）改为 `TPIDRPRW`；`swapgs`（`handler.S:309,373`）
   整个消失——**这是 ARM 侧少有的"变简单"的地方**。
+
+**AM3 才开始、但必须在第一天就定的一个设计点：PPI 是每核银行化的。**
+GIC Distributor 里管 0–31 号的 `GICD_ISENABLER0`，**每个核看到的是自己那一份**——
+CPU0 调 `gic_enable_irq(29)` 只影响 CPU0 的 bank。私有定时器正是 INTID 29。
+现在 `gic.c` 的 `g_irq_table[96]` 是全局的，且 29 号只在 CPU0 上使能过。AM3 要决定：
+PPI 的处理函数表按核分开，还是整表 per-CPU、SPI 注册时同步到所有核。
+**这个决定必须在写 CPU1 引导之前做，否则后面返工。**
 
 ### 2.7 上下文切换与浮点
 
@@ -585,11 +604,139 @@ scugic_hw.h             ← GIC 寄存器字典（仅参考）
 
 ---
 
+### 2.16 设备描述层（类 DTS）—— M3 的主体
+
+#### 为什么必须有这一层
+
+x86 侧**没有驱动模型**：不存在 `struct bus`/`struct driver`/`probe()`/`match()`/
+设备树/resource descriptor 中的任何一种。唯一的发现机制是 PCI 枚举
+（MCFG ECAM，否则 legacy `0xCF8/0xCFC`），其余全是固定 ISA 端口探测。
+
+而 ARM 这边**连枚举这个概念都不成立**：
+
+| | x86_64 | Zynq-7020 |
+|---|---|---|
+| 发现方式 | PCI 枚举 / ACPI 表 —— 硬件必须回答"你是谁" | **只能被告知** |
+| 地址 | BAR，运行期分配 | Vivado 地址编辑器写死 |
+| 中断号 | MSI / ACPI `_PRT` | 从 `xparameters.h` 抄 |
+| IP 参数 | 标准 capability 寄存器 | **`xlnx,is-dual` / `xlnx,gpio-width` 读不出来** |
+
+最后一行是关键：AXI GPIO 的数据寄存器宽度恒为 32 位、通道数不体现在任何 ID
+寄存器里——**硬件本身不告诉你它是什么**。所以描述不是可选优化，是唯一的信息来源。
+
+**没有枚举还有一个后果**：x86 上漏配一个设备，枚举照样能把它找出来；
+这里**描述表就是全部**——少写一个节点，驱动静默不加载且不报错。
+所以描述层必须自带启动时打印全部节点的能力，这是唯一能在"驱动没起来"时
+区分"驱动写错了"和"节点漏写"的手段。
+
+#### 描述模型（照 DTS 语义）
+
+```
+描述模型  ← 照 DTS：节点树 / compatible / reg / interrupts / 属性 / status
+落地形式  ← C 表 · DTB · 从 xparameters.h 生成   ← 三者可换，不影响模型
+```
+
+**这两个轴是独立的。** 先把模型定死，落地形式怎么换都不动驱动代码。
+
+```c
+/* DTS 属性 —— 节点里的任意键值 */
+typedef struct {
+    const char *name;      /* "xlnx,is-dual"                    */
+    uint32_t    value;     /* 1                                 */
+} plat_prop_t;
+
+/* DTS 节点 */
+typedef struct plat_device {
+    const char        *name;        /* "uart1"          (node name)      */
+    const char        *compatible;  /* "xlnx,ps7-uart"  (compatible)     */
+
+    uintptr_t          reg_base;    /* 0xE0001000       (reg = <base size>) */
+    size_t             reg_size;
+
+    int32_t            irq;         /* **已解码的 GIC INTID**            */
+    uint32_t           irq_flags;   /* 1=电平 3=边沿    (interrupts)     */
+
+    const char        *clocks;      /* "uart_clk"       (clocks)         */
+
+    const plat_prop_t *props;       /* 不可探测的 IP 参数                */
+    uint32_t           prop_count;
+
+    const char        *parent;      /* 预留:层级(AXI 互联),本期不实现   */
+    uint32_t           bus;         /* PLAT_BUS_AXI / APB                */
+    bool               enabled;     /* "okay" / "disabled"  (status)     */
+} plat_device_t;
+
+/* 驱动侧 —— 与 Linux 的 of_match_table 同形，只是表是编译期常量 */
+typedef struct {
+    const char *compatible;
+    int       (*probe)(const plat_device_t *dev);   /* 0 = 认领 */
+    void      (*remove)(const plat_device_t *dev);
+} plat_driver_t;
+```
+
+匹配就是 `devices × drivers` 的 `strcmp(compatible)` 循环，命中调 `probe()`。
+
+#### 必须收在描述层里的一件事：中断号解码
+
+`xparameters.h` 里的 `_INTERRUPTS` **不是 INTID**，是编码过的
+（定义见 BSP 的 `xinterrupt_wrap.h`）：
+
+```
+bits[11:0]  = 相对中断号
+bits[15:12] = 触发类型
+bit20       = 0 = SPI,1 = PPI
+实际 GIC INTID = 相对号 + (SPI ? 32 : PPI ? 16 : 0)
+```
+
+拿本板真实值验算过：
+
+| 外设 | `_INTERRUPTS` | 解码 | 实际 INTID |
+|---|---|---|---|
+| `SCUTIMER` | `0x13100d` | PPI,相对 13 → +16 | **29**（正是 Cortex-A9 私有定时器）|
+| `QSPI` | `0x4013` | SPI,相对 0x13 → +32 | **51** |
+
+**这个解码绝不能留给每个驱动**——差 32 的错会让驱动挂到一个完全无关的中断上，
+而且 symptoms 取决于那个中断恰好是什么。
+
+#### 落地形式：从 `xparameters.h` 生成
+
+`xparameters.h` 是 Vitis 从 XSA 导出的**已经扁平化的 DTS 表示**，
+包含 `_COMPATIBLE` / `_BASEADDR` / `_HIGHADDR` / `_INTERRUPTS` /
+`_INTERRUPT_PARENT` 以及各 IP 的参数（如 `XPAR_AXI_GPIO_0_IS_DUAL`、
+`XPAR_AXI_GPIO_0_GPIO_WIDTH`）。
+
+新增 `tools/gen_board_desc.py`：解析它 → 生成 `plat_device_t` 表。
+这相当于把 Xilinx 的 `XLookupConfig` 机制换成本项目自己的形态，
+但**同样遵循"单一真值来源 = XSA"**，且内核侧零运行期依赖。
+
+- 与仓库已有的 `tools/gen_ninja.py` codegen 风格一致；
+- 生成物**进版本库**（便于 diff 与复核），CI 校验"重新生成后无差异"；
+- 中断解码放在**生成器**里：生成的表里 `irq` 字段直接是干净的 INTID，
+  编码细节只出现在生成器与本节。
+
+**暂不做的两件事**（本期明确推迟）：
+1. **AXI 互联层级** —— `parent` 字段先留着不实现。当前 Zynq 是"一条 APB + 一条
+   AXI GP"的扁平结构，等 PL 里真挂上 AXI 互联再补。
+2. **PL 动态烧录与热插拔** —— PL 现在没有启用，PL 节点一律
+   `enabled = false`。
+
+#### 验收方式
+
+把已经跑起来的 **AXI GPIO**（`0x41200000`，双通道 8 位，无中断）从
+`src/led.c` 的硬编码改成走 `plat_driver_t.probe()`。
+
+选它的理由：它是**唯一一个不依赖内核主体**的现成驱动——
+GPIO 不是设备节点，不需要 `device_t` / VFS / 堆 / 调度器
+（块设备的依赖链见 §4.1）。所以整条描述层路径可以在当前的最小内核上验证完，
+不必先搬 `kernel/`。
+
+---
+
 ## 3. 风险与决策点（需先拍板）
 
 | # | 决策 | 影响 |
 |---|---|---|
-| R1 | **系统调用号 ABI**：保留 Linux x86_64 号 + 号翻译层，还是 ARM 独立号表？ | 决定是否需要重建全部用户态；SXAH 的 57 位号**无论如何都必须重编号** |
+| R1 | **系统调用号 ABI**：保留 Linux x86_64 号 + 号翻译层，还是 ARM 独立号表？ | 决定是否需要重建全部用户态。**修正：SXAH 的 57 位号虽然无论如何都必须重编号，但它的"代价"被原文高估了 —— 全部用户态二进制本来就是 x86-64 机器码、本来就必须全部重建（§0 事实 3），所以重编号是免费的，反而所有兼容性问题里最好解决的一个** |
 | R2 | **存储介质**：SD 还是 QSPI？ | 决定块驱动与镜像流程 |
 | R3 | **启动路径**：U-Boot `bootelf` 还是裸机启动头？ | U-Boot 顺带提供 DTB/网络/镜像加载；裸机更可控但工作量大。另见 §6.4：**开发期用 JTAG 直载可以两者都先跳过** |
 | R4 | **浮点 ABI**：hard-float 还是 softfp？NEON 是否启用？ | 需与 bitstream 一致；影响 `liballoc`/busybox/musl 的重建目标与 VFP 上下文切换。**已可定案：AMD 官方 standalone BSP 用的是 `-mfpu=vfpv3 -mfloat-abi=hard`，跟着选 hard-float 风险最低**（见 §6.1） |
@@ -597,29 +744,68 @@ scugic_hw.h             ← GIC 寄存器字典（仅参考）
 | R6 | **弱内存模型**：x86 的 TSO 让很多地方可以偷懒；ARMv7 是弱序 | `include/cpu/lock.h` 已有 `spin_unlock` 里先清标志再 `sfence` 的可疑写法（`:66-83`），迁移时要把所有屏障语义重新审一遍，这是**并发 bug 高发区** |
 | R7 | **用户态从哪来**：重建 busybox/musl，还是放弃 Linux 兼容层只跑 XAPI 程序？ | 前者要交叉工具链 + syscall 号翻译；后者工作量小但失去现有用户态生态 |
 
+### 3.1 已拍板的决策
+
+| # | 决策 | 结论 | 依据 |
+|---|---|---|---|
+| D1 | 工具链 | **Vitis GNU `arm-none-eabi-gcc` 13.3.0**，不用 clang | clang 集成汇编器拒绝 Xilinx BSP 汇编；且不支持 `-specs=` |
+| D2 | 浮点 ABI | **hard-float**（`-mfpu=vfpv3 -mfloat-abi=hard`）| 与 AMD 官方 standalone BSP 一致（R4 已定案） |
+| D3 | 页表形式 | **ARMv7 短描述符**，先只做 1MB 段 | 4KB 小页留到需要给 DMA 缓冲单独设属性时再加 |
+| D4 | 设备描述层 | **描述模型照 DTS，落地形式用「从 `xparameters.h` 生成 C 表」** | 见 §2.16。模型与落地形式是两个独立的轴，先把模型定死 |
+| D5 | 双核阶段 | **从 M3 拆出，后移到 AM3（After M3）** | SMP 风险随系统复杂度放大；应在调度器进来之前做 |
+| D6 | PL（FPGA）范围 | **本期不启用**：PL 节点一律 `enabled = false`；AXI 互联层级与动态烧录推迟 | 当前 PL 只是占位的 AXI GPIO，没有真实 PL 设计 |
+
 ---
 
 ## 4. 建议的分阶段路径
 
 每个阶段都以"能在 QEMU `xilinx-zynq-a9` 上看到结果"为验收标准。
 
-| 阶段 | 目标 | 主要内容 |
+| 阶段 | 目标 | 主要内容 | 状态 |
+|---|---|---|---|
+| **M0** | 工具链与骨架能编译 | `gen_ninja.py` 加 ARCH 维度、ARM 标志集、新 `linker.ld`；`arch/arm32/` 目录与接口定义。**注**：工具链最终选 **Vitis GNU `arm-none-eabi-gcc` 13.3.0** 而非 clang —— clang 的集成汇编器拒绝 Xilinx BSP 的 `asm_vectors.S`/`boot.S`（`ldrneh` 判为非法指令）且不支持 `-specs=` | ✅ 已完成 |
+| **M1** | 串口最小可启动内核 | Zynq UARTPS 驱动 + MMIO；GIC + Cortex-A9 定时器；异常向量表；JTAG 直载运行。**注**：实际未走"改造 `main.cpp`"的路线，而是新写了 `arch/arm32/src/kmain.c`（见 §4.1 的路线说明） | ✅ 已完成 |
+| **M2** | MMU + 内存管理 | ARMv7 短描述符页表；`PTE_*` 全部重做；1MB 段恒等映射 + 区域表；XN 与 DACR client；**缓存几何/维护原语 + L1+L2 使能**（DMA 前置） | ✅ 已完成 |
+| **M3** | **设备描述层与驱动框架（类 DTS）** | 见 §2.16。描述模型照 DTS（节点 / `compatible` / `reg` / `interrupts` / 属性 / `status`）；**从 `xparameters.h` 生成**描述表；`INTID` 解码收在描述层；驱动 `probe()` 匹配循环；启动时打印全部节点。**验收：把 AXI GPIO 从硬编码改成走 `probe()`** | ← 当前 |
+| **AM3** | **双核（SMP）** —— 原 M3 的后半，从 M3 拆出后移 | OCM 跳板 + `sev` 引导 CPU1；CPU1 自己的栈/VBAR/TTBR0/DACR/SCU/ACTLR/缓存；`TPIDRPRW` 每 CPU 数据；**per-CPU 中断表**（PPI 是每核银行化的）；spinlock + SGI 做 IPI。**验收：两核各自 1 kHz tick、核间计数器竞争结果正确** | |
+| **M4** | 用户态 | SVC 入口 + 寄存器帧映射；ELF32 加载；`R_ARM_*` + `DT_REL`；ARM `crt0.S`；`TPIDRURO` TLS；信号帧；**先跑一个静态链接的 hello XAPI 程序** | |
+| **M5** | 存储 + rootfs | SD/SDIO 驱动（ADMA2 + 缓存维护，注册为 `device_t`）；FATFS 打通；镜像流程出 `BOOT.BIN`；挂载 `/system` 并跑 `shell.elf` | |
+| **M6** | 网络 | Cadence GEM 驱动替换 e1000（GEM 描述符环 + PHY/MDIO）；lwIP 胶水去 x86 汇编；`netserver.sys` 零改动接入 | |
+| **M7** | 模块与 ABI 收敛 | 可加载 `.sys` 模块在 32 位空间工作；导出符号范围校验；重建 busybox/musl（若 R7 选前者） | |
+
+**为什么把双核拆到 AM3 而不是留在 M3**：SMP 的风险（缓存一致性、per-CPU 数据、锁）
+会随系统复杂度成倍放大。把它放在"描述层做完、调度器还没进来"的位置，
+两个核面对的是同一份简单代码，调试一致性问题的代价最低；
+等 M4 把调度器搬进来再上双核，一个 coherency bug 会同时牵扯调度器状态。
+这与 §2.6 的判断一致。
+
+### 4.1 已完成阶段的实际情况（与计划原文的偏差）
+
+| 计划原文 | 实际做法 | 原因 |
 |---|---|---|
-| **M0** | 工具链与骨架能编译 | `gen_ninja.py` 加 ARCH 维度、ARM 标志集、新 `linker.ld`；`arch/arm32/` 目录与接口定义；`offsetof` 生成汇编头替换 `handler.S:29-33` 的硬编码偏移；**修掉 §2.12 的三处地雷** |
-| **M1** | 串口最小可启动内核 | 引入 `platform_init()` 取代 `main.cpp:446-471,519` 的 `init_hpet/init_apic/init_smp/pci_setup`，在 Zynq 上装入静态板级描述符（GIC/UART/GEM/SD 基址、定时器频率、RAM 范围、INTID 表）替代 ACPI 表；Zynq UARTPS 驱动 + MMIO；裸机 / U-Boot 启动头；关掉一切非必要子系统（用 `OPENXJ380CONFIG_CLEAR_RUN`）。**先做定时器、再做串口**——`nanoTime()` 是所有超时/调度的基础，没有它连串口轮询都难调试 |
-| **M2** | MMU + 内存管理 | ARMv7 页表（建议先短描述符，后评估 LPAE）；重做 `PTE_*` 与 `page.cpp` 遍历；重新规划 32 位 VA 布局；HHDM 常量集中化；**同时落地缓存属性/缓存维护原语**（DMA 阶段要用） |
-| **M3** | 中断 + 双核 | GIC Distributor/CPU Interface、`INTID → handler` 注册表、`ICCEOIR` 取代 `send_eoi()`；异常向量表取代 IDT；Cortex-A9 global/private timer 替换 HPET（保留 `nanoTime()` 接口与 1ms 周期中断）；SCU + `sev` AP 引导；`TPIDRPRW` 每 CPU 数据 |
-| **M4** | 用户态 | SVC 入口 + 寄存器帧映射；ELF32 加载；`R_ARM_*` + `DT_REL`；ARM `crt0.S`；`TPIDRURO` TLS；信号帧；**先跑一个静态链接的 hello XAPI 程序** |
-| **M5** | 存储 + rootfs | SD/SDIO 驱动（ADMA2 + 缓存维护，注册为 `device_t`）；FATFS 打通；镜像流程出 `BOOT.BIN`；挂载 `/system` 并跑 `shell.elf` |
-| **M6** | 网络 | Cadence GEM 驱动替换 e1000（GEM 描述符环 + PHY/MDIO）；lwIP 胶水去 x86 汇编；`netserver.sys` 零改动接入 |
-| **M7** | 模块与 ABI 收敛 | 可加载 `.sys` 模块在 32 位空间工作；导出符号范围校验；重建 busybox/musl（若 R7 选前者） |
+| M0 用 clang | 改用 Vitis GNU `arm-none-eabi-gcc` | clang 拒绝 Xilinx BSP 的汇编 |
+| M1 "改造 `main.cpp`，引入 `platform_init()`" | 新写 `arch/arm32/src/kmain.c`，未动 `kernel/` | 先把地基在最小面积上验证透，避免同时怀疑地基与上层 |
+| M2 "重做 `page.cpp` 遍历" | 新写 `mmu.c`（纯逻辑）+ `mmu_hw.c`（CP15） | 同上；且这样纯逻辑能上宿主机单测 |
+| M1 "静态板级描述符" | 当时的 `platform.h` 宏表 | M3 会把它升级成真正的描述层 |
+
+**这两条路线必须在某一点汇合**，而汇合点就是驱动——因为驱动要注册
+`device_t`，而 `regist_device()`（`driver/device.cpp:484 行`）依赖
+`krlcb` + `id_alloc`（堆）+ `mutex`/`task/pcb.h`（调度器）+ `fs/partition.h`
+（自动分区扫描）+ `mm/uaccess.h`（页表翻译 + `phys_to_virt`）；
+`device_manager_init()` 一上来就创建 256 个 mutex 和一个 id_allocator。
+
+也就是说：**块设备驱动必须坐在内核主体之上**，而内核主体（`kernel/memory` 2196 行、
+`kernel/task` 3291 行、`driver/fs` 32621 行）目前一行都还没搬。
+**不依赖内核主体的驱动**（GPIO、时钟、PL 上的自定义 IP）不受此限——
+M3 用 AXI GPIO 验收正是利用这一点。
+
 
 **建议的优先级原则**：M1 之前不要碰 `driver/` 里的 x86 驱动——先把
 CPU/MMU/中断/定时器这条"地基"做完，因为上层业务逻辑（VFS、syscall handler、
 调度器策略）几乎不需要改，它们的价值只在能启动之后才体现。
 
-**驱动侧的推进顺序**（与上表 M3→M6 对应，按风险从低到高）：
-定时器 → 串口 → 中断核心 → SD 块驱动 → GEM 网卡。
+**驱动侧的推进顺序**（与上表对应，按风险从低到高）：
+定时器 → 串口 → 中断核心 → **描述层（M3）** → SD 块驱动（M5）→ GEM 网卡（M6）。
 其中**块存储的性价比最高**：块层契约干净且与设备无关，驱动只需实现回调并注册，
 注册后分区扫描会自动触发；而**网络层的回报也很直接**——因为 `netdev_t` 与硬件解耦，
 GEM 驱动一做出来，`netserver.cpp` 不用改一行就能跑起来。
@@ -980,9 +1166,29 @@ CMake 流程都用不上。**除非有明确理由坚持单一编译器，否则
 真正的成本不在"写 ARM 代码"，而在"把散落在 14+ 个文件里的 x86 常量、
 95 处内联汇编、以及 x86 二进制生态一次性收敛掉"。**
 
-建议按 M0→M7 推进，并在 M0 阶段**优先建立架构抽象层**——
-跳过这一步直接改代码，后面每一步都会退化成打地鼠。
+建议按 M0→M3→AM3→M4→M7 推进（AM3 = 双核，从原 M3 拆出）。
+**M0–M2 已完成并上板验证**，实际代码量与本文估计同量级（`arch/arm32` 约 5,400 行，
+含验证基础设施；本文的 3,500 行只算了地基本身）。
+
+**计划本身需要一条补充**：本文假设的是"移植现有内核"（改造 `main.cpp`/`page.cpp`/
+`sys.cpp`），而实际执行的是"先在最小面积上把地基写对"（新写 `kmain.c`/`mmu.c`/
+`cache_hw.c`）。**这两条路线必须在某一点汇合，而汇合点就是驱动**——
+块设备驱动要注册 `device_t`，而 `regist_device()` 依赖堆、调度器、VFS、
+`phys_to_virt`（依赖链见 §4.1），这些目前一行都还没搬。
+不依赖内核主体的驱动（GPIO、时钟、PL 自定义 IP）不受此限，
+所以 **M3 用 AXI GPIO 验收描述层**是最省的一次路径验证。
 
 调试方面：**工具链其实够用，缺的是 QEMU（自己装主线版即可）和一个正确的调试顺序。**
 把 QEMU 当主力、JTAG 直载当上板手段、`bootgen` 只在验收时用，
 就能完全绕开 Vitis Unified IDE 那些"明确不支持"的功能。
+
+**最后一条经验，写在这里因为它比上面任何一条都更影响后续成本**：
+M0–M2 阶段修掉的 bug 里，**几乎没有一个是"ARM 与 x86 不同"造成的**，
+全部是"这个假设从来没被验证过"——空指针解引用、
+缓存使能了却完全无加速（漏 SCU/ACTLR）、
+耗时基准被编译器整体优化掉、首次测量取到未初始化值。
+所以 §0 那句"上层基本可以原样保留"应当读作
+**"上层代码可复用，但需要同等密度的重新验证"**——
+它们是纸面上可移植，搬到 32 位 + SVC 入口 + 弱内存序下不会在编译期报错，
+只会在运行期偶发。
+
