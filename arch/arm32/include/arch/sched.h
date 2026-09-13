@@ -37,6 +37,8 @@
  * 时间以纳秒作参数传进来,于是宿主机上可以直接构造"过了 3ms"这种场景。
  */
 
+#include <arch/heap.h>
+#include <arch/kstack.h>
 #include <arch/tcb.h>
 #include <arch/types.h>
 
@@ -115,3 +117,49 @@ void sched_entity_init(tcb_t t, u64 now);
 /* 纯函数:队列平均 vruntime(源 OS 的 `queue_average_vruntime` 用来算基准)。
  * 队列为空时返回 fallback */
 u64 sched_queue_avg_vruntime(const sched_queue_t *q, tcb_t ignore, u64 fallback);
+
+/* ------------------------------------------------------------------ */
+/* 内核侧(M4-8.3,实现在 src/sched_kern.c)                            */
+/* ------------------------------------------------------------------ */
+
+#define SCHED_MAX_SWITCHES_TRACKED 4096u /* 切换次数计数上限(诊断用,不封顶)*/
+
+/*
+ * 本核当前线程。**唯一真相在 percpu_t.current_task**;这里只做转换,
+ * 不另存一份(存两份就会有"派生量忘了同步"的静默失真)。
+ */
+tcb_t sched_current(void);
+void  sched_set_current(tcb_t t);
+
+/*
+ * 把栈池与内核堆绑进来(启动时一次)。不 extern 全局量的理由见 .c。
+ */
+void sched_kern_bind(kstack_pool_t *ks, heap_t *heap);
+
+/* 清空本核就绪队列并把 current 置空。启动时每个核各调一次 */
+void sched_kern_init(void);
+
+/*
+ * 造一个内核线程并把本核就绪队列按 deadline 有序插入。
+ *
+ * TCB 从内核堆取(不是静态数组 —— 线程数不能是编译期常量),
+ * 内核栈从 M4-5 的栈池取(带 guard page)。两者任一失败就整体回滚。
+ */
+tcb_t sched_kthread_create(void (*entry)(void *), void *arg, const char *name);
+
+/*
+ * 让出 CPU:给当前线程计费 -> 重新入队 -> 选 deadline 最小者 -> 切换。
+ * 当前线程是 idle(或队列里只剩自己)时直接返回,不做无谓的切换。
+ */
+void sched_yield(void);
+
+/*
+ * 造 idle 线程并切过去 —— **不返回**。
+ * idle 就是 `for (;;) arch_wfi();`,它的存在让"没有可运行线程"这件事
+ * 有一个合法的落点,而不是让调度器去挑一个空队列。
+ */
+void sched_kern_start(void);
+
+/* 诊断:本核累计切换次数、idle 被调度到的次数 */
+u32 sched_switch_count(void);
+u32 sched_idle_spins(void);

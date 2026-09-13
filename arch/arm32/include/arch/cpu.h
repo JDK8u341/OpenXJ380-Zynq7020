@@ -28,6 +28,18 @@ static inline void cpu_relax(void)
     __asm__ volatile("yield" ::: "memory");
 }
 
+/* 低功耗等待(x86 的 hlt 对应物)。本文件顶部的对照表里写着有 WFE/WFI,
+ * 但一直没有实现 —— M4-8 的 idle 线程需要它。 */
+static inline void arch_wfi(void)
+{
+    __asm__ volatile("wfi" ::: "memory");
+}
+
+static inline void arch_wfe(void)
+{
+    __asm__ volatile("wfe" ::: "memory");
+}
+
 /* 等待事件:进入低功耗直到 SEV/中断。等价于 x86 的 hlt */
 static inline void cpu_wfe(void)
 {

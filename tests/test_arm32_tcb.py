@@ -204,11 +204,8 @@ int main(void)
          *   只要有人往里塞指针或 uintptr_t,宿主上这个数就会变大 ——
          *   而"宿主验的偏移就是目标偏移"这条前提随即失效。
          */
-        CHECK(sizeof(percpu_t) == 64u);
-        CHECK(offsetof_arm(percpu_t, sched_head) == ARM_PERCPU_OFF_CURRENT_TASK + 4u);
-        CHECK(offsetof_arm(percpu_t, sched_count) == ARM_PERCPU_OFF_CURRENT_TASK + 8u);
-        CHECK(offsetof_arm(percpu_t, scheduler_ticks) == 56u);
-        CHECK(sizeof(((percpu_t *)0)->sched_head) == 4u);
+        CHECK(sizeof(percpu_t) == 56u);
+        CHECK(offsetof_arm(percpu_t, scheduler_ticks) == 48u);
         CHECK(sizeof(((percpu_t *)0)->scheduler_ticks) == 8u);
         /* 地址字段是 u32,不是 uintptr_t —— 后者在宿主上是 8 字节 */
         CHECK(sizeof(((percpu_t *)0)->stack_top) == 4u);

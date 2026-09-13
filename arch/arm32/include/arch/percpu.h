@@ -92,9 +92,18 @@ typedef struct
      * `scheduler_ticks` 是 64 位累加量(u64 在两个平台上都是 8 字节对齐),
      * 所以它不破坏这条不变式。
      */
-    u32 sched_head;      /* 就绪队列首节点的 TCB 地址;0 = 空队列 */
-    u32 sched_count;     /* 队列长度(与链表互为校验:一个是另一个的派生量)*/
-    u64 scheduler_ticks; /* 本核已调度的 tick 数(诊断用)*/
+    /*
+     * ⚠ 这里**故意不存**就绪队列的头与长度。
+     *
+     * 一开始加了 `sched_head` / `sched_count`,后来去掉了:它们是队列本身的
+     * **派生量**,存两份就等于给了两个真相来源 —— 本项目已经因为
+     * "派生量忘了重算"吃过一次亏(heap 的 largest_free,见计划 §0.5.5 第 13 条),
+     * 而那种错误的形态是**静默失真**:数字看着合理,只是不对。
+     *
+     * 就绪队列本体在 sched_kern.c 里(每核一个 `sched_queue_t`)。
+     * 要在 JTAG 上看队列,读那个静态数组的地址即可。
+     */
+    u64 scheduler_ticks; /* 本核已调度的 tick 数(诊断用,不是派生量)*/
 } percpu_t;
 
 /* 把 current_task 取成 tcb_t。集中在一处,避免散落的强制转换 */
@@ -120,14 +129,10 @@ _Static_assert(offsetof_arm(percpu_t, current_task) == ARM_PERCPU_OFF_CURRENT_TA
  * 所以下面这几条断言不只是钉数值,它们钉的是**这条不变式仍然成立**:
  * sizeof 必须等于"全部字段按 u32 排下来"的结果。
  */
-_Static_assert(offsetof_arm(percpu_t, sched_head) == ARM_PERCPU_OFF_CURRENT_TASK + 4u,
-               "sched_head 紧跟 current_task —— 中间多出字段说明有人插了东西");
-_Static_assert(offsetof_arm(percpu_t, sched_count) == ARM_PERCPU_OFF_CURRENT_TASK + 8u,
-               "sched_count 紧跟 sched_head");
-_Static_assert(offsetof_arm(percpu_t, scheduler_ticks) == 56u,
-               "scheduler_ticks 应当 8 字节对齐到 56");
-_Static_assert(sizeof(percpu_t) == 64u,
-               "sizeof(percpu_t) 不是 64 —— 多半是有人加了指针/uintptr_t 字段,"
+_Static_assert(offsetof_arm(percpu_t, scheduler_ticks) == 48u,
+               "scheduler_ticks 应当 8 字节对齐到 48");
+_Static_assert(sizeof(percpu_t) == 56u,
+               "sizeof(percpu_t) 不是 56 —— 多半是有人加了指针/uintptr_t 字段,"
                "那会让宿主与目标的布局分叉");
 
 extern percpu_t g_percpu[PERCPU_MAX_CPUS];
