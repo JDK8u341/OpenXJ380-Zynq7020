@@ -1755,13 +1755,57 @@ void scheduler_yield() { get_current_cpu()->scheduler_ticks = TIME_SLICE;
 | **M4-8.4** | **把 1Hz 状态行改成内核线程**(第一个真活) | 板上:它仍在输出,且与一个纯占用线程按顺序交替 |
 | **M4-8.5** | 无饥饿判据:每 N 个 tick 内每个可运行线程都推进过 ≥1 | 板上二值 |
 
+#### ★ M4-8.4 开工前的调研（三份清单，2026-09，M4-9.5 之后）★
+
+M4-8.4 是"把 1Hz 状态行改成内核线程"—— 也就是**第一个会睡会醒的真实负载**。
+动手前按规程把源 OS 读清楚。结论是:**它逼出一个必须先补的账。**
+
+##### ① 逐条沿用的（源 OS 怎么做，就怎么做）
+
+| 源 OS | 出处 | ARM 侧 |
+|---|---|---|
+| `scheduler_sleep_ns(nano)`：`wakeup_time = nanoTime()+nano`、`status = WAIT`、`do { yield(); } while (status == WAIT);`、最后 `if (status == START) status = RUNNING;` | `scheduler.cpp:468-493` | **逐字照抄**为 `sched_sleep_ns(u64)`，时间由调用方传入 |
+| `scheduler_wake_task(task)`：显式唤醒，`wakeup_time=0`、`status=START`、给睡醒补偿 | `scheduler.cpp:495-509` | 照抄 |
+| **睡眠的调用形态** | `ipc.cpp:37,46`、`sys.cpp:618` | 三处**全都是** `do { sleep_ns(1ms); …干活…; } while (!条件);` —— 也就是"睡一会儿→干活→再看"。1Hz 状态行线程就该长这样 |
+| `select_next_task_safe()` | `scheduler.cpp:316-362` | **照抄**（见下面 ③）|
+| `queue_average_vruntime()` | `scheduler.cpp:256-287` | **照抄**，它在扫描的同时**唤醒到点的睡眠任务** |
+| `mark_task_dispatched()` | `scheduler.cpp:304-314` | 照抄 |
+| `wake_sleeping_task()` | `scheduler.cpp:220-230` | 已有 `sched_wake_if_due` ✓ |
+
+##### ② 因架构 / 位宽 / 当前阶段而必须不同的（每条都写理由）
+
+| 源 OS | ARM 侧 | 为什么不同 |
+|---|---|---|
+| `nanoTime()` 读 HPET，且 HPET 未就绪时**返回 0** | 用 `timer_read_ns()`（Cortex-A9 全局定时器，复位即走）| 架构不同。x86 那个"返回 0"的分支在 ARM 上不存在 —— 定时器从复位起就有效，所以**不需要** `bootNanoTime()` 那套减基准 |
+| `create_kernel_thread(void *_start, void *args, char *name, pcb_t pcb)` | `sched_kthread_create(void (*entry)(void*), void *arg, const char *name)` | `pcb_t`（进程组）内核对线程还没有（退化清单 D5，M7 才有）|
+| 新线程栈上压 `process_exit` 当返回地址，`rdi = args` | `ctx.pc = entry`、`ctx.r[0] = arg`、**`ctx.lr = 0`** | x86 靠"返回地址"表达"线程干完活去哪"；ARM 侧还没有线程退出机制（M4-11），所以 `lr = 0` 表示**不许返回**。这是**欠账**，不是设计 |
+| `save_fpu_context(&new_task->fpu_context)` | `arch_vfp_save(t->vfp, &t->fpscr)` | 语义照抄：新线程**继承创建者的浮点现场** |
+| `add_task()` 挑"队列最短的核" | 只入本核队列 | M4-10 才有多核队列（D6/D12）|
+| `spin_lock(&create_thread_lock)` / `scheduler_lock` | 无锁 | 单核，只有 CPU0 碰调度器（D12）|
+| `no_interrupt` / `open_interrupt` | 无对应物 | ARM 侧造线程时中断保持原样；防"造两个线程之间被切走"用的是 `sched_disable()` 窗口 |
+
+##### ③ ★ 它逼出的那个账：`sched_pick` 是取队首 —— 那是我发明的 ★
+
+- 源 OS 的队列（`lock_queue`）是**普通 FIFO 插入序**（`queue_enqueue` → `queue_append_node`），
+  **不排序**；选取是 `select_next_task_safe()` 的**全表扫描**：先取 `avg_vruntime`，
+  再要求 `candidate->eevdf_vruntime <= avg`，在合格者里取 deadline 最小。
+- 而 ARM 侧 M4-8 写的是"**按 deadline 有序插入、取队首**"。
+  这在等权负载下结果相近,但**不是源 OS**,而且它有个直接后果:
+  **`wake_sleeping_task` 的调用点在扫描里,取队首的写法里根本没有那次扫描
+  ⇒ 睡眠的任务永远醒不过来。**
+- ⇒ 所以 M4-8.4 的第一步是**把这个账补上**：队列改 FIFO、选取改全表扫描（连带唤醒）、
+  `current` 与"睡眠中的任务"都**留在队列里**（源 OS 就是这样，靠 `is_task_schedulable` 排除），
+  队列成员关系不再由切换路径维护。
+
+★ 附带的好处：`sched_tick` 里那套"一进一出"的队列维护**整段消失**，
+与源 OS 的 `timer_handle` 一一对应 —— 现在是"只改状态，不动队列"。
+
 **注意 M4-8.3 与 M4-9 的分界**:M4-8 的切换是**协作式**的(线程自己让出),
 M4-9 才在异常返回路径上做抢占。所以 M4-8 的 `arch_ctx_switch` 不需要动 CPSR ——
 这与 M4-7 定下的分工一致。
 
 **④ M4-10 不挪** —— 严格按 M4-8 → M4-9 → M4-10 → M4-11 一路做完单核到 SMP。
-理由:可睡眠的 `mutex`(M4-11)要先在单核上定形,若先做 fs 再回头做 SMP 调度,
-可能会反过来改 `mutex` 的语义。
+理由:可睡眠的 `mutex`(M4-11)要先在单核上定形,若先做 fs 再回头做 SMP 调度,可能会反过来改 `mutex` 的语义。
 
 **M4-8 之后先只跑 CPU0（单核调度验证透）再开 M4-10。**
 SMP 调度是整个 M4 最容易出错的一环（任务迁移、栈切换与 per-CPU 状态的交互），
