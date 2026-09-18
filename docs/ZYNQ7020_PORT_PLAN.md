@@ -290,7 +290,7 @@ M4-8 里我推出一个"纯协作式调度器到不了 idle"的死结，并准�
 教训：**当你发现自己需要一个源 OS 里不存在的新机制时，先回去读源 OS。**
 "我这里有个特殊情况"十有八九是自己前面的某一步已经走偏了。
 
-### 0.5.7 ★ 续接点：**M4-11 已完成；合流决策 D2/D4/D5 已拍板；下一站 M4A-1.1** ★
+### 0.5.7 ★ 续接点：**M4-11 已完成；D2/D4/D5 已拍板且 D5 已落地；M4A-1.1a 已完成** ★
 
 > **这一节是压缩上下文后的第一读物。** 它写清了：M4-8.5 / M4-10 / M4-11 各自落成了什么样、
 > 之后三条 API 兼容性分别在哪个阶段。
@@ -298,8 +298,16 @@ M4-8 里我推出一个"纯协作式调度器到不了 idle"的死结，并准�
 > ★ **2026-09-18 拍板（合流决策，表见 `docs/ZYNQ7020_INTEGRATION_PLAN.md` §6）**：
 > **D2** 内存分配器 = **保留 ARM 那份 + 补一层上游形状的接口**（不搬 `kernel/memory/**`）；
 > **D4** 用户态 = **新增 M4A-4**，同时**改写 M5 的验收**（不在 M5 跑 `shell.elf`）；
-> **D5** 心跳区 = **扩容 32 → 64 槽**（不删旧槽）—— ✅ **已落地（`6cf135d`，板上 97/0 + 八组 A/B 全检出 + 清零与注入各有区分性判据）**。
-> ⇒ **下一步就是 `§4.6` 的 M4A-1.1**（device manager + `regist_device` + devfs 骨架）。
+> **D5** 心跳区 = **扩容 32 → 64 槽**（不删旧槽）—— ✅ **已落地（`6cf135d`）**。
+>
+> ★ **M4A-1.1 已拆成两步，第一步 a 已完成（`6b82a0e`）**：
+> **1.1a** = D2 的接口层 —— `malloc/calloc/realloc/free` 接到 M4-3 就做好的堆上
+> （`arch/arm32/src/kmalloc.c`，加 `kmalloc_bad_free_count()` 补上 `free` 无返回值的
+> 信号损失）。板上 **98/0**（新增一条 `heap_bind_ab` 破坏性 A/B）+
+> `Heap smoke` 改走 `malloc/free` 因而每次都验这条接线。
+> ⇒ **下一步 1.1b**：上游 include 路径映射（`<mm/alloc/alloc.h>` / `<mm/heap.h>`）
+> + device manager + `regist_device` + devfs 骨架 —— 那一步会第一次把上游
+> `include/device.h` 拉进 ARM 图（它经 `proto.hpp` 拖进整个 x86 主干，见下文）。
 
 **M4-8.5（无饥饿）、M4-10（SMP 调度）、M4-11（串口真锁 + 线程退出路径）都已完成并
 板上验证。板级自检 97 passed / 0 failed，八组破坏性 A/B 全部检出。**
@@ -2476,8 +2484,9 @@ M4A-4 用户态与 syscall 层          <- 2026-09-18 新增(合流决策 D4);�
 
 | # | 内容 | 依赖 | 上板可验证方式 |
 |---|---|---|---|
-| **M4A-1.1** | device manager + `regist_device` + devfs 骨架 | M4-11 | `regist_device` / `get_device` 往返。⚠ 本行原文写"此时 `mutex` 已可睡眠，不再是退化版"—— **这句是错的**：M4-11 开工前的调研（`43dc1eb`）已推翻它，源 OS 的 mutex 是 **yield 型**、不存在"可睡眠互斥"（D13/D17）。M4A-1.1 用的是**已经落地并板上验过的那把 yield 型互斥** |
-| **M4A-1.2** | **VFS 核心 + `tmpfs`** | M4A-1.1 | **第一个完整切片**：建/读/写/列目录全在内存，不需要块设备 |
+| ~~**M4A-1.1a**~~ | ~~D2 的接口层：`malloc/calloc/realloc/free` 接到 ARM 堆上~~ | M4-3 的堆 ✅ | ✅ **已完成（`6b82a0e`）**：板上 **98/0**；`Heap smoke` 改走 `malloc/free`（每次上板都验这条接线）+ 新增 `heap_bind_ab` 破坏性 A/B（解绑后 `malloc` 必须返回 NULL）。宿主新增 `tests/test_arm32_kmalloc.py`（含"把释放失败吞掉"的破坏性对照）。⚠ 上游的 `<mm/alloc/alloc.h>` 路径映射**还没做**，今天只保证符号存在 |
+| **M4A-1.1b** | device manager + `regist_device` + devfs 骨架（+ 上游 include 路径映射） | 1.1a | `regist_device` / `get_device` 往返。⚠ 本行原文写"此时 `mutex` 已可睡眠，不再是退化版"—— **这句是错的**：M4-11 开工前的调研（`43dc1eb`）已推翻它，源 OS 的 mutex 是 **yield 型**、不存在"可睡眠互斥"（D13/D17）。M4A-1.1 用的是**已经落地并板上验过的那把 yield 型互斥** |
+| **M4A-1.2** | **VFS 核心 + `tmpfs`** | M4A-1.1b | **第一个完整切片**：建/读/写/列目录全在内存，不需要块设备 |
 | **M4A-1.3** | 块设备（SD/arasan）+ `diskio` | 独立，可并行 | 读写扇区 + 写回读 |
 | **M4A-1.4** | **FATFS** | M4A-1.2 + M4A-1.3 | 挂载 + 读写文件 + 与主机侧比对 |
 | **M4A-1.5** | `procfs` / `dev` / `pipe` / `pty` | M4A-1.2 | 逐项 |
@@ -2500,6 +2509,14 @@ M4A-1 会拉进来的 19 个文件里，堆 API 只有 **4 个符号**、**257 �
 ⚠ **`device_manager_init()` 一上来就 create 256 个 mutex + 一个 `id_allocator`**，
 那个 `id_allocator`（`kernel/id_alloc.cpp`）要的就是上面这几个符号 —— 所以这层 shim 是
 **M4A-1.1 的第一个前置**，不是可选项。
+
+★ **已实施（`6b82a0e`，M4A-1.1a）**：四个符号落在 `arch/arm32/src/kmalloc.c`，
+声明进 `krlibc.h`（拼写与旧 XJ380 一致）；`kmalloc_bad_free_count()` 补上
+"`free` 没有返回值"造成的信号损失。板上 **98/0**，`Heap smoke` 改走 `malloc/free`，
+并新增 `heap_bind_ab` 破坏性 A/B（解绑后 `malloc` 必须返回 NULL）。
+⚠ `PAGE_SIZE` / `MIN` / `MAX` / `PADDING_UP` 那四个宏**还没做**（属 1.1b，
+与 include 路径映射一起），`aligned_alloc` / `usable_size` 是**刻意不做**（0 个调用点，
+且真正的对齐分配必须做在堆内部 —— 理由见 `arch/kmalloc.h`）。
 
 **明确推迟**：`socketfs` / `unixsock` / `dnsfs` / `nmfs` 属于网络栈（M5+），
 fs 本身的移植完全不需要它们。

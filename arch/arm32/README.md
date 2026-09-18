@@ -1383,6 +1383,27 @@ irq_count = ticks + spurious + unhandled
 
 已经复用过一轮的结论：**没被调用、没法验证的代码不搬。**
 
+★ **2026-09-18 补记（M4A-1.1a）：那一组堆函数补上了。**
+`malloc` / `calloc` / `realloc` / `free` 现在有了 —— 但**分配器一个字节都没重写**：
+`heap.c`（M4-3）早就做完了，缺的只是"名字"这一层接线，实现在
+`src/kmalloc.c`，语义与**刻意没提供**的两个函数（`aligned_alloc` / `usable_size`）
+见 `arch/kmalloc.h`。
+
+值得一提的三点：
+
+1. **它不是"顺手改个名字"** —— 启动时的 `Heap smoke` 现在走 `malloc`/`free`，
+   所以这条接线每次上板都被跑一遍；
+2. **`free()` 是 void，而 `heap_free()` 会告诉你失败**。接成 void 就把
+   "双重释放/野指针"这个信号扔了，于是它变成"堆慢慢坏掉、很久以后在无关处崩"。
+   所以留了 `kmalloc_bad_free_count()` —— 这是那类错误**唯一**看得见的地方；
+3. **`Heap bind A/B`**：把绑定撤掉之后 `malloc` 必须返回 NULL。
+   "冒烟测试通过了"本身说明不了"通过的是这条接线"，撤掉再试才算数。
+   它不解锁任何破坏性路径，所以是本项目第一组放在**报告之前**的 A/B。
+
+**还没做的**：上游文件写的是 `#include <mm/alloc/alloc.h>` / `<mm/heap.h>`，
+那层 include 路径映射没做 —— 今天只保证**符号**存在（`nm` 能在
+`out/kernel-arm.elf` 里看到 `malloc`/`free`/`calloc`/`realloc`）。
+
 #### errno：用机械手段保证两个架构一致，而不是靠自觉
 
 `arch/arm32/include/arch/errno.h` 是 `include/errno.h`（旧 XJ380，125 条定义）的副本。
