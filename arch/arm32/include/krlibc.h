@@ -12,6 +12,11 @@
  * 得到 23 个函数、699 个调用点。其中 malloc/calloc/realloc/free
  * 共 316 处属于**堆**(M4-3),不算本阶段。
  *
+ * ★ 2026-09-18 补记:那一组**现在补上了**(M4A-1.1a)。堆本身早在 M4-3
+ *   就做完(heap.c),缺的只是"名字"这一层接线 —— 实现见 src/kmalloc.c,
+ *   语义与**刻意没提供**的两个函数见 <arch/kmalloc.h>。
+ *   上游文件写的 #include <mm/alloc/alloc.h> 那层路径映射还没做。
+ *
  * 本阶段只做**纯函数**:不依赖堆、不依赖调度器、不看硬件。
  * 好处是它们能在宿主机上直接编译运行 —— 而这个项目的规矩是
  * "没被调用、没法验证的代码不搬"。
@@ -39,6 +44,21 @@ void *memcpy(void *dest, const void *src, size_t n);
 void *memmove(void *dest, const void *src, size_t n);
 void *memset(void *dst, int val, size_t size);
 int   memcmp(const void *a, const void *b, size_t size);
+
+/*
+ * ---- 堆(M4A-1.1a)----
+ *
+ * 拼写与旧 XJ380 的 <mm/alloc/alloc.h> 一致,这样上游文件能直接编进 ARM 图。
+ * 实现在 src/kmalloc.c,分配策略全在 heap.c;语义(含 free(NULL) 与
+ * 未绑定时返回 NULL)见 <arch/kmalloc.h>。
+ *
+ * ⚠ 上游 alloc.h 还声明了 aligned_alloc 与 usable_size —— 这两个**没有**提供,
+ *   理由写在 <arch/kmalloc.h> 的末尾,别以为它们存在。
+ */
+void *malloc(size_t size);
+void *calloc(size_t nmemb, size_t size);
+void *realloc(void *ptr, size_t size);
+void  free(void *ptr);
 
 /* ---- 字符串 ---- */
 size_t strlen(const char *str);

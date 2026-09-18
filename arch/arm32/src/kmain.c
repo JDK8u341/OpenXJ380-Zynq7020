@@ -26,6 +26,7 @@
 #include <arch/io.h>
 #include <arch/irq.h>
 #include <arch/kstack.h>
+#include <arch/kmalloc.h>
 #include <arch/led.h>
 #include <arch/mmu.h>
 #include <arch/mutex.h>
@@ -41,6 +42,9 @@
 #include <arch/vmap.h>
 #include <arch/types.h>
 #include <arch/uart_ps.h>
+
+/* libc 子集。M4A-1.1a 起 malloc/free 也在里面(见 arch/kmalloc.h) */
+#include <krlibc.h>
 
 /*
  * CPU0 栈区顶部的链接符号(boot/kernel.ld)。
@@ -1419,6 +1423,7 @@ static u32 g_palloc_selftest;
 static u32 g_palloc_smoke;
 static u32 g_heap_selftest;
 static u32 g_heap_smoke;
+static u32 g_heap_bind_ab;
 
 /* SMP 压力测试的结果,供自检报告使用 */
 static smp_stress_result_t g_smp_stress;
@@ -2320,6 +2325,16 @@ void kmain(void)
 
             if (heap_init(&g_heap, heap_base, (size_t)HEAP_PAGES * PALLOC_PAGE_SIZE) != HEAP_OK) {
                 console_puts(" Heap        : init FAILED\n");
+            } else {
+                /*
+                 * ★ 把 libc 那四个名字接到这块堆上(M4A-1.1a)。
+                 *
+                 * 必须在 heap_init 成功之后、任何 malloc 调用之前。
+                 * 绑定之前 malloc 返回 NULL(不会崩),所以这一步漏了
+                 * 不会立刻炸 —— 它会表现为"分配失败",所以这里紧跟一句
+                 * 断言式的说明:下面那个冒烟测试就是它的判据。
+                 */
+                kmalloc_set_heap(&g_heap);
             }
         } else {
             console_printf(" Heap        : palloc FAILED err=%u\n", (u32)pe);
@@ -2330,11 +2345,18 @@ void kmain(void)
         /*
          * 真实内存冒烟:自检跑的是合成实例,证明逻辑对;
          * 这一步才证明**这块物理内存真的能用**(与 palloc 的冒烟同理)。
+         *
+         * ★ 这里刻意走 **malloc/free 而不是 heap_alloc/heap_free**(M4A-1.1a):
+         *   上面那层接线如果没绑上、或语义接错了,这一步就会失败。
+         *   它是 kmalloc.c 在板上的**唯一判据**,不是"顺手改个名字"。
+         *
+         * ⚠ free() 是 void,所以释放失败看不出来 —— 判据里必须带上
+         *   kmalloc_bad_free_count()==0,否则"释放成功了没有"是没验的。
          */
         g_heap_smoke = 0u;
         if (pe == PALLOC_OK) {
-            u8  *p1 = (u8 *)heap_alloc(&g_heap, 1000u);
-            u8  *p2 = (u8 *)heap_alloc(&g_heap, 4000u);
+            u8  *p1 = (u8 *)malloc(1000u);
+            u8  *p2 = (u8 *)malloc(4000u);
             u32  i;
             u32  ok = 1u;
 
@@ -2346,14 +2368,48 @@ void kmain(void)
                 for (i = 0; i < 1000u; i++) { if (p1[i] != (u8)(i & 0xFFu)) { ok = 0u; break; } }
                 for (i = 0; i < 4000u; i++) { if (p2[i] != (u8)((i * 7u) & 0xFFu)) { ok = 0u; break; } }
                 if (heap_check(&g_heap) != HEAP_OK) { ok = 0u; }
-                if (heap_free(&g_heap, p1) != HEAP_OK) { ok = 0u; }
-                if (heap_free(&g_heap, p2) != HEAP_OK) { ok = 0u; }
+                free(p1);
+                free(p2);
                 if (heap_check(&g_heap) != HEAP_OK) { ok = 0u; }
+                if (kmalloc_bad_free_count() != 0u) { ok = 0u; }
             }
 
             g_heap_smoke = ok;
             console_printf(" Heap smoke  : alloc/write/readback/free 2 blocks = %s\n",
                            ok ? "PASS" : "FAIL");
+        }
+
+        /*
+         * ★ 破坏性 A/B(M4A-1.1a):把堆**解绑**,malloc 必须真的失败。
+         *
+         * 要证的是"绑定这一步是承重的"。上面那个冒烟测试走的是 malloc/free,
+         * 但"它通过了"本身并不能说明"它通过的是这条接线" —— 万一还有别的
+         * 路径能拿到堆呢?把绑定撤掉再试一次,答案才是确定的。
+         *
+         * 这一步不破坏任何东西(解绑只是让 malloc 返回 NULL,不崩),
+         * 所以它可以放在报告**之前**,作为一条正式判据;
+         * 与本项目其它几组 A/B 不同 —— 那些会停机,只能放在报告之后。
+         *
+         * 判据要求**两侧都成立**:解绑时必须失败、重新绑定后必须成功。
+         * 只看一侧的话,"这一相什么都没发生"也会显得通过(坑 43)。
+         */
+        g_heap_bind_ab = 0u;
+        if (pe == PALLOC_OK) {
+            u8 *p3;
+            u32 unbound_null;
+            u32 rebound_ok;
+
+            kmalloc_set_heap(NULL);
+            unbound_null = (malloc(64u) == NULL) ? 1u : 0u;
+
+            kmalloc_set_heap(&g_heap);
+            p3         = (u8 *)malloc(64u);
+            rebound_ok = (p3 != NULL) ? 1u : 0u;
+            free(p3);
+
+            g_heap_bind_ab = (unbound_null != 0u && rebound_ok != 0u) ? 1u : 0u;
+            console_printf(" Heap bind A/B: unbound->malloc_null=%u  rebound->malloc_ok=%u\n",
+                           (u32)unbound_null, (u32)rebound_ok);
         }
     }
 
@@ -3609,6 +3665,12 @@ void kmain(void)
 
     selftest_report("heap_selftest", g_heap_selftest, 0u, SELFTEST_EQ);
     selftest_report("heap_smoke", g_heap_smoke, 1u, SELFTEST_EQ);
+    /*
+     * 破坏性 A/B(M4A-1.1a)的判定:解绑后 malloc 必须失败、重新绑定后必须成功。
+     * 它排在 heap_smoke 后面是刻意的 —— 两者合起来才说明"冒烟走的就是这条接线";
+     * 只看 smoke 的话,接线接没接上是分不出来的。
+     */
+    selftest_report("heap_bind_ab", g_heap_bind_ab, 1u, SELFTEST_EQ);
     /* 至少 32MB 可用 —— 判据写小了等于没判 */
     selftest_report("heap_size_ok", (g_heap.total_bytes >= (32u * 1024u * 1024u)) ? 1u : 0u, 1u, SELFTEST_EQ);
 
