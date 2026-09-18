@@ -37,6 +37,31 @@ typedef unsigned int       uintptr_t;
 typedef int                intptr_t;
 
 /*
+ * 固定宽度的那套别名(stdint 的名字)。
+ *
+ * 为什么 ARM 侧也要有:上游的头文件到处写的是 `uint8_t` / `uint64_t`
+ * (include/device.h、include/mm 下、driver/fs 下),而移植侧一直只用 u8/u32。
+ * 两套拼写混着用,将来共享源码时每一处都要改 —— 那是纯粹的摩擦。
+ *
+ * 为什么不直接 #include <stdint.h>:ARM 图是 -nostdinc,系统头文件不可见;
+ * 而仓库根目录的 include/stdint.h 属于上游头文件树,把它拉进 ARM 的
+ * -I 会让**所有** ARM 源文件都暴露在上游头文件下(实测过一个坑:
+ * include/id_alloc.h 用引号写 #include "krlibc.h",会命中上游那份 219 行的)。
+ * ⇒ 显式在这里给别名,不开新的 include 路径。
+ *
+ * 与 hosted 分支的 <stdint.h> 定义重复也不要紧:C11 允许相同的 typedef 重复。
+ */
+
+typedef unsigned char      uint8_t;
+typedef signed char        int8_t;
+typedef unsigned short     uint16_t;
+typedef signed short       int16_t;
+typedef unsigned int       uint32_t;
+typedef signed int         int32_t;
+typedef unsigned long long uint64_t;
+typedef signed long long   int64_t;
+
+/*
  * ⚠ C++ 有**内建** bool,再 typedef 会报
  *   "redeclaration of C++ built-in type 'bool' [-fpermissive]"。
  *   ARM 上两边都是 1 字节、布局一致,所以 C++ 翻译单元直接用内建的即可。

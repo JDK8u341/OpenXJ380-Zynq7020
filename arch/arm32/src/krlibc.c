@@ -223,6 +223,33 @@ char *strrchr(const char *s, int c)
     }
 }
 
+/*
+ * strdup —— 见头文件。M4A-1.1b 起被 device.c 的路径复制用到
+ * (上游 device.cpp 的 regist_device 就是这个形状)。
+ *
+ * ⚠ 分配失败返回 NULL,而不是返回一个空串 —— 让调用方能分辨
+ *   "复制成功但内容是空的"与"根本没分配出来"。
+ */
+char *strdup(const char *s)
+{
+    size_t len;
+    char  *copy;
+
+    if (s == NULL) {
+        return NULL;
+    }
+
+    len  = strlen(s) + 1u; /* 含结尾的 '\0' */
+    copy = (char *)malloc(len);
+    if (copy == NULL) {
+        return NULL;
+    }
+
+    memcpy(copy, s, len);
+
+    return copy;
+}
+
 char *strtok(char *str, const char *delim)
 {
     /*

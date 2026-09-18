@@ -86,6 +86,16 @@ char  *strchr(const char *s, int c);
 char  *strrchr(const char *s, int c);
 
 /*
+ * strdup —— M4A-1.1b 起需要:上游 device.cpp 的 regist_device 会把注册路径
+ * **复制一份**存进设备表(device_ctl[id].path),delete_device 再 free 掉它。
+ * M4A-1 那批文件里 strdup 共 25 处调用。
+ *
+ * 它依赖堆,所以 M4-1 时不能进"纯函数"那一批 —— 现在堆和 malloc 都到位了。
+ * 失败返回 NULL(不设 errno:本移植的 errno 还是全局变量,见文件末尾)。
+ */
+char *strdup(const char *s);
+
+/*
  * strtok 是**有状态**的:第一次传串,之后传 NULL 继续切分。
  *
  * ⚠ 状态是全局的 —— 两个任务同时 strtok 会互相踩。
@@ -108,6 +118,15 @@ int atoi(const char *pstr);
  *   已登记进 README 的「退化实现清单」。
  */
 extern int errno;
+
+/*
+ * errno_t —— 上游把它放在 `include/krlibc.h:27`,这里放同一个位置,
+ * 好让两边共用源码时不必改 include。
+ *
+ * M4A-1.1b 起需要:上游 `include/device.h` 的 `devfs_register` / `devfs_delete`
+ * 返回的就是它(EOK == 0,见 <arch/errno.h>)。
+ */
+typedef int errno_t;
 
 #ifdef __cplusplus
 } /* extern "C" */

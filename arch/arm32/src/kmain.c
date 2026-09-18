@@ -20,6 +20,7 @@
 #include <arch/board_devices.h>
 #include <arch/console.h>
 #include <arch/cpu.h>
+#include <arch/device.h>
 #include <arch/fault_test.h>
 #include <arch/heartbeat.h>
 #include <arch/heap.h>
@@ -1424,6 +1425,8 @@ static u32 g_palloc_smoke;
 static u32 g_heap_selftest;
 static u32 g_heap_smoke;
 static u32 g_heap_bind_ab;
+static u32 g_device_roundtrip;
+static u32 g_device_devfs_ab;
 
 /* SMP 压力测试的结果,供自检报告使用 */
 static smp_stress_result_t g_smp_stress;
@@ -2410,6 +2413,135 @@ void kmain(void)
             g_heap_bind_ab = (unbound_null != 0u && rebound_ok != 0u) ? 1u : 0u;
             console_printf(" Heap bind A/B: unbound->malloc_null=%u  rebound->malloc_ok=%u\n",
                            (u32)unbound_null, (u32)rebound_ok);
+        }
+    }
+
+    /* ---- 9.45 设备管理器 + devfs 骨架(M4A-1.1b)---- */
+    /*
+     * 位置:必须在**堆之后** —— `devfs_register` 会把注册路径 strdup 一份
+     * 存进设备表(上游 dev.cpp:322 就是这么做的),而 strdup 要堆。
+     *
+     * 判据是**往返**:注册 → 按 id 取回 → 按名字取回 → 注销 → 都取不到。
+     *
+     * ⚠ 两个观测点都要有,不能只看 get_device:
+     *   `devfs_lookup()` 是**独立于设备表**的那一个 —— 只查设备表的话,
+     *   devfs 什么都不做也会通过(那正是计划 §4.4 警告的"只登记不建节点"
+     *   的假兼容,下面的破坏性 A/B 就是专门去证明这件事的)。
+     */
+    g_device_roundtrip = 0u;
+    g_device_devfs_ab  = 0u;
+    /*
+     * 条件用"堆可用"而不是 palloc 的结果:`pe` 是上面那个块的局部量;
+     * 而这一步真正需要的就是堆 —— `devfs_register` 要 strdup。
+     * 堆没起来时 malloc 返回 NULL,注册会失败,判据照样是 0(不会假装通过)。
+     */
+    if (g_heap.inited) {
+        device_t dev;
+        int      id_a = -1;
+        int      id_b = -1;
+        u32      ok   = 1u;
+
+        memset(&dev, 0, sizeof(dev));
+        dev.flag  = 1; /* ⚠ 上游规矩:flag 由**驱动**置,regist_device 不碰它 */
+        dev.type  = DEVICE_STREAM;
+        dev.size  = 1234u;
+        strcpy(dev.drive_name, "rt0");
+
+        if (device_manager_init() != 0) {
+            ok = 0u;
+        }
+
+        /*
+         * ⚠ 这里刻意传非 NULL 的 path 而不是 NULL:
+         *   NULL 那条分支下 device_ctl[id].path 本来就是 NULL,
+         *   "路径被复制了没有""注销时释放了没有"这两件事都**看不出来**。
+         */
+        if (ok != 0u) {
+            id_a = regist_device("/blk", dev);
+            if (id_a < 0) {
+                ok = 0u;
+            }
+        }
+
+        if (ok != 0u) {
+            device_t *p = get_device((size_t)id_a);
+
+            if (p == NULL) { ok = 0u; }
+            else if (p->vdiskid != (size_t)id_a) { ok = 0u; }
+            else if (strcmp(p->drive_name, "rt0") != 0) { ok = 0u; }
+            else if (disk_size(id_a) != 1234u) { ok = 0u; }
+            else if (!have_vdisk(id_a)) { ok = 0u; }
+
+            /* 路径必须是**副本**:指针不同、内容相同 */
+            if (ok != 0u) {
+                if (device_ctl[id_a].path == NULL) { ok = 0u; }
+                else if (device_ctl[id_a].path == (const char *)"/blk") { ok = 0u; }
+                else if (strcmp(device_ctl[id_a].path, "/blk") != 0) { ok = 0u; }
+            }
+
+            /* ★ 独立观测点 */
+            if (ok != 0u && devfs_lookup("rt0") != id_a) { ok = 0u; }
+        }
+
+        /* 第二个设备:id 不重复、名字各归各 */
+        if (ok != 0u) {
+            strcpy(dev.drive_name, "rt1");
+            id_b = regist_device(NULL, dev);
+            if (id_b < 0 || id_b == id_a) { ok = 0u; }
+            else if (devfs_lookup("rt1") != id_b) { ok = 0u; }
+            else if (devfs_node_count() != 2u) { ok = 0u; }
+        }
+
+        /* 注销 a:它两个方向都要消失,而 b 不受影响 */
+        if (ok != 0u) {
+            delete_device(id_a);
+            if (devfs_lookup("rt0") != -1) { ok = 0u; }
+            if (device_ctl[id_a].path != NULL) { ok = 0u; } /* 路径副本要释放掉 */
+            if (devfs_lookup("rt1") != id_b) { ok = 0u; }
+            if (devfs_node_count() != 1u) { ok = 0u; }
+            delete_device(id_b);
+            if (devfs_node_count() != 0u) { ok = 0u; }
+        }
+
+        g_device_roundtrip = ok;
+        console_printf(" Device rt   : regist/get/get-by-name/delete round trip = %s\n",
+                       ok != 0u ? "PASS" : "FAIL");
+
+        /*
+         * ★ 破坏性 A/B(M4A-1.1b):把 devfs 关掉,只登记不建节点。
+         *
+         * 这就是计划 §4.4 第 4 条点名的 **B5-b 退化形态**("先做只登记、
+         * 不建节点的退化实现")。要证的是:上面那条往返**确实**依赖 devfs ——
+         * 关掉之后 `get_device` 照样成功,而 `devfs_lookup` 必须找不到。
+         *
+         * 两侧缺一不可:只报"找不到"的话,可能是注册本身就失败了;
+         * 只报"取得到"的话,那正是没有区分能力的假通过(坑 43)。
+         */
+        if (ok != 0u) {
+            device_t dev2;
+            int      id_c;
+            u32      by_id_ok;
+            u32      by_name_missing;
+
+            memset(&dev2, 0, sizeof(dev2));
+            dev2.flag = 1;
+            dev2.type = DEVICE_STREAM;
+            strcpy(dev2.drive_name, "ab0");
+
+            devfs_ab_set_disabled(1u);
+            id_c = regist_device(NULL, dev2);
+            devfs_ab_set_disabled(0u);
+
+            by_id_ok        = (id_c >= 0 && get_device((size_t)id_c) != NULL) ? 1u : 0u;
+            by_name_missing = (devfs_lookup("ab0") == -1) ? 1u : 0u;
+
+            if (id_c >= 0) {
+                delete_device(id_c);
+            }
+
+            g_device_devfs_ab = (by_id_ok != 0u && by_name_missing != 0u) ? 1u : 0u;
+            console_printf(" Device A/B  : devfs-off -> by_id=%u by_name_missing=%u\n",
+                           (u32)by_id_ok, (u32)by_name_missing);
         }
     }
 
@@ -3671,6 +3803,15 @@ void kmain(void)
      * 只看 smoke 的话,接线接没接上是分不出来的。
      */
     selftest_report("heap_bind_ab", g_heap_bind_ab, 1u, SELFTEST_EQ);
+
+    /*
+     * 设备管理器 + devfs 骨架(M4A-1.1b)。
+     * `device_roundtrip` 是往返本身;`device_devfs_ab` 是**证明它承重**的
+     * 破坏性对照(关掉 devfs 之后 get_device 照样成功、按名字必须找不到)。
+     * 两条一起看才有意义 —— 单看往返,一个空转的 devfs 也能让它全绿。
+     */
+    selftest_report("device_roundtrip", g_device_roundtrip, 1u, SELFTEST_EQ);
+    selftest_report("device_devfs_ab", g_device_devfs_ab, 1u, SELFTEST_EQ);
     /* 至少 32MB 可用 —— 判据写小了等于没判 */
     selftest_report("heap_size_ok", (g_heap.total_bytes >= (32u * 1024u * 1024u)) ? 1u : 0u, 1u, SELFTEST_EQ);
 
