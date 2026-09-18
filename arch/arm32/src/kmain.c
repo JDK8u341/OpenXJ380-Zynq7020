@@ -1526,6 +1526,27 @@ static void fail_stop(void)
     }
 }
 
+/*
+ * 把心跳区里**还没人分配**的那段槽清成 0(合流决策 D5,预留容量 32 → 64 槽)。
+ *
+ * 为什么必须显式清:OCM 上电后的内容是**未定义**的,而心跳是"串口不可用时
+ * 唯一还能观测的通道" —— 保留槽里留着一个上电残值,读的人分不清
+ * "这里还没人写过"和"有人写了这个数",于是会把噪声当成读数。
+ *
+ * 为什么只清 [HB_SLOT_COUNT, HB_SLOT_CAPACITY):已分配的槽由各自的写者负责,
+ * 替它们清会掩盖"那一步没跑到"。而这个区间会随 HB_SLOT_COUNT 增长自动收缩 ——
+ * 将来往 32 号槽加诊断量时,不需要回来改这里。
+ *
+ * 顺带它也是扩容这件事**唯一的正向板级判据**:启动后 JTAG 读 0x20080..0x200FF
+ * 应当全 0(而 0x20100 才是故障注入选择器)。
+ */
+static void heartbeat_reserve_clear(void)
+{
+    for (u32 i = HB_SLOT_COUNT; i < HB_SLOT_CAPACITY; i++) {
+        HB[i] = 0u;
+    }
+}
+
 void kmain(void)
 {
     u32      uart_clk = 0;
@@ -1549,6 +1570,9 @@ void kmain(void)
      *   这个拆分让 led_init() 能保持"足够早",不依赖任何发现机制。
      */
     led_init();
+
+    /* 先把保留槽清干净,再宣布"心跳区从这一槽开始有效"(见函数上的说明) */
+    heartbeat_reserve_clear();
     HB[HB_SLOT_MAGIC] = PLAT_HEARTBEAT_MAGIC;
 
     /* ---- 2. 时间基准 ---- */

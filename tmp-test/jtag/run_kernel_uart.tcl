@@ -203,13 +203,13 @@ if {[string match "*00000001" $u]} {
 set sel [lindex $argv 0]
 if {$sel ne "" && $sel != 0} {
     step "注入故障 selector=$sel"
-    mwr -force 0x00020080 $sel
+    mwr -force 0x00020100 $sel
     puts "已写入 FAULT_SEL"
 
     # 异常处理函数会打完现场再停机,9600 波特下需要一点时间把日志吐完
     after 4000
 
-    puts "FAULT_SEL  = [rd 0x00020080]  (内核应已清零,避免反复触发)"
+    puts "FAULT_SEL  = [rd 0x00020100]  (内核应已清零,避免反复触发)"
     puts "PC         = [rr pc]"
     puts "DFAR       = [rr dfar]"
     puts "DFSR       = [rr dfsr]"

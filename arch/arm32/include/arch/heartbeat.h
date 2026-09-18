@@ -139,10 +139,20 @@
 #define HB_SLOT_CPU1_MPIDR  28u /* CPU1 读到的 MPIDR 原始值 */
 
 /*
- * ⚠ 这三项之后,32 槽的预留区就满了(故障注入选择器就在 0x20080)。
- *   再加东西必须先扩容 PLAT_HEARTBEAT_REGION_SLOTS 并同步下移选择器,
- *   否则静态断言会拦住 —— 那是好事:两个结构撞车的症状是
- *   "内核莫名进了 Data Abort",而心跳看上去一切正常。
+ * ⚠ 这三项是**当前已分配的最后一组**(0..31)。
+ *
+ * ★ 2026-09-18(合流决策 D5):预留容量从 32 扩到 **64 槽**,所以这里
+ *   **不再顶格** —— slot 32..63 是**保留区**,由 kmain 在启动时**显式清零**
+ *   (见 src/kmain.c 的 heartbeat_reserve_clear())。清零这一步不是洁癖:
+ *   OCM 上电后的内容是未定义的,不清的话"还没人写过"与"写了 0"分不开,
+ *   JTAG 读到一个非零残值会**被当成真实读数**——而 JTAG 恰恰是出问题时
+ *   唯一还能用的观测手段,它自己不能先骗人。
+ *
+ *   占用超过容量时静态断言会拦住 —— 那是好事:心跳与故障注入选择器撞车的
+ *   症状是"内核莫名进了 Data Abort",而心跳看上去一切正常。
+ *
+ *   新增槽位的顺序约定:**接着 31 往下排,不要插空** —— 槽号一旦被外部引用
+ *   就是契约(JTAG 脚本、自检报告、文档都按号读)。
  */
 #define HB_SLOT_CPU1_TICKS  29u /* CPU1 自己的 1kHz tick 计数 */
 #define HB_SLOT_IPI_COUNT   30u /* CPU1 收到的 SGI 次数 */
@@ -176,7 +186,8 @@
 #define HB_MMU_STAGE_ON         4u /* MMU 已开,且已回到 C 代码继续跑 */
 #define HB_MMU_STAGE_FAILED     0xEEu /* 自检未通过,主动放弃开 MMU */
 
-/* 已定义的槽位数。越界写会踩到后面的故障注入选择器 */
+/* 已分配(有写者)的槽位数。
+ * HB_SLOT_COUNT .. HB_SLOT_CAPACITY-1 是保留区,由 kmain 启动时清零。 */
 #define HB_SLOT_COUNT     32u
 
 /* 心跳区预留的槽位容量(见 platform.h 的 PLAT_HEARTBEAT_REGION_SLOTS) */
@@ -188,11 +199,11 @@
 /*
  * 双向锁住心跳区与故障注入选择器的边界。
  *
- * 这两个结构都是会增长的:心跳已经扩过两次槽位,而选择器原先就在
- * 第 16 槽上。一旦心跳长到选择器头上,fault_test_poll() 会把
- * 心跳进度号当成注入码读走 —— 症状是"内核莫名进了 Data Abort",
- * 而心跳本身看上去一切正常,极难联想到是这两个结构撞了。
- * 让它在编译期就报错。
+ * 这两个结构都是会增长的:心跳已经扩过**三次**槽位(16 → 32 → **64**,
+ * 2026-09-18 合流决策 D5),而选择器原先就在第 16 槽上。一旦心跳长到
+ * 选择器头上,fault_test_poll() 会把心跳进度号当成注入码读走 ——
+ * 症状是"内核莫名进了 Data Abort",而心跳本身看上去一切正常,
+ * 极难联想到是这两个结构撞了。让它在编译期就报错。
  */
 _Static_assert(HB_SLOT_COUNT <= HB_SLOT_CAPACITY,
                "heartbeat slots exceed the reserved region capacity");

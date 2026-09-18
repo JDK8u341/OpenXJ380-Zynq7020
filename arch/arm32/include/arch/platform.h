@@ -226,7 +226,7 @@
  * 故障注入选择器。
  *
  * ⚠ 位置不是随便挑的:它必须**紧接在心跳区预留容量之后**。
- *   心跳区占地 0x00020000..0x0002007F(32 槽),选择器从 0x00020080 开始。
+ *   心跳区占地 0x00020000..0x000200FF(64 槽),选择器从 0x00020100 开始。
  *
  *   这个边界是踩出来的:最初选择器放在 0x00020040,也就是第 16 槽,
  *   而心跳后来扩展到了第 16 槽(MMU 阶段标记)——
@@ -234,7 +234,18 @@
  *   随机触发异常,而且症状是"内核莫名奇妙进了 Data Abort"。
  *   arch/heartbeat.h 里有静态断言双向锁住这条边界。
  *
+ * ★ 2026-09-18(合流决策 D5):预留容量从 32 槽扩到 **64 槽**,选择器随之
+ *   从 0x00020080 移到 0x00020100。扩容而不是删旧槽的理由见计划 §0.5.8 ——
+ *   34 个已定义的槽**每个都有写者**,而 JTAG 可见的诊断量只能放在**不可缓存**
+ *   的低 1MB(DDR 是写回可缓存,JTAG 直读物理内存会读到陈旧值)。
+ *
+ * ⚠ 改这两个常量时,**仓库里还有 7 处硬编码副本要同步**
+ *   (tmp-test/jtag/{run_kernel_uart,inject_fault}.tcl、tmp-test/guard_trip.py、
+ *    以及 arch/fault_test.h 的用法注释)。tests/test_arm32_heartbeat.py 会
+ *   逐处核对它们与这里的值一致 —— 漏改的症状是"注入脚本写了却没反应",
+ *   因为那一写会落进心跳槽里而不是选择器。
+ *
  * 由 JTAG 写入以触发指定异常,见 arch/fault_test.h。
  */
-#define PLAT_HEARTBEAT_REGION_SLOTS 32u
-#define PLAT_FAULT_SEL_ADDR 0x00020080u
+#define PLAT_HEARTBEAT_REGION_SLOTS 64u
+#define PLAT_FAULT_SEL_ADDR 0x00020100u

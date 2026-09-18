@@ -8,15 +8,20 @@
  *   "处理函数写对了" 和 "处理函数根本没被调用、只是系统恰好没崩"。
  *
  * 用法:内核启动后,用 JTAG 往选择器地址写码即可触发,不需要重新烧录:
- *   xsdb> mwr -force 0x00020080 1     # 触发 Data Abort
- *   xsdb> mwr -force 0x00020080 2     # 触发 Undefined Instruction
- *   xsdb> mwr -force 0x00020080 3     # 触发 Prefetch Abort
- *   xsdb> mwr -force 0x00020080 4     # 触发 SVC(会返回,不致命)
- *   xsdb> mwr -force 0x00020080 5     # 从 XN 区域取指(验证 XN 生效)
- *   xsdb> mwr -force 0x00020080 6     # 栈溢出进 guard 页(验证 guard 生效)
- *   xsdb> mwr -force 0x00020080 7     # 同上,但 guard 用 AP=0b000 实现
- *   xsdb> mwr -force 0x00020080 8     # ★ 对照组:关掉 guard 再溢出,应当不报错 ★
- *   xsdb> mwr -force 0x00020080 9     # 异常帧布局自检(会返回,结果进自检报告)
+ *   xsdb> mwr -force 0x00020100 1     # 触发 Data Abort
+ *   xsdb> mwr -force 0x00020100 2     # 触发 Undefined Instruction
+ *   xsdb> mwr -force 0x00020100 3     # 触发 Prefetch Abort
+ *   xsdb> mwr -force 0x00020100 4     # 触发 SVC(会返回,不致命)
+ *   xsdb> mwr -force 0x00020100 5     # 从 XN 区域取指(验证 XN 生效)
+ *   xsdb> mwr -force 0x00020100 6     # 栈溢出进 guard 页(验证 guard 生效)
+ *   xsdb> mwr -force 0x00020100 7     # 同上,但 guard 用 AP=0b000 实现
+ *   xsdb> mwr -force 0x00020100 8     # ★ 对照组:关掉 guard 再溢出,应当不报错 ★
+ *   xsdb> mwr -force 0x00020100 9     # 异常帧布局自检(会返回,结果进自检报告)
+ *
+ * ⚠ 地址是 PLAT_FAULT_SEL_ADDR(platform.h)。它**紧跟在心跳区预留容量之后** ——
+ *   2026-09-18 心跳从 32 扩到 64 槽,这个地址因此从 0x00020080 移到 0x00020100。
+ *   写错地址不会报错,只会**写进心跳槽**:症状是"注入脚本没反应"。
+ *   tests/test_arm32_heartbeat.py 逐处核对仓库里的副本。
  */
 
 #include <arch/types.h>

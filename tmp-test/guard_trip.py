@@ -89,7 +89,11 @@ POKE_TCL = ROOT / "tmp-test" / "out" / "_guard_trip_poke.tcl"
 PORT = config.SERIAL_PORT
 BAUD = config.SERIAL_BAUD
 
-FAULT_SEL_ADDR = 0x00020080
+# 故障注入选择器地址 —— 必须与 arch/arm32/include/arch/platform.h 的
+# PLAT_FAULT_SEL_ADDR 一致(它紧跟在心跳区预留容量之后)。
+# ★ 2026-09-18 心跳 32 → 64 槽,这个地址随之从 0x00020080 移到 0x00020100。
+# tests/test_arm32_heartbeat.py 会核对这里;写错不会报错,只会写进心跳槽里。
+FAULT_SEL_ADDR = 0x00020100
 SEL_GUARD = 6
 SEL_GUARD_AP = 7
 SEL_GUARD_OFF = 8
