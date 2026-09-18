@@ -209,7 +209,7 @@ python tmp-test/run_and_capture.py <串口> 9600 60  # 只抓原始串口（hex 
 
 ---
 
-## 7. 已经实现的功能（M0 – M4-11）
+## 7. 已经实现的功能（M0 – M4-11，以及 M4A 的前两步）
 
 | 阶段 | 内容 | 板上状态 |
 |---|---|---|
@@ -223,6 +223,8 @@ python tmp-test/run_and_capture.py <串口> 9600 60  # 只抓原始串口（hex 
 | M4-9/M4-9.5 | **抢占（搬帧）**、VFP 现场随切换保存/恢复 | ✅ |
 | M4-10 | **SMP 调度**：每核 idle/队列/计数器、挑最短队列、VFP 每核化 | ✅ |
 | M4-11 | **串口排他换成源 OS 的 yield 型互斥**（D13）、**线程退出路径**（`DEATH`+让出+`wfi`，D14，**内核线程不回收**）、`sched_park_self` 退场 | ✅ |
+| M4A-1.1a | **libc 堆接口**：`malloc/calloc/realloc/free` 接到 ARM 的堆上（+ `kmalloc_bad_free_count()` 补上 `free` 无返回值的信号损失） | ✅ |
+| M4A-1.1b | **设备管理器 + devfs 骨架**（`regist_device`/`get_device` 往返，形状对着上游 `include/device.h` 机械比对）—— `/dev` 下**还没有真节点**，块设备**不会自动扫分区** | ✅ |
 
 > ★ **关于"线程生命周期"要说清一句**（`docs/PTASK.md` §1.1 / §4.4）：
 > **源 OS 的内核线程本来就没有生命周期** —— 能被标成 `DEATH`，但**没有任何释放路径**
@@ -245,6 +247,8 @@ python tmp-test/run_and_capture.py <串口> 9600 60  # 只抓原始串口（hex 
   判据是跑一个**手写的**静态链接 32 位用户程序（`write`/`exit`）——**不含** busybox/musl，
   「跑 `shell.elf`」留给 `M7`。**该阶段尚未开工。**
 - **文件系统**：没有 VFS、没有 FATFS、没有块设备驱动（SD/arasan 一行没写）。
+  ⚠ **devfs 只有骨架**（M4A-1.1b）：一张"名字 → 设备 id"的表，`/dev` 下没有真节点、
+  没有文件操作。计划 §4.4 明写"不允许把只登记不建节点当成完成态"——**它不是完成态**。
 - **网络 / USB / 显示**：没有。
 - **进程（PCB）**：没有。ARM 侧只有"线程（TCB）"这一层；上游的进程组/`fork`/`execve`
   语义还没接。

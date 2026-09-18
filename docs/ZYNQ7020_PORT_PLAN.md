@@ -300,14 +300,17 @@ M4-8 里我推出一个"纯协作式调度器到不了 idle"的死结，并准�
 > **D4** 用户态 = **新增 M4A-4**，同时**改写 M5 的验收**（不在 M5 跑 `shell.elf`）；
 > **D5** 心跳区 = **扩容 32 → 64 槽**（不删旧槽）—— ✅ **已落地（`6cf135d`）**。
 >
-> ★ **M4A-1.1 已拆成两步，第一步 a 已完成（`6b82a0e`）**：
+> ★ **M4A-1.1 已拆成两步，两步都已完成（`6b82a0e` / `1a4aa3f`，板上 100/0）**：
 > **1.1a** = D2 的接口层 —— `malloc/calloc/realloc/free` 接到 M4-3 就做好的堆上
 > （`arch/arm32/src/kmalloc.c`，加 `kmalloc_bad_free_count()` 补上 `free` 无返回值的
-> 信号损失）。板上 **98/0**（新增一条 `heap_bind_ab` 破坏性 A/B）+
-> `Heap smoke` 改走 `malloc/free` 因而每次都验这条接线。
-> ⇒ **下一步 1.1b**：上游 include 路径映射（`<mm/alloc/alloc.h>` / `<mm/heap.h>`）
-> + device manager + `regist_device` + devfs 骨架 —— 那一步会第一次把上游
-> `include/device.h` 拉进 ARM 图（它经 `proto.hpp` 拖进整个 x86 主干，见下文）。
+> 信号损失）；**1.1b** = 设备管理器 + devfs 骨架（`arch/device.h` / `src/device.c` /
+> `src/devfs.c` / `src/id_alloc.c`），形状对着上游 `include/device.h` 由
+> `tests/test_arm32_device.py` **逐字段机械比对**钉住。
+> ⚠ **上一版这段写的"1.1b 会第一次把上游 `include/device.h` 拉进 ARM 图"是错的**：
+> 上游 `driver/device.cpp` 卡在 VFS/分区层（M4A-1.3/1.4）与**进程层**（M7）上，
+> 与 C++ 无关 ⇒ 那件事属于 M4A-3/B5，C++ 规则的前置是 M4A-1.2（搬上游 VFS）。
+> ⇒ **下一步 M4A-1.2**：上游 include 路径映射（`<mm/alloc/alloc.h>` / `<mm/heap.h>` /
+> `<fs/vfs/vfs.h>`）+ VFS 核心 + `tmpfs`。
 
 **M4-8.5（无饥饿）、M4-10（SMP 调度）、M4-11（串口真锁 + 线程退出路径）都已完成并
 板上验证。板级自检 97 passed / 0 failed，八组破坏性 A/B 全部检出。**
@@ -2485,7 +2488,7 @@ M4A-4 用户态与 syscall 层          <- 2026-09-18 新增(合流决策 D4);�
 | # | 内容 | 依赖 | 上板可验证方式 |
 |---|---|---|---|
 | ~~**M4A-1.1a**~~ | ~~D2 的接口层：`malloc/calloc/realloc/free` 接到 ARM 堆上~~ | M4-3 的堆 ✅ | ✅ **已完成（`6b82a0e`）**：板上 **98/0**；`Heap smoke` 改走 `malloc/free`（每次上板都验这条接线）+ 新增 `heap_bind_ab` 破坏性 A/B（解绑后 `malloc` 必须返回 NULL）。宿主新增 `tests/test_arm32_kmalloc.py`（含"把释放失败吞掉"的破坏性对照）。⚠ 上游的 `<mm/alloc/alloc.h>` 路径映射**还没做**，今天只保证符号存在 |
-| **M4A-1.1b** | device manager + `regist_device` + devfs 骨架（+ 上游 include 路径映射） | 1.1a | `regist_device` / `get_device` 往返。⚠ 本行原文写"此时 `mutex` 已可睡眠，不再是退化版"—— **这句是错的**：M4-11 开工前的调研（`43dc1eb`）已推翻它，源 OS 的 mutex 是 **yield 型**、不存在"可睡眠互斥"（D13/D17）。M4A-1.1 用的是**已经落地并板上验过的那把 yield 型互斥** |
+| ~~**M4A-1.1b**~~ | ~~device manager + `regist_device` + devfs 骨架（+ 上游 include 路径映射）~~ | 1.1a ✅ | ✅ **已完成（`1a4aa3f`）**：板上 **100/0**；`device_roundtrip`（注册 → 按 id 取回 → 按**名字**取回 → 注销）+ `device_devfs_ab` **破坏性对照**（关掉 devfs 后 `get_device` 照样成功、`devfs_lookup` 必须找不到 —— 即计划 §4.4 点名的 B5-b 退化形态）。形状由 `tests/test_arm32_device.py` 对着上游 `include/device.h` **逐字段比对**；与上游的 4 处加固 + 1 个已知缺口（块设备不会自动扫分区）逐条记在 `arch/device.h` 与 `arch/arm32/README.md`。<BR>⚠ 本行原文写"此时 `mutex` 已可睡眠，不再是退化版"—— **这句是错的**：源 OS 的 mutex 是 **yield 型**（D13/D17）。<BR>⚠ **上游 include 路径映射仍未做**（原计划并进本行，实际属 M4A-1.2） |
 | **M4A-1.2** | **VFS 核心 + `tmpfs`** | M4A-1.1b | **第一个完整切片**：建/读/写/列目录全在内存，不需要块设备 |
 | **M4A-1.3** | 块设备（SD/arasan）+ `diskio` | 独立，可并行 | 读写扇区 + 写回读 |
 | **M4A-1.4** | **FATFS** | M4A-1.2 + M4A-1.3 | 挂载 + 读写文件 + 与主机侧比对 |

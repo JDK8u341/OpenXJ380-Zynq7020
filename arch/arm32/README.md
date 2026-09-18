@@ -2726,6 +2726,112 @@ kstack_peak_used          池的峰值用量（数值本身要能看见）
 
 ---
 
+### M4A-1.1a：libc 堆接口（已完成，板上 98/0）
+
+把 `malloc` / `calloc` / `realloc` / `free` 接到 M4-3 就做好的堆上。
+**分配器一个字节都没重写** —— 缺的一直是"名字"这一层接线。
+详见上面 M4-1 一节的补记与 `arch/kmalloc.h`。
+
+一句话：`free()` 是 void，而 `heap_free()` 会告诉你失败。接成 void 就把
+"双重释放/野指针"这个信号扔了 ⇒ 留了 `kmalloc_bad_free_count()`，
+并让启动冒烟测试走 `malloc/free`，所以这条接线每次上板都被跑一遍。
+
+---
+
+### M4A-1.1b：设备管理器 + devfs 骨架（已完成，板上 100/0）
+
+**先纠正一个我上一轮的判断**：这件事**不需要 C++**。
+
+上游 `driver/device.cpp`（540 行）在这一步**无论如何搬不进来**，与语言无关：
+
+| 它依赖什么 | 属于哪个阶段 |
+|---|---|
+| `regist_device` → `partition_device_added()`（自动分区扫描） | VFS/分区层，M4A-1.3/1.4 |
+| `device_manager_init()` → 256 把 `blk_cached_bounce_lock` | 块层，M4A-1.3 |
+| 块路径 / `delete_device` → `get_current_task()->parent_group->pagedir`、`user_range_mapped()` | **进程层，M7** |
+
+⇒ C++ 规则真正的前置是 **M4A-1.2**（搬上游 VFS，`driver/fs` 全是 `.cpp`）；
+   上游 `include/device.h` 拖进 `proto.hpp`（进而整个 x86 主干）那件事属于 **M4A-3/B5**。
+   所以这一步按"移植侧写骨架"来做，语言用 C。
+
+#### 形状怎么保证一致：机械比对，不靠自觉
+
+`arch/arm32/include/arch/device.h` 是**按上游形状写的**，而上游那份不能直接
+include。于是 `tests/test_arm32_device.py` 做**文本契约比对**（与 errno 逐值
+比对同一套路）：
+
+- `device_t` 的成员**逐条比类型拼写与顺序** —— 顺序也要比，因为
+  `regist_device(path, vd)` 是**按值**传结构体，字段错位不会报错，只会让两边
+  的字段互相顶掉；
+- 枚举量名字与顺序、回调 typedef、`SECTORS_ONCE`；
+- 我们声明出去的每个原型，上游都得有（**允许是子集**：块层那几个函数本阶段
+  刻意**不声明**，好让调用方得到一句清楚的 implicit declaration，
+  而不是链到一半才发现是空壳）；
+- `DEVICE_TABLE_SIZE` 与上游 `device_ctl[256]` 的字面量对齐。
+
+#### 与上游的差异：四条加固 + 一个已知缺口
+
+| # | 差异 | 为什么 |
+|---|---|---|
+| 1 | `get_device()` 加**上界检查** | 上游直接 `device_ctl[id].flag`，越界会读到别人的内存并当成设备用（`partition.cpp` 有 5 处调用）。返回 NULL 至少可诊断 |
+| 2 | `delete_device()` 释放路径副本后**把表里的指针清空** | 上游 free 的是**局部拷贝**，表里留的是悬垂指针；槽位被重新注册时 `devfs_register` 会二次释放。上游靠"`regist_device` 整体覆盖 `vd`"侥幸躲开 |
+| 3 | `devfs_delete()` 统一按「/dev 下的节点名」 | 上游 `delete_device` 在 `dev.path != NULL` 时传的是**父目录**，会 unlink 错节点（实测 `dev.cpp:300-314` 是拼 `"/dev/"+参数` 再 unlink 那个节点）。今天四个调用方全传 NULL，那条错路从没被走到 —— **潜伏**，不是发作中 |
+| 4 | `devfs_register` 先释放旧的 `path` | 上游对同一槽位重复注册会泄漏 |
+| ⚠ | **块设备不会自动扫分区** | 上游 `regist_device` 对 `DEVICE_BLOCK` 调 `partition_device_added()`，我们**没做**（属 M4A-1.3/1.4）。写在这里而不是悄悄跳过 —— "注册成功"四个字很容易让人以为后面都通了 |
+
+另有一条**照抄**的：`delete_device` 之后 `get_device(id)` 仍返回非 NULL
+（上游只改局部拷贝）。宿主测试**显式断言**它，好让"哪天改成清 flag"
+变成一个有意识的决定，而不是悄悄变了没人知道。
+
+#### id 分配器：照抄一份，不是自己造
+
+`src/id_alloc.c` 是上游 `kernel/id_alloc.cpp`（57 行）的 C 版，语义逐条一致。
+它是**有意的临时副本**（上游那份是 `.cpp`），C++ 规则到位后应当删掉、改回共用；
+理由与先例（`errno.h` 的复制 + 逐值比对）写在 `arch/id_alloc.h`。
+**没有**在 `device.c` 里塞一个"私有的 15 行位图" —— 规程是源 OS 优先（§0.5.9），
+而且 `id_alloc` 在上游是**两个**子系统共用的（设备表 + 模块加载器）。
+
+#### 顺带把 libc 补到能接上游代码
+
+`strdup`（上游那批文件里 25 处调用）、`errno_t`（上游放在 `krlibc.h:27`，
+这里放同一位置）、以及 `arch/types.h` 的 `uintN_t`/`intN_t`（上游头文件到处
+在用，而移植侧只有 `u8`/`u32`）。
+**没有**开 `-I./include`：那会让所有 ARM 源文件暴露在上游头文件下 ——
+实测过一个坑：`include/id_alloc.h` 用**引号**写 `#include "krlibc.h"`，
+引号形式先搜本文件所在目录，于是命中的是上游那份 219 行的。
+
+#### 板上判据
+
+```
+Registers (rt0)device success
+Registers (rt1)device success
+Device rt   : regist/get/get-by-name/delete round trip = PASS
+Registers (ab0)device success
+Device A/B  : devfs-off -> by_id=1 by_name_missing=1
+CHECK device_roundtrip = 1   PASS
+CHECK device_devfs_ab  = 1   PASS
+SELF-TEST: 100 passed, 0 failed
+```
+
+★ **`device_devfs_ab` 是破坏性对照**：把 devfs 关掉（即计划 §4.4 点名的
+**B5-b 退化形态"只登记不建节点"**），此时 `get_device` **照样成功**、
+而 `devfs_lookup` **必须找不到**。两侧都要报出来 —— 只看一侧就没有区分能力
+（"找不到"可能只是注册整个失败了）。它同时证明了"只登记不建节点"为什么是
+**假的兼容**。
+
+#### 明确**没有**做的事
+
+- 块层（`device_read` / `device_write` / `blk_device_*` / `device_mmap` / bounce 缓冲）→ M4A-1.3；
+- 自动分区扫描 → M4A-1.3/1.4；
+- `/dev` 下**没有真节点**，也没有文件操作。骨架只有一张"名字 → id"的表。
+  ⚠ 计划 §4.4 第 4 条明写"不允许把只登记不建节点当成完成态" —— 本骨架**不是**
+  完成态，真 devfs 随 M4A-1.2 的 VFS 一起来；
+- `path`（父目录）被**接受但不生效**（骨架没有目录树）。今天所有调用方都传
+  NULL，所以不影响任何现有调用。相应地，**同名不同父**的两个设备在骨架里会
+  撞在一起 —— 真 devfs 到位后这个限制自然消失。
+
+---
+
 ### 12. 其它待办（AM3 及以后）
 
 - 缓存维护与 Cortex-A9/PL310 勘误 —— **L1 与 L2 均已使能**；
