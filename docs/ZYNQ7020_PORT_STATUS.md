@@ -241,6 +241,9 @@ python tmp-test/run_and_capture.py <串口> 9600 60  # 只抓原始串口（hex 
 
 - **用户态 / 系统调用层**：完全没有。没有 `syscall` 分发，没有 `shell.elf`，没有 ELF 加载；
   ARM 侧遇到 `SVC` 只打一行诊断然后返回。
+  ★ 归属阶段 **2026-09-18 已拍板**：**新增 `M4A-4`「用户态与 syscall 层」**（合流决策 D4），
+  判据是跑一个**手写的**静态链接 32 位用户程序（`write`/`exit`）——**不含** busybox/musl，
+  「跑 `shell.elf`」留给 `M7`。**该阶段尚未开工。**
 - **文件系统**：没有 VFS、没有 FATFS、没有块设备驱动（SD/arasan 一行没写）。
 - **网络 / USB / 显示**：没有。
 - **进程（PCB）**：没有。ARM 侧只有"线程（TCB）"这一层；上游的进程组/`fork`/`execve`
@@ -260,7 +263,7 @@ python tmp-test/run_and_capture.py <串口> 9600 60  # 只抓原始串口（hex 
 | 串口 | PS UART1 @ `0xE0001000`，MIO48/49，**9600 8N1**；主机侧串口号**因机器而异**，写在 `config.py` 的 `SERIAL_PORT` |
 | JTAG | Vitis `xsdb`；脚本 `tmp-test/jtag/run_kernel_uart.tcl`（`reset system` → `ps7_init` → 比特流 → `dow`） |
 | LED | PL 侧 AXI GPIO @ `0x41200000`（跑马灯，用来肉眼确认"内核在跑"） |
-| 心跳 | OCM `0x00020000` 起 32 槽（**已满**，新的诊断量走串口/自检报告） |
+| 心跳 | OCM `0x00020000` 起 **32 槽（已满）**；合流决策 D5 已定**扩容到 64 槽**，**尚未实施** —— 在那之前新的诊断量走串口/自检报告 |
 | 已知硬故障 | XSA 若把 MIO bank1 声明成 3.3V，UART1 RX 会**静默收不到任何字节**（脚本里有硬断言拦它） |
 
 ---
