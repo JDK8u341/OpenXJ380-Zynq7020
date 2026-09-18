@@ -36,10 +36,21 @@ typedef int                ssize_t;
 typedef unsigned int       uintptr_t;
 typedef int                intptr_t;
 
+/*
+ * ⚠ C++ 有**内建** bool,再 typedef 会报
+ *   "redeclaration of C++ built-in type 'bool' [-fpermissive]"。
+ *   ARM 上两边都是 1 字节、布局一致,所以 C++ 翻译单元直接用内建的即可。
+ *
+ * 为什么架构头要在意 C++:上游的 kernel/、driver/ 全是 .cpp,合流(见
+ * docs/ZYNQ7020_INTEGRATION_PLAN.md)迟早要把它们编进 ARM 图 ——
+ * 那时这条 typedef 会是第一个拦路的。
+ */
+#    ifndef __cplusplus
 typedef u8 bool;
 
-#    define true  1
-#    define false 0
+#        define true  1
+#        define false 0
+#    endif
 
 #    ifndef NULL
 #        define NULL ((void *)0)

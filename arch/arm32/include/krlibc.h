@@ -39,6 +39,21 @@
 
 #include <arch/types.h>
 
+/*
+ * ★ 整份声明都放进 extern "C"。
+ *
+ * 上游的 <mm/alloc/alloc.h> 也是这么写的(它自带 extern "C" 块),
+ * 而两边一旦同时出现、链接约定却不一致,编译器会直接报
+ *   "conflicting declaration of 'void* malloc(size_t)' with 'C' linkage"
+ * —— 实测就是这么撞上的(把 kernel/id_alloc.cpp 编进 ARM 图时)。
+ *
+ * 这些符号的**定义**在 src 下的 .c 文件里(C 编译),所以在 C++ 翻译单元里
+ * 必须按 C 链接去找它们,否则会去链 _Z6mallocj。
+ */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* ---- 内存 ---- */
 void *memcpy(void *dest, const void *src, size_t n);
 void *memmove(void *dest, const void *src, size_t n);
@@ -93,3 +108,7 @@ int atoi(const char *pstr);
  *   已登记进 README 的「退化实现清单」。
  */
 extern int errno;
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
