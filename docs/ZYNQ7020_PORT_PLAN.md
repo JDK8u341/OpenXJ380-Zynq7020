@@ -169,7 +169,9 @@ for l in text.splitlines():
 - 控制台 = **UART1 @ `0xE0001000`，MIO48(TX)/MIO49(RX)**，9600 8N1；USB 线一根经 SL2.1S hub：
   JTAG + PS 串口（CH9102F → **COM4**）+ PL 串口（CH340E → COM7）
 - PL LED = 双通道 AXI GPIO @ `0x41200000`（无中断）
-- 心跳区 OCM `0x00020000`，magic `0x4F583338`；**32 个槽已满**，故障注入选择器 `0x00020080`
+- 心跳区 OCM `0x00020000`，magic `0x4F583338`；预留 **64 槽**（`0x00020000`–`0x000200FF`，
+  其中已分配 0–31、32–63 是启动时清零的保留区），故障注入选择器 `0x00020100`
+  （2026-09-18 合流决策 D5 扩容；原为 32 槽 / `0x00020080`，**别再按旧值排查**）
 - DDR `0x00100000` + `0x3FF00000`；内核物理加载 `0x00100000`
 - **MIO bank1 实际 1.8V**、bank0 3.3V；当前 XSA 已修正，加载器在 `ps7_init` 后有硬校验
 - 板子当前是**交叉组合**：PS 配置取自 `opjtmp.xsa`，PL 比特流取自 `AXI_GPIO_1_SOFT`
@@ -296,7 +298,7 @@ M4-8 里我推出一个"纯协作式调度器到不了 idle"的死结，并准�
 > ★ **2026-09-18 拍板（合流决策，表见 `docs/ZYNQ7020_INTEGRATION_PLAN.md` §6）**：
 > **D2** 内存分配器 = **保留 ARM 那份 + 补一层上游形状的接口**（不搬 `kernel/memory/**`）；
 > **D4** 用户态 = **新增 M4A-4**，同时**改写 M5 的验收**（不在 M5 跑 `shell.elf`）；
-> **D5** 心跳区 = **扩容 32 → 64 槽**（不删旧槽）。
+> **D5** 心跳区 = **扩容 32 → 64 槽**（不删旧槽）—— ✅ **已落地（`6cf135d`，板上 97/0 + 八组 A/B 全检出 + 清零与注入各有区分性判据）**。
 > ⇒ **下一步就是 `§4.6` 的 M4A-1.1**（device manager + `regist_device` + devfs 骨架）。
 
 **M4-8.5（无饥饿）、M4-10（SMP 调度）、M4-11（串口真锁 + 线程退出路径）都已完成并
@@ -612,7 +614,7 @@ Preempt A/B  : skip_frame -> a=0 b=0 switched=2 invalid=0   → 检出
 | ~~新线程 vruntime 漏了 `- WAKEUP_CREDIT`（D15）~~ | **已结案（M4-10.1，`ccb7156`）**：`sched_entity_init` 改成源 OS 的三参数语义，并逐值钉在宿主单测里（旧判据当时是**跟着实现一起写错的**）|
 | `spin_t` 的宿主编译器 `#include <stdint.h>` | 无 |
 | `arch/arm32` 不在 `ninja format` 的范围内 | 刻意；见 README（用 clang-format 会打散注释对齐）|
-| ~~**心跳区 32 槽已满**~~ | **已结案（2026-09-18，合流决策 D5）：扩容 32 → 64 槽**，不删旧槽。取证：34 个 `HB_SLOT_*` 名字**每个都有写者**（最少的也是"定义 1 + 使用 1"），**没有一个死槽可删**；而心跳的**唯一价值**是"串口不可用时唯一还能观测的通道"，现有槽大多是启动期量（UART 标定 / MMU 阶段 / CPU1 阶段 / 缓存自检），删掉就是放弃那类故障的事后诊断。⚠ **新诊断量也不能改放 DDR**：DDR 是写回可缓存，JTAG 走 DAP 直读物理内存会读到陈旧值 ⇒ 想加 JTAG 可见的诊断量，扩容是**唯一**正确选项。代价是常数级：`PLAT_HEARTBEAT_REGION_SLOTS` 32→64、`PLAT_FAULT_SEL_ADDR` `0x00020080`→`0x00020100`（空间充足：低 OCM 窗口 `0x0..0x2FFFF`，选择器之上还剩 ~64 KB），**不用动页表**（低 1 MB 本就是一条 1 MB 段、不可缓存），且有 `heartbeat.h` 的两条 `_Static_assert` 在编译期护栏；外加 **7 行 / 5 个文件**的硬编码要同步：`tmp-test/guard_trip.py:92`、`tmp-test/jtag/inject_fault.tcl:18,21`、`tmp-test/jtag/run_kernel_uart.tcl:206,212`、`arch/arm32/include/arch/fault_test.h:11-19` |
+| ~~**心跳区 32 槽已满**~~ | **已结案（2026-09-18，合流决策 D5）：扩容 32 → 64 槽**，不删旧槽。取证：34 个 `HB_SLOT_*` 名字**每个都有写者**（最少的也是"定义 1 + 使用 1"），**没有一个死槽可删**；而心跳的**唯一价值**是"串口不可用时唯一还能观测的通道"，现有槽大多是启动期量（UART 标定 / MMU 阶段 / CPU1 阶段 / 缓存自检），删掉就是放弃那类故障的事后诊断。⚠ **新诊断量也不能改放 DDR**：DDR 是写回可缓存，JTAG 走 DAP 直读物理内存会读到陈旧值 ⇒ 想加 JTAG 可见的诊断量，扩容是**唯一**正确选项。代价是常数级：`PLAT_HEARTBEAT_REGION_SLOTS` 32→64、`PLAT_FAULT_SEL_ADDR` `0x00020080`→`0x00020100`（空间充足：低 OCM 窗口 `0x0..0x2FFFF`，选择器之上还剩 ~64 KB），**不用动页表**（低 1 MB 本就是一条 1 MB 段、不可缓存），且有 `heartbeat.h` 的两条 `_Static_assert` 在编译期护栏；外加 **7 行 / 5 个文件**的硬编码要同步：`tmp-test/guard_trip.py:92`、`tmp-test/jtag/inject_fault.tcl:18,21`、`tmp-test/jtag/run_kernel_uart.tcl:206,212`、`arch/arm32/include/arch/fault_test.h:11-19`。<BR>✅ **已实施（`6cf135d`）**：三条上板判据都过 —— ①回归 `verify_board.py --load --seconds 75` = **97/0** 且**八组破坏性 A/B 全部检出**；②★ **清零真的跑了**（这条判据第一版**不承重**：`rst -system` 本身就会清 OCM，实测种 `0xDEADBEEF` → `rst -system` → 读回 0；改成"复刻加载序列、在加载器清完心跳之后 `con` 之前把哨兵种到 `0x000200A0`"，实测 `0xDEADBEEF` → 启动后 **0**，而对照 `rst -processor` 哨兵**存活** ⇒ OCM 不会自己变 0）；③★ **从新地址注入仍有效**：写 `0x00020100` = 1 → 内核读掉并清 0、`PC=0x001001FC` 落在 `_vec_data_abort` 内。另新增 `tests/test_arm32_heartbeat.py`（8 条）管住**脚本里的副本** —— C 侧静态断言管不到它们，而失效形态是"写了却没反应、心跳槽被改一个字" |
 
 #### ★ M4-10 收尾（`ed97035`）：五个缺口的补法与两处新增退化风险
 
