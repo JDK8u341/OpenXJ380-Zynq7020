@@ -524,11 +524,25 @@ static inline void barrier(void)
  * 独占访问原语。
  * 用内联汇编而不是 __builtin_arm_ldrex/clang 的 __ldrex:
  * 前者是 clang 专有,后者是 GCC 专有,内联汇编两边都能编。
+ *
+ * ★★ 约束里的 `&`(early-clobber)不是装饰,是**正确性要求** ★★
+ *
+ * ARMv7 的 `strex Rd, Rt, [Rn]` 要求 **Rd != Rn**(Rd 与 Rt 也不能同)。
+ * 少了 `&`,编译器完全可以把 `%0`(结果)与 `%1`(地址)分配到同一个寄存器,
+ * 生成 `strex r3, r2, [r3]` —— 汇编器直接报
+ *   Error: registers may not be the same -- `strex r3,r2,[r3]'
+ * 而**寄存器分配是上下文相关的**:同一份头文件在别处能编过,在这里编不过。
+ *
+ * 这个 bug 一直是**潜伏**的:本文件自 M4 起就被 sched/mutex/kstack 用着,
+ * 它们那个上下文里编译器恰好选了不同的寄存器。2026-09-18 把上游
+ * driver/fs 下的文件编进来时,9 个文件一起炸在汇编器上,才把它暴露出来。
+ * ⇒ 修法不是"把寄存器错开"(那是碰运气),而是用 `&` 让编译器**必须**错开。
  */
 static inline u32 arch_ldrex(volatile u32 *addr)
 {
     u32 value;
-    __asm__ volatile("ldrex %0, [%1]" : "=r"(value) : "r"(addr) : "memory");
+    /* `&` 同理:`ldrex Rd, [Rn]` 在 Rd == Rn 时也是 UNPREDICTABLE */
+    __asm__ volatile("ldrex %0, [%1]" : "=&r"(value) : "r"(addr) : "memory");
     return value;
 }
 
@@ -536,7 +550,10 @@ static inline u32 arch_ldrex(volatile u32 *addr)
 static inline u32 arch_strex(u32 value, volatile u32 *addr)
 {
     u32 result;
-    __asm__ volatile("strex %0, %2, [%1]" : "=r"(result) : "r"(addr), "r"(value) : "memory");
+    __asm__ volatile("strex %0, %2, [%1]"
+                     : "=&r"(result)      /* early-clobber:保证 %0 与 %1/%2 不同 */
+                     : "r"(addr), "r"(value)
+                     : "memory");
     return result;
 }
 
