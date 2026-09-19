@@ -38,7 +38,7 @@
  * 这不是权宜之计,而是这条边界的**正确形状**:交界处本来就该是
  * "两边各自的一份声明",而不是"两边的实现细节都摊开"。
  * 手写的那几个声明由 `tests/test_arm32_upstream_api.py` 对着
- * `arch/arm32/include/arch/*.h` 做机械比对 —— 漂移会被抓住。
+ * `arch/arm32/include/arch/` 下的头文件做机械比对 —— 漂移会被抓住。
  *
  * ⚠ 也**只**做"转发/安装",不写业务逻辑:逻辑在 `arch/sched.h`、
  *   `arch/cpu.h`、`arch/timer.h` 里(它们已被板上自检覆盖)。
@@ -442,4 +442,140 @@ int write_serial_fmt(const char *fmt, ...)
 
     /* 与源 OS 一致:恒返回 0 */
     return 0;
+}
+
+/* ====================================================================
+ * ★★ VFS 起搏 + 验收转发(M4A-1.2b 的验收判据)★★
+ * ====================================================================
+ *
+ * ## 为什么需要这一组,而不是让移植侧 C 直接调 VFS
+ *
+ * 因为 `include/fs/vfs/vfs.h` **整个文件没有 `extern "C"`** ——
+ * VFS 的每一个公开函数都是 **C++ 链接**的:
+ *
+ *     $ arm-none-eabi-nm out/kernel-arm.elf | grep -E 'vfs_init|vfs_mount'
+ *     00115c94 T _Z8vfs_initv
+ *     00113d64 T _Z9vfs_mountPKcP8vfs_node
+ *
+ * ⇒ 移植侧 C 给不出这些符号名(同一个坑 M4A-1.2b 收尾时在
+ *   `sprintf` 上刚踩过,见坑表 55)。所以"调用 VFS"这件事必须发生在
+ *   C++ 这一侧。
+ *
+ * ## 为什么这一组里**没有业务逻辑**
+ *
+ * 按本文件的规矩(见文件头):落地层只做**转发与安装**。
+ * 于是这里的分工是:
+ *   - **安装**:`arm_vfs_bringup()` —— 建内核进程上下文 → `vfs_init()`
+ *     → `tmpfs_setup()` → 把根目录填进 cwd。顺序照源 OS
+ *     `kernel/main.cpp:457` 与 `:558`(vfs_init 先、tmpfs 后)。
+ *   - **转发**:下面每一个 `arm_vfs_*` 都是"展开一次上游调用、把它的
+ *     返回值原样交回去",**不做判断**。
+ *   - **判据**(什么算通过、阈值多少)全在移植侧 C:
+ *     `arch/arm32/src/vfs_check.c` —— 那里才是"验收程序"。
+ *
+ * ⚠ `tmpfs_setup()` 在上游没有进任何头文件,是 `kernel/main.cpp:424`
+ *   自己 `extern int tmpfs_setup();` 声明的(与 `mount_root()` 一样)。
+ *   这里照做 —— **不改上游**,连声明方式都跟着上游。
+ */
+
+/* 上游没有导出声明,照 `kernel/main.cpp:424` 的做法自己声明 */
+int tmpfs_setup(void);
+
+extern "C" int arm_vfs_bringup(void)
+{
+    /*
+     * ① 内核进程上下文。**必须在堆之后**(`queue_init()` 要 malloc)。
+     *    上游对应物:`create_process_group()`(`kernel/task/pcb.cpp`),
+     *    ARM 侧只是"一个静态实例",理由见上面进程层那一节。
+     */
+    arm_kernel_process_init();
+
+    /* ② `vfs_init()` —— 上游 `kernel/main.cpp:457`。返回 bool(false = 失败) */
+    if (!vfs_init()) {
+        return -1;
+    }
+
+    /* ③ `tmpfs_setup()` —— 上游 `kernel/main.cpp:558`。
+     *    内部 = `vfs_regist("tmpfs", …)` + `vfs_mkdir("/tmp")` +
+     *    `vfs_open("/tmp")` + `vfs_mount(TMPFS_REGISTER_ID, tmp)`,
+     *    成功返回 0、失败返回 -EIO/-ENOENT */
+    if (tmpfs_setup() != 0) {
+        return -2;
+    }
+
+    /* ④ 根目录填进 cwd —— 上游 `vfs.cpp:1230` 用
+     *    `get_current_task()->cwd` 拼绝对路径,根目录下它必须是合法节点 */
+    arm_kernel_process_set_cwd(get_rootdir());
+
+    return 0;
+}
+
+extern "C" int arm_vfs_create(const char *path)
+{
+    /* `errno_t vfs_mkfile(const char *)`(`vfs.h:246`),0 = 成功 */
+    return (int)vfs_mkfile(path);
+}
+
+extern "C" int arm_vfs_write(const char *path, const void *data, unsigned int len)
+{
+    vfs_node_t node = vfs_open(path);
+
+    if (node == NULL) {
+        return -1;
+    }
+    /* `size_t vfs_write(node, void *, offset, size)`(`vfs.h:359`)
+       —— 上游形参不是 const,这里显式去掉 const,不改上游签名 */
+    return (int)vfs_write(node, (void *)data, 0u, (size_t)len);
+}
+
+extern "C" int arm_vfs_read(const char *path, void *buf, unsigned int len)
+{
+    vfs_node_t node = vfs_open(path);
+
+    if (node == NULL) {
+        return -1;
+    }
+    return (int)vfs_read(node, buf, 0u, (size_t)len);
+}
+
+/*
+ * 目录项计数。**"列目录"在本 VFS 里就是这个意思** ——
+ * 上游没有 `readdir`:目录的子项就是 `vfs_node_t::child`(`vfs.h:200`,
+ * 类型 `list_t`),由路径解析/创建路径上的 `vfs_child_append()` 填。
+ * ⇒ 数 `list_length(dir->child)`。
+ */
+extern "C" int arm_vfs_child_count(const char *path)
+{
+    vfs_node_t dir = vfs_open(path);
+
+    if (dir == NULL || dir->type != file_dir) {
+        return -1;
+    }
+    return (int)list_length(dir->child);
+}
+
+/*
+ * 节点所属**文件系统实例**的 id(`vfs_node_t::fsid`)。
+ *
+ * 为什么它是"挂载真的发生了"的判据:tmpfs 的 `tmpfs_mount()` 里
+ * 写着 `node->fsid = tmpfs_id;`(`tmpfs.cpp:111`),而 `tmpfs_id` 来自
+ * `vfs_regist()` 的返回值(`fs_nextid++`)。挂载没发生的话,`/tmp`
+ * 仍是根文件系统的一个普通目录 ⇒ 它的 fsid 与 `/` **相同**。
+ */
+extern "C" int arm_vfs_fsid(const char *path)
+{
+    vfs_node_t node = vfs_open(path);
+
+    if (node == NULL) {
+        return -1;
+    }
+    return (int)node->fsid;
+}
+
+/* 内核进程的 cwd 是不是根目录(判 `arm_kernel_process_set_cwd()` 生效)*/
+extern "C" int arm_vfs_cwd_is_root(void)
+{
+    tcb_t task = get_current_task();
+
+    return (task != NULL && task->cwd != NULL && task->cwd == get_rootdir()) ? 1 : 0;
 }

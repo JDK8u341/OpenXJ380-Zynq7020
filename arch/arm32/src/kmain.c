@@ -43,6 +43,7 @@
 #include <arch/vmap.h>
 #include <arch/types.h>
 #include <arch/uart_ps.h>
+#include <arch/vfs_check.h>
 
 /* libc 子集。M4A-1.1a 起 malloc/free 也在里面(见 arch/kmalloc.h) */
 #include <krlibc.h>
@@ -1428,6 +1429,13 @@ static u32 g_heap_bind_ab;
 static u32 g_device_roundtrip;
 static u32 g_device_devfs_ab;
 
+/*
+ * VFS 验收的实测读数(M4A-1.2b)。**整张表**留在这里而不是拆成散变量:
+ * 报告项要读其中的六七个数,而它们属于**同一次**探针运行 ——
+ * 拆开以后"这一项读的是哪一次的结果"就说不清了。
+ */
+static vfs_check_t g_vfs;
+
 /* SMP 压力测试的结果,供自检报告使用 */
 static smp_stress_result_t g_smp_stress;
 
@@ -2543,6 +2551,27 @@ void kmain(void)
             console_printf(" Device A/B  : devfs-off -> by_id=%u by_name_missing=%u\n",
                            (u32)by_id_ok, (u32)by_name_missing);
         }
+    }
+
+    /* ---- 9.45b ★ VFS 起搏 + tmpfs 验收(M4A-1.2b 的验收项)★ ---- */
+    /*
+     * 位置:在堆(9.4x)与设备管理器之后。
+     *
+     * 为什么在这里:`arm_vfs_bringup()` 要 malloc(`queue_init()` 建 fd 表、
+     * `vfs_init()` 建根目录节点),所以必须等堆绑好 —— 而它与设备管理器
+     * 没有依赖关系,只是顺手放在同一段里,便于"上游代码的起搏点"
+     * 集中在一处。
+     *
+     * 为什么**判据在这里、调用在落地层**、以及每一条判据各证明什么,
+     * 见 <arch/vfs_check.h> 的文件头(那里写清了三个证据层次)。
+     *
+     * ⚠ 这一步之后的每一次路径操作都依赖它:cwd 指向根目录、
+     *   `/tmp` 上是 tmpfs。所以它必须发生在**任何** VFS 使用者之前。
+     */
+    {
+        const vfs_check_t *vfs = vfs_check_run();
+
+        g_vfs = *vfs;
     }
 
     /* ---- 9.46 内核栈池 + guard page(M4-5) ---- */
@@ -3812,6 +3841,42 @@ void kmain(void)
      */
     selftest_report("device_roundtrip", g_device_roundtrip, 1u, SELFTEST_EQ);
     selftest_report("device_devfs_ab", g_device_devfs_ab, 1u, SELFTEST_EQ);
+
+    /*
+     * ---- VFS 起搏 + tmpfs 验收(M4A-1.2b 的验收项)----
+     *
+     * 这是"**建 / 读 / 写 / 列目录**"那一组(计划 §4.6 M4A-1.2b 的判据)。
+     * 每一项各证明什么、为什么要按这三个层次组织,见 <arch/vfs_check.h>;
+     * 这里只强调两件容易看漏的:
+     *
+     *   - `vfs_tmpfs_mounted` 比的是**两个 fsid 不相等**。它才是"挂载真的
+     *     发生了"的证据:tmpfs 的 `tmpfs_mount()` 里写着
+     *     `node->fsid = tmpfs_id`(`tmpfs.cpp:111`),没挂上就还是根 fs
+     *     的普通目录。
+     *   - `vfs_negative_ok` 是**反面控制**,不是重复项:上游给未挂载节点
+     *     的回调是 `empty_func`(返回 void 却被当 `size_t` 用)⇒
+     *     "调用成功"本身不携带信息。只有"根 fs 上同样的往返不成立"
+     *     才能证明读写真的走了 tmpfs 的回调。
+     */
+    selftest_report("vfs_bringup", (u32)((g_vfs.bringup == 0) ? 1u : 0u), 1u, SELFTEST_EQ);
+    selftest_report("vfs_tmpfs_mounted",
+                    (u32)((g_vfs.fsid_tmp >= 0 && g_vfs.fsid_root >= 0 &&
+                           g_vfs.fsid_tmp != g_vfs.fsid_root) ? 1u : 0u),
+                    1u, SELFTEST_EQ);
+    selftest_report("vfs_create", (u32)((g_vfs.create_a == 0 && g_vfs.create_b == 0) ? 1u : 0u), 1u,
+                    SELFTEST_EQ);
+    /* 写入/读回的**字节数必须正好等于载荷长度** —— 少读多读都要露 */
+    selftest_report("vfs_write", (u32)g_vfs.write_a, (u32)VFS_CHECK_PAYLOAD_LEN, SELFTEST_EQ);
+    selftest_report("vfs_read", (u32)g_vfs.read_a, (u32)VFS_CHECK_PAYLOAD_LEN, SELFTEST_EQ);
+    selftest_report("vfs_roundtrip", (u32)g_vfs.roundtrip, 1u, SELFTEST_EQ);
+    /* 列目录:比"之后 >= 2"更强 —— 要求**相对基线**多出两个子项 */
+    selftest_report("vfs_list_delta",
+                    (u32)((g_vfs.list_before >= 0 && g_vfs.list_after >= g_vfs.list_before + 2) ? 1u : 0u),
+                    1u, SELFTEST_EQ);
+    selftest_report("vfs_list_before", (u32)g_vfs.list_before, 0u, SELFTEST_EQ);
+    selftest_report("vfs_cwd_root", (u32)g_vfs.cwd_root, 1u, SELFTEST_EQ);
+    selftest_report("vfs_negative_ok", (u32)g_vfs.negative_ok, 1u, SELFTEST_EQ);
+
     /* 至少 32MB 可用 —— 判据写小了等于没判 */
     selftest_report("heap_size_ok", (g_heap.total_bytes >= (32u * 1024u * 1024u)) ? 1u : 0u, 1u, SELFTEST_EQ);
 
