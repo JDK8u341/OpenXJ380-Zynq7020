@@ -5,6 +5,17 @@
 #include <fs/vfs/vfs.h>
 #include <krlibc.h>
 #include <net/socket.h>
+/*
+ * proto.hpp 是 x86 的"万能头",而 `snprintf` 的**声明就在它里面**
+ * (不在 krlibc.h / stdio.h 里 —— 用预处理定位过)。
+ *
+ * 以前这一行是省掉的:fs/vfs/list.h 与 fs/vfs/vfs.h 都 #include "proto.hpp",
+ * 于是本文件**传递地**拿到了它。2026-09-18 把那两处过度包含改成自足的包含之后,
+ * 本文件就必须自己开口要 —— 这正是"用了什么就包含什么"。
+ *
+ * (本文件属网络栈,ARM 侧明确推迟到 M5+;这里保持 x86 侧原样最小改动。)
+ */
+#include <proto.hpp>
 
 enum {
     DNSFS_KIND_ROOT = 0,

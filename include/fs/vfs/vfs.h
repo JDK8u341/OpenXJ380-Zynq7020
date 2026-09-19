@@ -78,7 +78,24 @@ char *normalize_path(const char *path);
 #define O_TMPFILE   020200000
 #define O_NDELAY    O_NONBLOCK
 
-#include "proto.hpp"
+/*
+ * 平台中立重构(2026-09-18):这一行原先是 `#include "proto.hpp"`。
+ *
+ * 本文件真正用到的基础类型只有 size_t / uint32_t / uint64_t / bool / errno_t
+ * —— 逐个查过:结构体里出现的其它类型中,`llist_header` 来自下面那个
+ * llist.h,而 `vfs_node` / `vfs_filesystem` / `vfs_callback` / fd 都是本文件
+ * 自己定义的。而 `proto.hpp` 会把**整个 x86 内核主干**拖进来
+ * (`<ps2/keyboard.h>`、`<efi/fbc.h>`、mm 下的头文件、`<smp/smp.h>`……)——
+ * 让一个纯粹的文件系统接口头依赖键盘和显存,本来就没有道理。
+ *
+ * 为什么现在必须改:移植侧(arch/arm32,ARMv7-A)要共用这份 VFS 接口,
+ * 而"包含它就等于包含 x86 主干"是那条路上第一个、也是最没道理的拦路石。
+ *
+ * 按计划 §7.2,上游文件只在**平台中立重构**时改动、每处都有理由 ——
+ * 这一处符合。改动前后对全部 30 个包含者做了 x86 单文件语法检查
+ * (`tmp-test/check_x86_syntax.py`),逐文件 rc=0 不变。
+ */
+#include "krlibc.h" /* errno_t / bool / NULL,并带上 <stdint.h> 的定宽类型 */
 #include "list.h"
 #include "llist.h"
 

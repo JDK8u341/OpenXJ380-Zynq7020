@@ -4,6 +4,12 @@
 #include <fs/vfs/vfs.h>
 #include <krlibc.h>
 #include <net/socket.h>
+/*
+ * 同 dnsfs.cpp:本文件用 `snprintf`,而它的声明在 proto.hpp 里。
+ * 以前靠 fs/vfs 那两个头**传递地**拿到,2026-09-18 把那两处改成自足的
+ * 包含之后,这里必须自己开口要。本文件属网络栈,ARM 侧推迟到 M5+。
+ */
+#include <proto.hpp>
 
 enum {
     NMFS_KIND_ROOT = 0,

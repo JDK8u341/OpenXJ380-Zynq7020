@@ -1,6 +1,21 @@
 #pragma once
 #include "mm/alloc/alloc.h"
-#include "proto.hpp"
+/*
+ * 平台中立重构(2026-09-18):这一行原先是 `#include "proto.hpp"`,已删除。
+ *
+ * 它拖进整个 x86 内核主干(`include/proto.hpp:175` → `mm/memory.h:13`
+ * → `efi/efi.h`,后者用 `EFIAPI`/`ms_abi` —— 那是 MSVC/x86 的调用约定属性,
+ * ARM 的编译器直接报 "'ms_abi' attribute directive ignored [-Werror=attributes]")。
+ *
+ * 本文件真正需要的东西上面那条 `mm/alloc/alloc.h` 已经带齐:
+ * 它 include `<krlibc.h>`,而那份又 include `<stdint.h>`
+ * (size_t / int64_t / uint64_t / bool / NULL 全在里面)。
+ * 下面第 4 行那个 "stdint.h" 本来也在,是双保险。
+ *
+ * ⚠ 一个**既有问题**(与本次改动无关,顺手记下):文件末尾的 `list_popi` /
+ *   `list_popu` 两个宏用了 `usize` / `isize`,而全仓库**没有这两个类型的定义**
+ *   —— 它们一被展开就编不过。今天没人用,所以一直没暴露。
+ */
 #include "stdint.h"
 
 #pragma GCC system_header
