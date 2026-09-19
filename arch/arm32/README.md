@@ -3267,6 +3267,30 @@ term->c_lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK;
 之后随机失败。开从设备前还按真实用户态的做法 `TIOCSPTLCK(0)` 解锁一次
 （`pts_open` 会拒锁着的,`pty.cpp:400`）。
 
+#### procfs：**决定不搬**,理由写在构建图里（M4A-1.5 最后一项）
+
+`driver/fs/vfs/procfs.cpp` 编不过,而这次**不是"差一点"**:
+
+```
+driver/fs/vfs/procfs.cpp:595:5: sorry, unimplemented:
+    non-trivial designated initializers not supported
+```
+
+那是 `/proc/cpuinfo` 的 **CPUID 位名表**（`[0]="fpu", [1]="vme", … [28]="ht"`）——
+稀疏数组指定初始化器,GCC 的 **C++** 前端直接拒绝（上游用 clang,把它当扩展收下了）。
+★ 但**就算语法能过也不该搬**:那张表是 x86 的 EDX/ECX 位名(`tsc`/`sse`/`avx`/`rdrand`),
+ARM 上这些位没有意义 —— ARM 的 `/proc/cpuinfo` 必须由 **MIDR/MPIDR/CTR/CCSIDR** 拼。
+⇒ 这是"**要另写一份 ARM 的**",不是"修一行就能编"。
+
+⇒ 于是把它记成一条**显式排除**（`tools/gen_ninja.py` 的 `ARM32_UPSTREAM_EXCLUDED`,
+每条都带"为什么"与"**什么能解开它**"）,而不是让它消失在沉默里。
+为什么值得为它建一张表:**"决定不编"与"忘了编"在构建图里长得一模一样**,
+而后续动作完全相反(前者写理由等条件,后者立刻补上)。
+`tests/test_arm32_upstream_excluded.py` 钉住三条不变量:每条有实质理由、
+理由必须可核(行号/符号/阶段号)、**同一路径不能同时在"已进图"与"已排除"两张表里**。
+
+解开条件:有东西真的读 `/proc` —— 现实里那是 M7 的用户态;今天 ARM 上没有读者。
+
 ---
 
 ### 12. 其它待办（AM3 及以后）
