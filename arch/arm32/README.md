@@ -3293,6 +3293,37 @@ ARM 上这些位没有意义 —— ARM 的 `/proc/cpuinfo` 必须由 **MIDR/MPI
 
 ---
 
+### M4A-3/B5 侦察：块层要**另写一份端口原生的**（2026-09-19）
+
+#### 为什么不能直接加进图
+
+上游 `driver/device.cpp` 与移植侧 `arch/arm32/src/device.c` **同名同义**
+（`device_ctl` / `get_device` / `regist_device` / `disk_size` …）—— 直接加进图
+就是重复定义，而内核链接带 `-z muldefs` ⇒ ld 会**静默挑一个**
+（正是坑表 59 那个坑）。⇒ 用**带外测量**：单独用 ARM 的 C++ 规则编成目标文件，
+再把它的未定义符号与当前 ELF 的已定义符号做差集。
+
+#### 结论
+
+- **能干净编过**：`-c` rc=0，11.5KB 目标文件；
+- **真缺口 11 个符号**，其中 **8 个是 x86 页层**：
+  `page_map_range` / `unmap_page_range` / `translate_address` / `page_virt_to_phys` /
+  `page_table_get_flags` / `free_frames` / `driver_phys_to_virt` / `driver_virt_to_phys`；
+  另加进程层 `lazy_tryalloc`（属 M7）、分区层 `partition_device_added`（可搬）、
+  `mutex_trylock`（落地层一行转发即可）。
+- ★ 那 8 个**不是欠账而是架构差异**：上游 `blk_device_read()` 里有一整套
+  **DMA bounce 缓冲 + direct-span 判定**（`blk_acquire_bounce` / `blk_direct_span_bytes`），
+  它存在的理由是"用户缓冲区可能不在 DMA 安全窗口里" —— 只有 x86 的 HHDM 布局下才成立。
+
+#### 决策
+
+**另写一份端口原生块层**，而不是拿假实现把那 11 个符号顶上去：
+接口与 LBA/偏移算术照上游（`blk_device_read/write` 的签名不变），
+但 ARM 侧目的地址**恒为内核地址** ⇒ 不需要 bounce，头 / 整扇区 / 尾三段即可。
+**判据（done 的定义）**：宿主单测钉住扇区算术，含**非对齐偏移**与短读。
+
+---
+
 ### 12. 其它待办（AM3 及以后）
 
 - 缓存维护与 Cortex-A9/PL310 勘误 —— **L1 与 L2 均已使能**；
