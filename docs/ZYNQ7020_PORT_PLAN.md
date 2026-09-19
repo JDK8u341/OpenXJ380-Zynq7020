@@ -164,6 +164,14 @@ python tools/gen_ninja.py --out build-arm.ninja --arch arm32
 ninja -f build-arm.ninja arm32               # 产物 out/kernel-arm.elf
 
 # 宿主单测(基线:9 failed / 74 passed;那 9 项预先存在,与本移植无关)
+
+# ★ 需要**人动手**的时候弹窗提醒(用户 2026-09-19 的要求)
+#   为什么要有它:代理只能看串口与文件,**没有办法确认人是否看到了某句话** ——
+#   把"请插 SD 卡"写在报告末尾很容易被下一条消息淹没。
+#   ⚠ 它会一直等人点确定 ⇒ **放到后台跑**,不要在前台等。
+powershell -ExecutionPolicy Bypass -File tmp-test/notify_user.ps1 `
+           -Title "标题" -Message "要做什么、做完怎么告诉我"
+
 python -m pytest tests/ -q
 
 # 上板:全部自检 + 退出码即判定
