@@ -44,16 +44,33 @@ LANDING = ROOT / "arch/arm32/src/upstream_api.cpp"
 UPSTREAM_VFS_H = ROOT / "include/fs/vfs/vfs.h"
 UPSTREAM_TMPFS = ROOT / "driver/fs/vfs/tmpfs.cpp"
 
-# 移植侧 C 要用的转发入口。少一个 = 链接期才炸,所以在这里钉住。
-EXPECTED_WRAPPERS = (
-    "arm_vfs_bringup",
-    "arm_vfs_create",
-    "arm_vfs_write",
-    "arm_vfs_read",
-    "arm_vfs_child_count",
-    "arm_vfs_fsid",
-    "arm_vfs_cwd_is_root",
-)
+# 移植侧 C 要用的转发入口,按"**在哪个文件里声明**"分组。
+# 每一条都不能少:少了就是链接期才炸,所以在这里钉住。
+WRAPPER_DECLARATIONS = {
+    "arch/arm32/src/vfs_check.c": (
+        "arm_vfs_bringup",
+        "arm_vfs_create",
+        "arm_vfs_write",
+        "arm_vfs_read",
+        "arm_vfs_child_count",
+        "arm_vfs_fsid",
+        "arm_vfs_cwd_is_root",
+    ),
+    # M4A-1.5:管道
+    "arch/arm32/src/pipe_check.c": (
+        "arm_pipefs_setup",
+        "arm_pipe_create",
+        "arm_pipe_write",
+        "arm_pipe_read",
+        "arm_pipe_fill",
+    ),
+    # M4A-1.5:devfs(上游那份)+ 设备自检
+    "arch/arm32/src/kmain.c": (
+        "arm_devfs_setup",
+        "arm_devfs_node_exists",
+    ),
+}
+EXPECTED_WRAPPERS = tuple(name for names in WRAPPER_DECLARATIONS.values() for name in names)
 
 
 def _strip_comments(text: str) -> str:
@@ -81,16 +98,22 @@ def _param_types(params: str) -> tuple[str, ...]:
 
 
 def _exact_decl(text: str, name: str) -> tuple[str, tuple[str, ...]] | None:
-    """精确匹配 `[extern "C"] <ret> name(params);` 形式的声明。"""
+    """精确匹配 `[extern] [extern "C"] <ret> name(params);` 形式的声明。
+
+    ⚠ 返回类型里要**去掉前导的 `extern`**:移植侧 C 有时写成
+    `extern int arm_pipe_write(...)`(习惯写法),而落地层那边是 `int …`。
+    两者是同一个声明,比较时必须先归一(第一版没做,于是报了假 FAIL)。
+    """
     pattern = re.compile(
-        r'(?:extern\s*"C"\s*)?([A-Za-z_][A-Za-z_0-9 \t\*]*?)\b'
+        r'(?:extern\s*"C"\s*)?((?:extern\s+)?[A-Za-z_][A-Za-z_0-9 \t\*]*?)\b'
         + re.escape(name)
         + r"[ \t]*\(([^;{)]*)\)[ \t]*;",
     )
     match = pattern.search(text)
     if match is None:
         return None
-    return " ".join(match.group(1).split()), _param_types(match.group(2))
+    return_type = re.sub(r"^extern\s+", "", " ".join(match.group(1).split()))
+    return return_type, _param_types(match.group(2))
 
 
 def _definitions(text: str, name: str) -> list[tuple[int, str, tuple[str, ...], bool]]:
@@ -122,31 +145,38 @@ class Arm32VfsBridgeContract(unittest.TestCase):
 
     # ---------------------------------------------------------------- 1
     def test_port_c_declares_every_wrapper(self) -> None:
-        for name in EXPECTED_WRAPPERS:
-            with self.subTest(symbol=name):
-                self.assertIsNotNone(_exact_decl(self.check_c, name),
-                                     f"vfs_check.c 里缺少 {name} 的 extern 声明")
+        for relative, names in WRAPPER_DECLARATIONS.items():
+            text = _strip_comments((ROOT / relative).read_text(encoding="utf-8"))
+            for name in names:
+                with self.subTest(symbol=name, declared_in=relative):
+                    self.assertIsNotNone(_exact_decl(text, name),
+                                         f"{relative} 里缺少 {name} 的 extern 声明")
 
     def test_landing_layer_defines_every_wrapper_with_c_linkage(self) -> None:
         for name in EXPECTED_WRAPPERS:
             with self.subTest(symbol=name):
-                definitions = [d for d in _definitions(self.landing, name) if d[1] == "int"]
-                self.assertTrue(definitions, f"落地层里找不到 {name} 的 int 定义")
+                # ⚠ 不能按返回类型过滤:`arm_devfs_setup` 就是 `void`
+                #   (它转发上游 `devfs_setup()`,本身就是 void)。
+                definitions = _definitions(self.landing, name)
+                self.assertTrue(definitions, f"落地层里找不到 {name} 的定义")
                 for _, _, _, has_extern_c in definitions:
                     self.assertTrue(has_extern_c,
                                     f"{name} 的定义没写 `extern \"C\"` —— "
                                     f"C 侧给出的是未修饰符号,链接期才会炸")
 
     def test_wrapper_signatures_agree_across_the_boundary(self) -> None:
-        """两边形参类型必须一致 —— 差一个 `const` 就是"能不能编过"的区别。"""
-        for name in EXPECTED_WRAPPERS:
-            with self.subTest(symbol=name):
-                declared = _exact_decl(self.check_c, name)
-                defined = [d for d in _definitions(self.landing, name) if d[1] == "int"]
-                self.assertIsNotNone(declared)
-                self.assertTrue(defined)
-                self.assertEqual(declared[1], defined[0][2],
-                                 f"{name} 在 vfs_check.c 与落地层的形参不一致")
+        """两边的**返回类型与形参**都必须一致 —— 差一个 `const` 就是"能不能编过"的区别。"""
+        for relative, names in WRAPPER_DECLARATIONS.items():
+            declared_text = _strip_comments((ROOT / relative).read_text(encoding="utf-8"))
+            for name in names:
+                with self.subTest(symbol=name, declared_in=relative):
+                    declared = _exact_decl(declared_text, name)
+                    defined = _definitions(self.landing, name)
+                    self.assertIsNotNone(declared, f"{relative} 里没有 {name} 的声明")
+                    self.assertTrue(defined, f"落地层里没有 {name} 的定义")
+                    _, ret, params, _ = defined[0]
+                    self.assertEqual((declared[0], declared[1]), (ret, params),
+                                     f"{name} 在 {relative} 与落地层的签名不一致")
 
     # ---------------------------------------------------------------- 2
     def test_upstream_calls_are_declared_upstream(self) -> None:
@@ -233,6 +263,57 @@ class Arm32VfsBridgeContract(unittest.TestCase):
         self.assertIn("vfs_check_t", header)
         self.assertIn("vfs_check_run", header)
         self.assertIn("VFS_CHECK_PAYLOAD_LEN", header)
+
+    # ---------------------------------------------------------------- 6
+    def test_pipe_bridges_reference_upstream_globals(self) -> None:
+        """
+        管道那一组要碰上游**两个全局变量**(`pipefs_root` / `pipefs_id`)。
+
+        ⚠ 顺便记一条**容易误判的事实**:GCC **不修饰全局变量名**(只修饰函数与
+        有作用域的实体)⇒ C++ 里 `extern vfs_node_t pipefs_root;` 与上游 C++ 定义
+        里那个变量是**同一个符号**(实测两边都是未修饰的)。
+        这也是上游 `extern device_t device_ctl[26];` 能直接接到移植侧 C 定义上的
+        原因。这条断言钉住"管道那一组确实靠这条路",免得有人以为还需要
+        `extern "C"` 而去改上游。
+        """
+        landing = self.landing
+        for symbol in ("pipefs_root", "pipefs_id"):
+            with self.subTest(symbol=symbol):
+                self.assertRegex(landing, r"extern\s+\w[\w \*]*\b" + re.escape(symbol) + r"\s*;")
+
+        pipefs_raw = (ROOT / "driver/fs/vfs/pipefs.cpp").read_text(encoding="utf-8")
+        # ⚠ `assertRegex` 的第三个参数是 **msg**,不是 flags —— 想带 re.M 必须
+        #   传一个**编译好的**模式(第一版写成 assertRegex(text, pat, re.M),
+        #   于是 re.M 被当成消息字符串,锚点没生效 ⇒ 假 FAIL)。
+        self.assertRegex(pipefs_raw, re.compile(r"^vfs_node_t pipefs_root = NULL;", re.M))
+        self.assertRegex(pipefs_raw, re.compile(r"^int\s+pipefs_id\s+= 0;", re.M))
+
+    def test_pipe_check_never_reads_an_empty_pipe(self) -> None:
+        """
+        ★ 安全约束的机械判据 ★
+
+        `pipefs_read()` 在**没有数据**时会循环 `pipe_wait_on()` 等写者
+        (只有 `write_fds == 0` 才立即返回 0)⇒ 在启动自检里读空管道就是
+        **当场挂住**。所以 `pipe_check_run()` 里每一次读之前必须有一次写。
+
+        这里做的是**顺序检查**:按出现次序,`arm_pipe_write` 的调用必须
+        先于同一步里的 `arm_pipe_read`。它不是形式主义 —— 这条约束失效的
+        症状是"板子卡死",而卡死时没有任何日志能告诉你原因。
+        """
+        source = _strip_comments((ROOT / "arch/arm32/src/pipe_check.c").read_text(encoding="utf-8"))
+        events = [(m.start(), "write" if "arm_pipe_write" in m.group(0) else "read")
+                  for m in re.finditer(r"arm_pipe_(?:write|read)\s*\(", source)]
+        self.assertTrue(events, "pipe_check.c 里没有任何读写调用?")
+
+        pending_write = False
+        for _, kind in events:
+            if kind == "write":
+                pending_write = True
+            else:
+                self.assertTrue(pending_write,
+                                "pipe_check.c 里出现了一次**先于任何写**的读 —— "
+                                "读空管道会让启动自检当场挂住")
+                pending_write = False
 
 
 if __name__ == "__main__":

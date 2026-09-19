@@ -52,6 +52,7 @@
 #include <lock_queue.h>
 #include <mm/page.h>
 #include <mutex.h> /* mutex_t:落地层要给出上游那三个 C++ 链接的互斥函数(M4A-1.4) */
+#include <pipe.h>  /* pipe_info_t / pipe_specific_t / PIPE_BUFF(M4A-1.5 的管道)*/
 #include <rtc.h>   /* tm / mktime / realtime_ns(纯算术部分照搬上游,见下) */
 #include <stdarg.h> /* va_list:下面那两条格式化转发要展开可变参数 */
 #include <task/pcb.h>
@@ -1135,4 +1136,169 @@ extern "C" int arm_devfs_node_exists(const char *path)
     }
     vfs_close(node);
     return 1;
+}
+
+/* ====================================================================
+ * ★★ 管道(pipefs)起搏 + 验收转发(M4A-1.5)★★
+ * ====================================================================
+ *
+ * ## 为什么"建一个管道"要写在这里、而且要照抄一段顺序
+ *
+ * 上游**没有** `pipe_create()` 这样的 API:`pipefs` 只提供
+ * `mount/open/read/write/close/…` 这些**回调**,而"把管道造出来"这件事
+ * 写在**系统调用层**里(`kernel/syscall/sys.cpp:3703-3762` 的 `sys_pipe2`)。
+ * 那段代码干的是:
+ *
+ *     两个节点(`vfs_node_alloc(pipefs_root, name)`,type=file_pipe,
+ *              fsid=pipefs_id,同 inode、dev=PIEFS_REGISTER_ID)
+ *     + 一个 `pipe_info_t`(buf=calloc(PIPE_BUFF)、read_fds=write_fds=1)
+ *     + 两个 `pipe_specific_t`(write=false / true)
+ *     + 把 `node->handle` 与 `info->read_spec/write_spec` 接起来
+ *
+ * ⇒ 落地层这边**逐句照搬前半段**(到 `node->handle` 接线为止),
+ *   后半段(sys.cpp:3763-3786)是**每进程 fd 表**那一层,属 M7,验收不需要它。
+ *
+ * ⚠ 为什么不把这一段放进移植侧 C:它通篇是 `vfs_node_t` / `pipe_info_t`
+ *   这些**上游类型**(合流纪律 #4:移植侧 C 看不到上游头)。
+ *
+ * ## 节点名
+ *
+ * 用 `xpipeN` 而不是上游 syscall 层的 `pipeN` —— 前缀分开是为了让
+ * "谁建的"一眼可辨(ARM 侧今天没有 syscall 层,两边不会同时存在,
+ * 但名字混在一起会让以后的排查多一次猜测)。
+ *
+ * ⚠ 名字与计数器都是本文件私有的:不去动上游的 `pipefd_id`(`sys.cpp` 在用它)。
+ */
+
+extern vfs_node_t pipefs_root; /* driver/fs/vfs/pipefs.cpp:8(非 static)*/
+extern int        pipefs_id;   /* driver/fs/vfs/pipefs.cpp:9(非 static)*/
+
+static vfs_node_t   g_pipe_read_node;
+static vfs_node_t   g_pipe_write_node;
+static unsigned int g_pipe_name_counter;
+static uint64_t     g_pipe_inode_next = 1u;
+
+extern "C" int arm_pipefs_setup(void)
+{
+    /* ← `pipefs.h`/`pipe.h:35` 的 `void pipefs_setup();`(C++ 链接 `_Z13pipefs_setupv`)。
+       内部 = `vfs_regist("pipefs", …)` + `vfs_mkdir("/pipe")` + `vfs_mount(/pipe)`。 */
+    pipefs_setup();
+    return (pipefs_root != NULL) ? 0 : -1;
+}
+
+extern "C" int arm_pipe_create(void)
+{
+    char         name[16];
+    vfs_node_t   node_read;
+    vfs_node_t   node_write;
+    uint64_t     inode;
+    pipe_info_t *info;
+    pipe_specific_t *read_spec;
+    pipe_specific_t *write_spec;
+
+    if (pipefs_root == NULL) {
+        return -1; /* 没挂载(调用方应先 arm_pipefs_setup)*/
+    }
+
+    sprintf(name, "xpipe%u", g_pipe_name_counter++);
+    node_read = vfs_node_alloc(pipefs_root, name);
+    if (node_read == NULL) {
+        return -2;
+    }
+    node_read->type = file_pipe;
+    node_read->fsid = pipefs_id;
+
+    sprintf(name, "xpipe%u", g_pipe_name_counter++);
+    node_write = vfs_node_alloc(pipefs_root, name);
+    if (node_write == NULL) {
+        return -3;
+    }
+    node_write->type = file_pipe;
+    node_write->fsid = pipefs_id;
+
+    /* 同一个管道 ⇒ 同一个 inode 号(上游 sys_pipe2 也是这么标的)*/
+    inode              = g_pipe_inode_next++;
+    node_read->inode   = inode;
+    node_write->inode  = inode;
+    node_read->dev     = PIEFS_REGISTER_ID;
+    node_write->dev    = PIEFS_REGISTER_ID;
+
+    info = (pipe_info_t *)malloc(sizeof(pipe_info_t));
+    if (info == NULL) {
+        return -4;
+    }
+    memset(info, 0, sizeof(pipe_info_t));
+    info->buf = (char *)calloc(1u, PIPE_BUFF);
+    if (info->buf == NULL) {
+        free(info);
+        return -5;
+    }
+    info->read_fds  = 1;
+    info->write_fds = 1;
+    info->ptr       = 0;
+
+    /*
+     * ⚠ 上游 `sys_pipe2` 这里还有一句 `info->lock = SPIN_INIT;` —— 我们**省了**,
+     *   理由:上面刚 `memset(info, 0, …)`,而移植侧的 `SPIN_INIT` 展开就是
+     *   `{0, 0}`(`arch/cpu.h:506`),两者等价。(写上去在 C++ 里也合法,
+     *   只是"清零之后再赋一遍零"会让读者以为那个字段有别的初值。)
+     */
+
+    read_spec  = (pipe_specific_t *)malloc(sizeof(pipe_specific_t));
+    write_spec = (pipe_specific_t *)malloc(sizeof(pipe_specific_t));
+    if (read_spec == NULL || write_spec == NULL) {
+        return -6;
+    }
+    read_spec->write  = false;
+    read_spec->info   = info;
+    read_spec->node   = node_read;
+    write_spec->write = true;
+    write_spec->info  = info;
+    write_spec->node  = node_write;
+
+    info->read_spec  = read_spec;
+    info->write_spec = write_spec;
+
+    node_read->handle  = read_spec;
+    node_write->handle = write_spec;
+
+    g_pipe_read_node  = node_read;
+    g_pipe_write_node = node_write;
+    return 0;
+}
+
+extern "C" int arm_pipe_write(const void *data, unsigned int len)
+{
+    if (g_pipe_write_node == NULL) {
+        return -1;
+    }
+    return (int)vfs_write(g_pipe_write_node, (void *)data, 0u, (size_t)len);
+}
+
+extern "C" int arm_pipe_read(void *buf, unsigned int len)
+{
+    if (g_pipe_read_node == NULL) {
+        return -1;
+    }
+    return (int)vfs_read(g_pipe_read_node, buf, 0u, (size_t)len);
+}
+
+/*
+ * 管道里当前有多少字节。
+ *
+ * `pipefs_stat()` 干的就是这一件事:`node->size = pipe->ptr`
+ * (`pipefs.cpp:247-253`)。⇒ 先 `vfs_update()`(它触发 stat 回调)再读 `size`。
+ *
+ * ★ 为什么它是这一组判据的关键:`arm_pipe_write()` 返回 32 只说明
+ *   "它说它写了 32";而"管道里**现在**有 32 字节"是**另一个观测点** ——
+ *   读完之后它必须回到 0。两侧都成立才说明数据真的进了管道缓冲区,
+ *   而不是某个空壳函数把入参原样返回。
+ */
+extern "C" int arm_pipe_fill(void)
+{
+    if (g_pipe_read_node == NULL) {
+        return -1;
+    }
+    vfs_update(g_pipe_read_node);
+    return (int)g_pipe_read_node->size;
 }

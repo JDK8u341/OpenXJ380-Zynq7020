@@ -45,6 +45,7 @@
 #include <arch/uart_ps.h>
 #include <arch/vfs_check.h>
 #include <arch/fatfs_check.h>
+#include <arch/pipe_check.h>
 
 /* libc 子集。M4A-1.1a 起 malloc/free 也在里面(见 arch/kmalloc.h) */
 #include <krlibc.h>
@@ -1444,6 +1445,9 @@ static vfs_check_t g_vfs;
 /* FATFS 验收的实测读数(M4A-1.4)。同样是"一次探针运行"的整张表 */
 static fatfs_check_t g_fatfs;
 
+/* 管道验收的实测读数(M4A-1.5)。同上 */
+static pipe_check_t g_pipe;
+
 /* SMP 压力测试的结果,供自检报告使用 */
 static smp_stress_result_t g_smp_stress;
 
@@ -2640,6 +2644,24 @@ void kmain(void)
         const fatfs_check_t *fatfs = fatfs_check_run();
 
         g_fatfs = *fatfs;
+    }
+
+    /* ---- 9.45e ★ 管道验收(M4A-1.5)★ ---- */
+    /*
+     * 位置:同样在 VFS 起搏之后(`pipefs_setup()` 要 `vfs_mkdir("/pipe")` 与
+     * `vfs_mount`),而且**刻意排在 FATFS 之后**:FATFS 那一段会往 RAM 盘上
+     * 写很多东西,管道这一段是纯内存往返 —— 把"可能长时间占用堆"的放在前面,
+     * 后面这步的读数就更容易归因。
+     *
+     * ⚠⚠ 一条必须遵守的安全约束:**不要读空管道**。
+     *   `pipefs_read()` 在没有数据时会循环 + `pipe_wait_on()` 等写者
+     *   (只有 `write_fds == 0` 才立即返回 0)⇒ 在 kmain 上下文里读空管道
+     *   就是**当场挂住**。判据因此全部**先写后读**,见 <arch/pipe_check.h>。
+     */
+    {
+        const pipe_check_t *pipe = pipe_check_run();
+
+        g_pipe = *pipe;
     }
 
     /* ---- 9.46 内核栈池 + guard page(M4-5) ---- */
@@ -3986,6 +4008,27 @@ void kmain(void)
        板子这边写死过一次 FAT16 ⇒ 对一个正确的卷报了假 FAIL。
        子类型交给宿主机用算术独立推(tmp-test/verify_fat_bootsector.py)。 */
     selftest_report("fatbs_fat_family", (u32)g_fatfs.bs_fat_family_ok, 1u, SELFTEST_EQ);
+
+    /*
+     * ---- 管道(pipefs)验收(M4A-1.5)----
+     *
+     * ⚠ 这一组有**两个观测点成对出现**,缺一不可(理由见 <arch/pipe_check.h>):
+     *   `pipe_write`/`pipe_read` 是"它说它读写了多少";
+     *   `pipe_fill_after`/`pipe_fill_drain` 是"管道里**现在**有多少字节"
+     *   (`pipefs_stat` 的 `node->size = pipe->ptr`)。
+     *   只看前者,一个把入参原样返回的空壳也能全绿(坑 43 的同型)。
+     */
+    selftest_report("pipe_setup", (u32)((g_pipe.setup == 0) ? 1u : 0u), 1u, SELFTEST_EQ);
+    selftest_report("pipe_create", (u32)((g_pipe.create == 0) ? 1u : 0u), 1u, SELFTEST_EQ);
+    selftest_report("pipe_write", (u32)g_pipe.write, PIPE_CHECK_PAYLOAD_LEN, SELFTEST_EQ);
+    selftest_report("pipe_fill_after", (u32)g_pipe.fill_after, PIPE_CHECK_PAYLOAD_LEN, SELFTEST_EQ);
+    selftest_report("pipe_read", (u32)g_pipe.read, PIPE_CHECK_PAYLOAD_LEN, SELFTEST_EQ);
+    selftest_report("pipe_roundtrip", (u32)g_pipe.roundtrip, 1u, SELFTEST_EQ);
+    /* 读干净之后管道必须是空的 —— 这条才排除"读了个空壳" */
+    selftest_report("pipe_fill_drain", (u32)g_pipe.fill_drain, 0u, SELFTEST_EQ);
+    /* 短读:写 8、按 32 去读 ⇒ 只能拿到 8(返回量由**存量**决定)*/
+    selftest_report("pipe_short_write", (u32)g_pipe.short_write, PIPE_CHECK_SHORT_LEN, SELFTEST_EQ);
+    selftest_report("pipe_short_read", (u32)g_pipe.short_read, PIPE_CHECK_SHORT_LEN, SELFTEST_EQ);
 
     /* 至少 32MB 可用 —— 判据写小了等于没判 */
     selftest_report("heap_size_ok", (g_heap.total_bytes >= (32u * 1024u * 1024u)) ? 1u : 0u, 1u, SELFTEST_EQ);
