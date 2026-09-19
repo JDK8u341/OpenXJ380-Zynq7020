@@ -2911,6 +2911,84 @@ MinGW `gcc` **无法编译 C++** —— 连一个 trivial 的 `.cpp` 都**静默
 
 ---
 
+### M4A-1.2b：上游 VFS + tmpfs 真的在板上跑起来了（已完成，板上 110/0）
+
+这一节的**判据**是计划里写死的那一条：**建 / 读 / 写 / 列目录**，
+全在内存里（tmpfs），不需要块设备。
+
+#### 起搏顺序照源 OS
+
+`arm_vfs_bringup()`（落地层）：
+
+```
+arm_kernel_process_init()   ← 内核进程上下文（queue_init 要 malloc）
+vfs_init()                  ← 源 OS kernel/main.cpp:457
+tmpfs_setup()               ← 源 OS kernel/main.cpp:558
+arm_kernel_process_set_cwd(get_rootdir())
+```
+
+`tmpfs_setup()` 上游**没有**放进任何头文件，是 `kernel/main.cpp:424` 自己
+`extern int tmpfs_setup();` 声明的 —— 落地层照抄这个做法（**不改上游**）。
+
+#### 调用在 C++、判据在 C：结构上的一个硬约束
+
+`include/fs/vfs/vfs.h` **整个文件没有 `extern "C"`** ⇒ VFS 的公开函数全是
+**C++ 链接**的：
+
+```
+$ arm-none-eabi-nm out/kernel-arm.elf | grep vfs_init
+00115c94 T _Z8vfs_initv
+```
+
+⇒ 移植侧 C **不可能**直接调它们（同一个坑在 `sprintf` 上刚踩过，坑表 55）。
+于是分工是：
+
+| 层 | 文件 | 做什么 |
+|---|---|---|
+| 调用 | `src/upstream_api.cpp`（C++ 落地层） | 七个 `extern "C"` 的 `arm_vfs_*`，**纯转发** |
+| 判据 | `src/vfs_check.c`（移植侧 C） | 探针序列 + 读数表 `vfs_check_t` |
+| 报告 | `src/kmain.c` | 十条 `selftest_report(...)` |
+
+交界线由 `tests/test_arm32_vfs.py`（9 条 + 27 子判据）钉住：声明/定义同形、
+必须带 `extern "C"`、上游函数必须真在上游头里有声明、`TMPFS_REGISTER_ID`
+与 `tmpfs_mount()` 的判据必须同一个数，以及**"`vfs.h` 仍然没有 `extern "C"`"**
+（这条是整组断言的前提：上游哪天加上了，落地层那组转发的存在理由就变了）。
+
+#### 判据分三层，第三层不是装饰
+
+| 层 | 判据 | 它证明什么 |
+|---|---|---|
+| ① 往返 | `vfs_write=32` / `vfs_read=32` / `vfs_roundtrip=1` | 32 字节模式写进去、读回来**逐字节相同** |
+| ② 挂载见证 | `vfs_tmpfs_mounted=1`（`/tmp` 的 `fsid` ≠ `/` 的 `fsid`） | **挂载真的发生了** —— `tmpfs.cpp:111` 的 `node->fsid = tmpfs_id`；没挂上就只是根 fs 的普通目录 |
+| ③ 反面控制 | `vfs_negative_ok=1`（在**根** fs 上做同样的往返必须**不成立**） | ① 的成功**不是假通过** |
+
+★ 第三层的必要性来自一个**上游实现细节**：给未挂载节点的回调是
+`static void empty_func() {}`（`vfs.cpp`）—— **返回 `void`，却被塞进
+`size_t (*)(...)` 的回调槽**。于是"调用成功"这件事在这里**本来就不携带信息**
+（返回值是未定义的）。只看前两层的话，"建文件成功"完全可能是空函数放行的结果
+—— 这与坑表 43（"判据成立但这一相什么都没发生 = 假通过"）是同型错误。
+
+#### 上板原文
+
+```
+vfs_bringup                          1      == 1    PASS
+vfs_tmpfs_mounted                    1      == 1    PASS
+vfs_create                           1      == 1    PASS
+vfs_write                           32     == 32    PASS
+vfs_read                            32     == 32    PASS
+vfs_roundtrip                        1      == 1    PASS
+vfs_list_delta                       1      == 1    PASS
+vfs_list_before                      0      == 0    PASS
+vfs_cwd_root                         1      == 1    PASS
+vfs_negative_ok                      1      == 1    PASS
+SELF-TEST: 110 passed, 0 failed
+```
+
+`vfs_list_delta` 判的是"**相对基线多出两个子项**"（`list_before=0`），
+不是"之后 ≥ 2" —— 后者一个恒返回大数的假实现也能过。
+
+---
+
 ### 12. 其它待办（AM3 及以后）
 
 - 缓存维护与 Cortex-A9/PL310 勘误 —— **L1 与 L2 均已使能**；
