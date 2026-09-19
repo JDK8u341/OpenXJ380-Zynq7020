@@ -3181,6 +3181,43 @@ SELF-TEST: 127 passed, 0 failed
 `pipefs.cpp`（管道）同一批进了图（零修改编过），但它自己的自检属
 M4A-1.5 的后续（`pipe` 的读写往返）。
 
+#### 管道验收（M4A-1.5 后续，已完成）
+
+`pipefs.cpp` 从 M4A-1.5 起就在图里，但**它一行都没跑过** —— "编过"与"能跑"
+之间隔着全部语义。所以补了一组内存往返判据（板上 **136/0**）：
+
+```
+pipe_setup 1   pipe_create 1   pipe_write 32   pipe_fill_after 32
+pipe_read 32   pipe_roundtrip 1   pipe_fill_drain 0
+pipe_short_write 8   pipe_short_read 8
+```
+
+★ **两个观测点成对出现，缺一不可**：
+`pipe_write`/`pipe_read` 是"它说它读写了多少"；`pipe_fill_after`/`pipe_fill_drain`
+是"管道里**现在**有多少字节"（`pipefs_stat` 的 `node->size = pipe->ptr`）。
+只看前者，一个把入参原样返回的空壳也能全绿（坑 43 的同型）。
+
+★ **短读**（写 8、按 32 去读 ⇒ 只拿到 8）证的是"返回量由**存量**决定，
+而不是由请求量决定"。
+
+⚠⚠ **一条必须遵守的安全约束：不要读空管道。**
+`pipefs_read()`（`pipefs.cpp:74-102`）在没有数据时会循环 + `pipe_wait_on()`
+等写者，只有 `write_fds == 0` 才立即返回 0 ⇒ 在 kmain 上下文里读空管道
+**当场挂住**，而且挂住时没有任何日志能告诉你原因。所以判据**全部先写后读**，
+并且 `tests/test_arm32_vfs.py` 里有一条**顺序检查**（每次读之前必须有写）
+把这条约束钉成机器可判的。
+
+**建管道为什么在落地层**：上游**没有** `pipe_create()` —— "把管道造出来"
+写在系统调用层（`kernel/syscall/sys.cpp:3703-3762` 的 `sys_pipe2`），
+而那段通篇是 `vfs_node_t` / `pipe_info_t` 这些**上游类型**（移植侧 C 看不到）。
+⇒ 落地层**逐句照搬前半段**（两个节点 + `pipe_info_t` + 两个 `pipe_specific_t`
++ `node->handle` 接线），后半段（每进程 fd 表）属 M7，验收不需要。
+
+★ 顺带记一条**容易误判的事实**：GCC **不修饰全局变量名**（只修饰函数与有作用域的
+实体）⇒ C++ 里 `extern vfs_node_t pipefs_root;` 与上游 C++ 定义里那个变量是
+**同一个符号**（实测两边都未修饰）。这也是上游 `extern device_t device_ctl[26];`
+能直接接到移植侧 C 定义上的原因 —— 别为它去加 `extern "C"`。
+
 ---
 
 ### 12. 其它待办（AM3 及以后）
