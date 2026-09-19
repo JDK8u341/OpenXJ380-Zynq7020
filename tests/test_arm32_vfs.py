@@ -68,6 +68,16 @@ WRAPPER_DECLARATIONS = {
     "arch/arm32/src/kmain.c": (
         "arm_devfs_setup",
         "arm_devfs_node_exists",
+        "arm_pty_init",
+    ),
+    # M4A-1.5:pty 配对
+    "arch/arm32/src/pty_check.c": (
+        "arm_pty_pair_create",
+        "arm_pty_slave_path",
+        "arm_pty_master_write",
+        "arm_pty_slave_write",
+        "arm_pty_master_read",
+        "arm_pty_slave_read",
     ),
 }
 EXPECTED_WRAPPERS = tuple(name for names in WRAPPER_DECLARATIONS.values() for name in names)
@@ -290,30 +300,74 @@ class Arm32VfsBridgeContract(unittest.TestCase):
 
     def test_pipe_check_never_reads_an_empty_pipe(self) -> None:
         """
-        ★ 安全约束的机械判据 ★
+        ★ 安全约束的机械判据(pipe 与 pty 各一条)★
 
-        `pipefs_read()` 在**没有数据**时会循环 `pipe_wait_on()` 等写者
-        (只有 `write_fds == 0` 才立即返回 0)⇒ 在启动自检里读空管道就是
-        **当场挂住**。所以 `pipe_check_run()` 里每一次读之前必须有一次写。
+        - `pipefs_read()` 在**没有数据**时会循环 `pipe_wait_on()` 等写者
+          (只有 `write_fds == 0` 才立即返回 0);
+        - `ptmx_read()`/`pts_read()` 同理,**而且 pty 还多一层**:默认 termios 是
+          规范模式,`pts_data_available()` 在缓冲区里没有行结束符时返回 0
+          (见 `pty_check.h` 的头注释 —— 第一版就是因为载荷里没有 `'\n'`
+          而**当场挂住**)。
+        ⇒ 启动自检里读空的一端就是**卡死**,而且卡死时没有任何日志能说明原因。
+        所以判据里每一次读之前必须有一次写。
 
-        这里做的是**顺序检查**:按出现次序,`arm_pipe_write` 的调用必须
-        先于同一步里的 `arm_pipe_read`。它不是形式主义 —— 这条约束失效的
-        症状是"板子卡死",而卡死时没有任何日志能告诉你原因。
+        这里做的是**顺序检查**:按出现次序,写必须紧接在读之前。
         """
-        source = _strip_comments((ROOT / "arch/arm32/src/pipe_check.c").read_text(encoding="utf-8"))
-        events = [(m.start(), "write" if "arm_pipe_write" in m.group(0) else "read")
-                  for m in re.finditer(r"arm_pipe_(?:write|read)\s*\(", source)]
-        self.assertTrue(events, "pipe_check.c 里没有任何读写调用?")
+        for relative in ("arch/arm32/src/pipe_check.c", "arch/arm32/src/pty_check.c"):
+            with self.subTest(source=relative):
+                raw = (ROOT / relative).read_text(encoding="utf-8")
+                # ⚠ 必须去掉**声明**那一批:文件开头的 `extern int arm_pty_master_read(...)`
+                #   也是 `_read(` 的形状,混进来会让"两次读相邻"看起来像真调用
+                #   (第一版就栽在这里 —— 判据把声明当成了调用)。
+                body = "\n".join(ln for ln in raw.splitlines() if not ln.lstrip().startswith("extern"))
+                source = _strip_comments(body)
+                events = [
+                    (m.start(), "write" if "_write" in m.group(0) else "read")
+                    for m in re.finditer(r"arm_(?:pipe|pty)_\w*(?:write|read)\s*\(", source)
+                ]
+                self.assertTrue(events, f"{relative} 里没有任何读写调用?")
 
-        pending_write = False
-        for _, kind in events:
-            if kind == "write":
-                pending_write = True
-            else:
-                self.assertTrue(pending_write,
-                                "pipe_check.c 里出现了一次**先于任何写**的读 —— "
-                                "读空管道会让启动自检当场挂住")
                 pending_write = False
+                for _, kind in events:
+                    if kind == "write":
+                        pending_write = True
+                    else:
+                        self.assertTrue(pending_write,
+                                        f"{relative} 里出现了一次**先于任何写**的读 —— "
+                                        f"读空的一端会让启动自检当场挂住")
+                        pending_write = False
+
+    def test_pty_payloads_respect_termios_gates(self) -> None:
+        """
+        ★ pty 两个方向的载荷约束**相反**,这里把它钉住 ★
+
+        - **方向 A(写主设备 → 读从设备)** 是输入路径:默认 `ICANON` ⇒
+          `pts_data_available()` 只认行结束符 ⇒ 载荷**必须以 `'\\n'` 结尾**;
+        - **方向 B(写从设备 → 读主设备)** 是输出路径:默认 `OPOST|ONLCR` ⇒
+          `pts_write` 把 `'\\n'` 改写成 `"\\r\\n"` ⇒ 载荷**必须避开 `'\\n'`/`'\\r'`**。
+
+        这两条都是上板实测出来的(第一版方向 A 的载荷避开了 `'\\n'`,
+        结果 `pts_read` 空转 ⇒ 日志停在 `pty: initialized` 之后)。
+        判据来源:`driver/fs/vfs/pty.cpp` 的 `pty_termios_default()`(60-62 行)
+        与 `pts_data_available()`(117-129 行)、`pts_write()`(503 行)。
+        """
+        source = _strip_comments((ROOT / "arch/arm32/src/pty_check.c").read_text(encoding="utf-8"))
+
+        # A 的载荷函数必须写 `'\n'`
+        # ⚠ Python 里要写 `"'\\n'"`(两个字符:反斜杠 + n),写成 `"'\n'"` 是**真的换行**,
+        #   于是 assertIn 永远找不到 —— 第一版就是这么假失败的。
+        self.assertIn("fill_input_payload", source)
+        self.assertIn("'\\n'", source, "pty_check.c 里找不到行结束符 —— 规范模式下面 A 会挂住")
+        # 输入路径必须在**输出路径之后**执行(ECHO 会把回显留在主设备那侧)
+        # ⚠ 同样要排除声明块:声明里 `master_write` 排在 `slave_write` **前面**,
+        #   拿整份源码找 index 会得出相反的结论(第一版就是这么假失败的)。
+        raw = (ROOT / "arch/arm32/src/pty_check.c").read_text(encoding="utf-8")
+        body = "\n".join(ln for ln in raw.splitlines() if not ln.lstrip().startswith("extern"))
+        order_first = body.index("arm_pty_slave_write")   # 方向 B 写从设备
+        order_second = body.index("arm_pty_master_write")  # 方向 A 写主设备
+        self.assertLess(order_first, order_second,
+                        "方向 B 必须先做:默认 ECHO 开着,先做 A 会把回显留在"
+                        "主设备缓冲里,挡住 B 的读取")
 
 
 if __name__ == "__main__":

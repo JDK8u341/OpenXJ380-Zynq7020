@@ -47,6 +47,7 @@
 #include <fs/fatfs/fatfs.h> /* fatfs_init / FATFS 的格式化与挂载(M4A-1.4) */
 #include <fs/fatfs/ff.h>     /* f_mkfs / MKFS_PARM / FM_FAT / FF_MAX_SS */
 #include <fs/vfs/devfs.h>    /* devfs_setup()(M4A-1.5:改用上游那份 devfs)*/
+#include <ioctl.h>           /* TIOCGPTN / TIOCSPTLCK(M4A-1.5 的 pty 配对)*/
 #include <fs/vfs/vfs.h>
 #include <krlibc.h>
 #include <lock_queue.h>
@@ -1192,6 +1193,103 @@ extern "C" int arm_pty_init(void)
 {
     pty_init();
     return arm_devfs_node_exists("/dev/ptmx") ? 0 : -1;
+}
+
+/*
+ * ---- pty 配对:主设备 + 从设备两个端点(M4A-1.5)----
+ *
+ * 与真实用户态**同一条路**(`sys.cpp`/`x3tp.cpp` 也是这么开的):
+ *
+ *     ① master = vfs_open("/dev/ptmx")   ← 触发 `ptmx_open`,分配一个 pair
+ *     ② vfs_ioctl(master, TIOCGPTN, &id) ← **问出**从设备号
+ *     ③ vfs_ioctl(master, TIOCSPTLCK, 0) ← 解锁从设备(`pts_open` 会拒锁着的)
+ *     ④ slave  = vfs_open("/dev/pts/<id>")
+ *
+ * ⚠⚠ 第②步是**问出来**的,不是假定 0 —— `ptmx_open` 每条 pair 都从
+ *   `pty_id_alloc()` 取号,而这个分配器是共享的(第二次开 ptmx 就是 1)。
+ *   写死 0 的判据在"第一次开"时能过,之后就随机失败 —— 那正是坑表 57/58
+ *   那一类("按我以为的"写判据)。这也是为什么从设备路径由落地层
+ *   **算完交给移植侧**(`arm_pty_slave_path`)而不是让检查代码自己拼。
+ *
+ * ⚠ 第③步:上游 `calloc` 之后 `locked` 本来就是 false,今天不解锁也能开;
+ *   但真实用户态在这里都要解锁一次,我们也做 —— 免得哪天默认值变了,
+ *   而症状是"从设备打不开"(一条很难归因的失败)。
+ */
+
+static vfs_node_t g_pty_master;
+static vfs_node_t g_pty_slave;
+static char       g_pty_slave_path[24];
+
+extern "C" int arm_pty_pair_create(void)
+{
+    int  id       = -1;
+    int  unlock   = 0;
+
+    g_pty_master = vfs_open("/dev/ptmx");
+    if (g_pty_master == NULL) {
+        return -1;
+    }
+
+    if (vfs_ioctl(g_pty_master, TIOCGPTN, &id) != 0 || id < 0) {
+        return -2;
+    }
+
+    (void)vfs_ioctl(g_pty_master, TIOCSPTLCK, &unlock);
+
+    (void)snprintf(g_pty_slave_path, sizeof(g_pty_slave_path), "/dev/pts/%d", id);
+
+    g_pty_slave = vfs_open(g_pty_slave_path);
+    if (g_pty_slave == NULL) {
+        return -3;
+    }
+    return 0;
+}
+
+/* 把算出来的从设备路径交出去(证据:它是一个真实的 `/dev/pts/<n>`,不是写死的)*/
+extern "C" int arm_pty_slave_path(char *out, unsigned int len)
+{
+    unsigned int i;
+
+    if (out == NULL || len == 0u || g_pty_slave_path[0] == '\0') {
+        return -1;
+    }
+    for (i = 0; i + 1u < len && g_pty_slave_path[i] != '\0'; i++) {
+        out[i] = g_pty_slave_path[i];
+    }
+    out[i] = '\0';
+    return (int)i;
+}
+
+extern "C" int arm_pty_master_write(const void *data, unsigned int len)
+{
+    if (g_pty_master == NULL) {
+        return -1;
+    }
+    return (int)vfs_write(g_pty_master, (void *)data, 0u, (size_t)len);
+}
+
+extern "C" int arm_pty_slave_write(const void *data, unsigned int len)
+{
+    if (g_pty_slave == NULL) {
+        return -1;
+    }
+    return (int)vfs_write(g_pty_slave, (void *)data, 0u, (size_t)len);
+}
+
+extern "C" int arm_pty_master_read(void *buf, unsigned int len)
+{
+    if (g_pty_master == NULL) {
+        return -1;
+    }
+    return (int)vfs_read(g_pty_master, buf, 0u, (size_t)len);
+}
+
+extern "C" int arm_pty_slave_read(void *buf, unsigned int len)
+{
+    if (g_pty_slave == NULL) {
+        return -1;
+    }
+    return (int)vfs_read(g_pty_slave, buf, 0u, (size_t)len);
 }
 
 /* ====================================================================

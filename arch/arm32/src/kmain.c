@@ -46,6 +46,7 @@
 #include <arch/vfs_check.h>
 #include <arch/fatfs_check.h>
 #include <arch/pipe_check.h>
+#include <arch/pty_check.h>
 
 /* libc 子集。M4A-1.1a 起 malloc/free 也在里面(见 arch/kmalloc.h) */
 #include <krlibc.h>
@@ -1433,9 +1434,10 @@ extern void arm_devfs_setup(void);
 extern int  arm_devfs_node_exists(const char *path);
 extern int  arm_pty_init(void);
 
-/* pty 起搏的结果(M4A-1.5)。⚠ 读写往返还没做,见 9.45d 的说明 */
-static u32 g_pty_init;
-static u32 g_pty_node;
+/* pty 起搏与配对验收的结果(M4A-1.5) */
+static u32        g_pty_init;
+static u32        g_pty_node;
+static pty_check_t g_pty;
 
 static u32 g_device_roundtrip;
 static u32 g_device_devfs_ab;
@@ -2648,6 +2650,20 @@ void kmain(void)
          */
         g_pty_init = (arm_pty_init() == 0) ? 1u : 0u;
         g_pty_node = arm_devfs_node_exists("/dev/ptmx") ? 1u : 0u;
+
+        /*
+         * 配对验收(main/从两个端点各做一次真实往返)。
+         *
+         * ⚠ 紧跟起搏:它要 `/dev/ptmx` 已存在,而且**从设备号是问出来的**
+         *   (`TIOCGPTN`),不是假定 0 —— 理由见 <arch/pty_check.h>。
+         * ⚠ 载荷避开 `'\r'`/`'\n'`:默认 termios 的 `ICRNL` 会改写它们,
+         *   那会把"逐字节相同"这条判据搅乱。
+         */
+        {
+            const pty_check_t *pty = pty_check_run();
+
+            g_pty = *pty;
+        }
     }
 
     /* ---- 9.45c ★ FATFS 起搏 + RAM 盘验收(M4A-1.4)★ ---- */
@@ -3960,6 +3976,26 @@ void kmain(void)
      */
     selftest_report("pty_init", g_pty_init, 1u, SELFTEST_EQ);
     selftest_report("pty_ptmx_node", g_pty_node, 1u, SELFTEST_EQ);
+
+    /*
+     * pty **配对**验收(M4A-1.5):两个方向各一次真实往返。
+     *
+     * 数据流(`pty.cpp` 实测读出来的):`ptmx_write` 进 **slave_buffer**、
+     * 由 `pts_read` 读走(方向 A);`pts_write` 进 **master_buffer**、
+     * 由 `ptmx_read` 读走(方向 B)⇒ 两个方向走**两块不同的缓冲**、
+     * 两端是**两个不同的节点**,所以"两个方向都对"比单向成立强得多。
+     */
+    selftest_report("pty_pair", (u32)((g_pty.pair == 0) ? 1u : 0u), 1u, SELFTEST_EQ);
+    /* 从设备路径必须真的是个 `/dev/pts/...`(长度 > 0 且不是空的)*/
+    selftest_report("pty_slave_path_len", (u32)((g_pty.path_len > 0) ? 1u : 0u), 1u, SELFTEST_EQ);
+    selftest_report("pty_a_write", (u32)g_pty.a_write, PTY_CHECK_PAYLOAD_LEN, SELFTEST_EQ);
+    selftest_report("pty_a_read", (u32)g_pty.a_read, PTY_CHECK_PAYLOAD_LEN, SELFTEST_EQ);
+    selftest_report("pty_a_roundtrip", (u32)g_pty.a_roundtrip, 1u, SELFTEST_EQ);
+    selftest_report("pty_a_short_write", (u32)g_pty.a_short_w, PTY_CHECK_SHORT_LEN, SELFTEST_EQ);
+    selftest_report("pty_a_short_read", (u32)g_pty.a_short_r, PTY_CHECK_SHORT_LEN, SELFTEST_EQ);
+    selftest_report("pty_b_write", (u32)g_pty.b_write, PTY_CHECK_PAYLOAD_LEN, SELFTEST_EQ);
+    selftest_report("pty_b_read", (u32)g_pty.b_read, PTY_CHECK_PAYLOAD_LEN, SELFTEST_EQ);
+    selftest_report("pty_b_roundtrip", (u32)g_pty.b_roundtrip, 1u, SELFTEST_EQ);
 
     /*
      * ---- VFS 起搏 + tmpfs 验收(M4A-1.2b 的验收项)----
