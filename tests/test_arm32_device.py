@@ -41,6 +41,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 UPSTREAM_DEVICE_H = ROOT / "include" / "device.h"
 ARM_DEVICE_H = ROOT / "arch" / "arm32" / "include" / "arch" / "device.h"
+ARM_ID_ALLOC_H = ROOT / "arch" / "arm32" / "include" / "arch" / "id_alloc.h"
 
 # 宿主 UCRT 已经导出了这些符号,直接链接会 duplicate symbol
 KR_PREFIXED = ("memcpy", "memmove", "memset", "memcmp", "strlen", "strcmp", "strncmp",
@@ -63,9 +64,13 @@ def _normalize(piece: str) -> str:
 
 
 def _struct_members(text: str, tag: str, typedef_name: str) -> list[str]:
-    """把 `typedef struct <tag> { ... } <typedef_name>;` 的成员拆成规范化声明列表。"""
+    """把 `typedef struct [<tag>] { ... } <typedef_name>;` 的成员拆成规范化声明列表。
+
+    tag 允许为空:上游 `id_alloc.h` 写的是 `typedef struct { ... } id_allocator_t;`,
+    而 `device.h` 写的是 `typedef struct _device { ... } device_t;` —— 两种都要吃。
+    """
     body = re.search(
-        r"typedef\s+struct\s+" + re.escape(tag) + r"\s*\{(.*?)\}\s*" + re.escape(typedef_name) + r"\s*;",
+        r"typedef\s+struct\s*" + re.escape(tag) + r"\s*\{(.*?)\}\s*" + re.escape(typedef_name) + r"\s*;",
         text,
         flags=re.S,
     )
@@ -82,6 +87,91 @@ def _top_level_prototypes(text: str) -> set[str]:
         if "(" in n and ")" in n and not n.startswith("#"):
             out.add(n)
     return out
+
+
+def _param_types(params: str) -> list[str]:
+    """把参数表拆成型别序列 —— **去掉参数名**。
+
+    上游写 `id_alloc(id_allocator_t *)`,移植侧写 `id_alloc(id_allocator_t *allocator)`,
+    两者是同一个 API;参数名不该让契约测试失败。
+    """
+    params = params.strip()
+    if params in ("", "void"):
+        return []
+    out = []
+    for p in params.split(","):
+        toks = p.split()
+        if len(toks) >= 2:
+            last = toks[-1]
+            if re.fullmatch(r"\*+[A-Za-z_]\w*", last):      # id_allocator_t *allocator
+                toks[-1] = last[: len(last) - len(last.lstrip("*"))]
+            elif re.fullmatch(r"[A-Za-z_]\w*", last):       # uint32_t id
+                toks = toks[:-1]
+        out.append(" ".join(toks))
+    return out
+
+
+def _strip_directives(text: str) -> str:
+    """按行删掉预处理指令。
+
+    ⚠ 必须**按行**删,不能只在片段开头判断 `#`:加了 `extern "C"` 之后,
+    第一条声明的那个片段是以 `#ifdef __cplusplus` 开头的 —— 靠 startsWith('#')
+    跳过会把 `id_allocator_create` 整个漏掉(这就是第一版的 bug)。
+    顺带也避免 `#define BITS_PER_WORD (sizeof(uint32_t) * 8)` 被当成函数声明。
+    """
+    return re.sub(r"(?m)^\s*#.*$", "", text)
+
+
+def _prototype_signatures(text: str) -> dict[str, tuple[str, tuple[str, ...]]]:
+    """函数名 -> (返回类型, 参数型别序列)。只取顶层、带括号、以 ; 结尾的声明。"""
+    out: dict[str, tuple[str, tuple[str, ...]]] = {}
+    # `extern "C" {` 会黏在紧随其后的那条声明的返回类型上 —— 它不是类型的一部分
+    text = _strip_directives(text).replace('extern "C" {', " ")
+    for piece in text.split(";"):
+        n = _normalize(piece)
+        m = re.fullmatch(r"(.+?)\b([A-Za-z_]\w*)\s*\((.*)\)", n)
+        if not m:
+            continue
+        out[m.group(2)] = (m.group(1).strip(), tuple(_param_types(m.group(3))))
+    return out
+
+
+class IdAllocContractTests(unittest.TestCase):
+    """`arch/arm32/include/arch/id_alloc.h` 必须与上游 `include/id_alloc.h` 同 API。
+
+    为什么移植侧要有一份**声明副本**:上游那份是 C++ 专属的(它拉
+    `include/krlibc.h`,而那份用了 `typeof(nullptr)`、`#define NULL 0`、
+    `static memmove` —— 在 C 里全编不过,实测)。所以两边唯一的交界是
+    "上游实现 + 移植侧 C 声明",而这份副本必须被机械地钉住。
+    """
+
+    def setUp(self) -> None:
+        self.up = _strip_comments((ROOT / "include" / "id_alloc.h").read_text(encoding="utf-8"))
+        self.arm = _strip_comments(ARM_ID_ALLOC_H.read_text(encoding="utf-8"))
+
+    def test_struct_members_match(self) -> None:
+        up = _struct_members(self.up, "", "id_allocator_t")
+        arm = _struct_members(self.arm, "", "id_allocator_t")
+        self.assertTrue(up, "上游 id_allocator_t 没解析到成员")
+        self.assertEqual(up, arm, "id_allocator_t 与上游不一致(左=上游,右=移植侧)")
+
+    def test_prototypes_match(self) -> None:
+        up = _prototype_signatures(self.up)
+        arm = _prototype_signatures(self.arm)
+
+        for name in ("id_allocator_create", "id_alloc", "id_free"):
+            self.assertIn(name, up, f"上游少了 {name} —— 解析器或上游都变了")
+            self.assertIn(name, arm, f"移植侧的 C 声明里少了 {name}")
+            self.assertEqual(up[name], arm[name], f"{name} 的签名与上游不一致")
+
+    def test_upstream_header_is_extern_c(self) -> None:
+        """上游那份必须带 `extern "C"` —— 否则 C 侧链不上(符号会被修饰)。
+
+        实测过:没有它时 `kernel/id_alloc.cpp` 编出来的符号是
+        `_Z8id_allocP14id_allocator_t`,C 那边根本找不到。
+        """
+        raw = (ROOT / "include" / "id_alloc.h").read_text(encoding="utf-8")
+        self.assertIn('extern "C"', raw, '上游 id_alloc.h 的 extern "C" 块没了')
 
 
 class DeviceShapeContractTests(unittest.TestCase):
@@ -372,35 +462,63 @@ class DeviceRoundTripTests(unittest.TestCase):
     CAPTURE = {"capture_output": True, "text": True, "encoding": "utf-8", "errors": "replace"}
 
     def _build(self, tmp: Path, harness: Path) -> Path:
+        """编出测试可执行文件:上游的 C++ 一份 + 移植侧的 C 若干。
+
+        ⚠ 两个翻译单元的 **include 路径是分开的** —— 与 ARM 构建里的
+        arm32_cc / arm32_cxx 两条规则同构:
+
+          上游 .cpp  : `-I include`(只看得见上游头文件树)
+          移植侧 .c  : `-I arch/arm32/include`(看不到上游头文件)
+
+        这不是洁癖:两边的头文件树在同一个 TU 里会打架(上游 stdint.h 的
+        `typedef char int8_t` vs 移植侧的 `signed char` —— ARM 上 char 默认
+        无符号),而且上游 krlibc.h 里有 `typeof(nullptr)` 这种 C++ 专属语法。
+        """
         binary = Path(tmp) / "device_test"
+        cxx_obj = Path(tmp) / "id_alloc.o"
         attempts: list[str] = []
+        defines = [f"-D{fn}=krtest_{fn}" for fn in KR_PREFIXED + HEAP_PREFIXED]
+
         for compiler in self.COMPILER_CANDIDATES:
-            command = [
-                compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
-                "-I", str(ROOT / "arch/arm32/include"),
-            ]
-            for fn in KR_PREFIXED + HEAP_PREFIXED:
-                command.append(f"-D{fn}=krtest_{fn}")
-            command += [
-                str(harness),
-                str(ROOT / "arch/arm32/src/device.c"),
-                str(ROOT / "arch/arm32/src/devfs.c"),
-                str(ROOT / "arch/arm32/src/id_alloc.c"),
-                str(ROOT / "arch/arm32/src/kmalloc.c"),
-                str(ROOT / "arch/arm32/src/heap.c"),
-                str(ROOT / "arch/arm32/src/krlibc.c"),
-                "-o", str(binary),
+            # ---- 1) 上游的 C++ 翻译单元 ----
+            cxx_cmd = [
+                compiler, "-x", "c++", "-std=gnu++17", "-fno-exceptions", "-fno-rtti",
+                "-Wall", "-Wextra", "-Werror",
+                "-I", str(ROOT / "include"),
+                *defines,
+                "-c", str(ROOT / "kernel" / "id_alloc.cpp"), "-o", str(cxx_obj),
             ]
             try:
-                result = subprocess.run(command, **self.CAPTURE)
+                r = subprocess.run(cxx_cmd, **self.CAPTURE)
             except FileNotFoundError:
                 attempts.append(f"{compiler}: not found")
                 continue
-            if result.returncode == 0:
+            if r.returncode != 0:
+                detail = (r.stderr or "").strip().replace("\n", " ")[:400]
+                attempts.append(f"{compiler}: 编译上游 .cpp 失败 rc={r.returncode} {detail}")
+                continue
+
+            # ---- 2) 移植侧的 C,与 C++ 目标文件链接 ----
+            command = [
+                compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
+                "-I", str(ROOT / "arch/arm32/include"),
+                *defines,
+                str(harness),
+                str(ROOT / "arch/arm32/src/device.c"),
+                str(ROOT / "arch/arm32/src/devfs.c"),
+                str(ROOT / "arch/arm32/src/kmalloc.c"),
+                str(ROOT / "arch/arm32/src/heap.c"),
+                str(ROOT / "arch/arm32/src/krlibc.c"),
+                str(cxx_obj),
+                "-o", str(binary),
+            ]
+            r = subprocess.run(command, **self.CAPTURE)
+            if r.returncode == 0:
                 return binary
-            detail = (result.stderr or "").strip().replace("\n", " ")[:500]
-            attempts.append(f"{compiler}: rc={result.returncode} {detail}")
-        self.fail("no working host C compiler found:\n  " + "\n  ".join(attempts))
+            detail = (r.stderr or "").strip().replace("\n", " ")[:400]
+            attempts.append(f"{compiler}: 链接失败 rc={r.returncode} {detail}")
+
+        self.fail("no working host C/C++ compiler found:\n  " + "\n  ".join(attempts))
 
     def test_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

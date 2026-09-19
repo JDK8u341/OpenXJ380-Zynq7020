@@ -552,6 +552,38 @@ ARM32_COMMON_FLAGS = (
     "-MP",
 )
 
+# ⚠ **不要**把 `-I./include` 加进 ARM32_COMMON_FLAGS。
+#
+# 上游的头文件树是 **C++ 专属**的,拿给 C 用会当场炸(实测,逐条):
+#   include/stdint.h:20   typedef char int8_t     与 ARM 的 signed char 冲突
+#                         (ARM 上 char 默认无符号 ⇒ 上游那条本身在 ARM 上就是错的)
+#   include/stdint.h:38   #define NULL 0          与 ARM 的 ((void *)0) 冲突
+#   include/krlibc.h:22   typedef typeof(nullptr) nullptr_t   —— C++ 专属语法
+#   include/krlibc.h:217  static memmove          与 ARM 的非 static 声明冲突
+# ⇒ 规矩:**移植侧的 C 文件看不到上游头文件;上游的 C++ 文件看不到移植侧头文件**
+#   (后者指不被它们 include;`-I` 顺序仍保证它们能找到自己的那一份)。
+#   两边唯一的交界是"上游 C++ 导出 C 链接符号 + 移植侧给出 C 声明",
+#   由 tests/test_arm32_device.py 之类的契约测试钉住。
+#
+# 所以这条 `-I./include` 只挂在 arm32_cxx 规则上(见下面)。
+ARM32_UPSTREAM_INCLUDE = "-I./include"
+
+# 上游(.cpp)里被编进 ARM 内核的文件。
+#
+# 这是"合流"的落点,所以**显式列举、不做目录扫描**:上游 kernel/ 与 driver/
+# 里有大量 x86 专有文件,扫进来只会得到满屏编译错误,而"到底哪个上游文件
+# 被编进来了"必须是一份可评审的清单。
+#
+# 每加一项的门槛不是"能不能编过",而是"它依赖的东西到位了没有" ——
+# 反例见 docs/ZYNQ7020_PORT_PLAN.md §4.6:M4A-1.1b 时 driver/device.cpp
+# 编不过**与 C++ 无关**,它卡在 VFS/分区层与进程层上。
+ARM32_UPSTREAM_CXX = (
+    # 57 行,只依赖 malloc/calloc/free。它原先在移植侧有一份 C 副本
+    # (arch/arm32/src/id_alloc.c)—— 那份是"上游是 .cpp 而当时没有 C++ 规则"
+    # 的临时品;C++ 规则到位后就该删掉、改回共用这一份(源 OS 优先)。
+    "kernel/id_alloc.cpp",
+)
+
 # Candidate install roots for the Vitis GNU toolchain, used only when the
 # compiler is not already on PATH.  The path itself lives in the repository-root
 # `config.py` (that is the one file to edit on a new machine); a couple of stock
@@ -646,6 +678,12 @@ def arm32_graph(n: Ninja, out_path: Path) -> list[Path]:
     n.var("arm_cc", cc)
     n.var("arm_libgcc", libgcc_arg)
     n.var("arm_cflags", " ".join(ARM32_COMMON_FLAGS))
+    # C++(上游)文件用的那套:去掉移植侧的 -I。
+    # 理由与"不要给 C 文件加 -I./include"是同一条规矩的另一半 ——
+    # 两边的头文件树在同一个 TU 里是会打架的(实测:上游 stdint.h 的
+    # `typedef char int8_t` 与移植侧的 `signed char` 冲突,因为在 ARM 上
+    # `char` 默认无符号)。上游文件只该看见上游的世界。
+    n.var("arm_cxx_cflags", " ".join(f for f in ARM32_COMMON_FLAGS if f != "-I./arch/arm32/include"))
     n.var("arm_arch_flags", " ".join(ARM32_ARCH_FLAGS))
     n.var("arm_ldflags", f"-nostdlib -T {ARM32_SOURCE_ROOT}/boot/kernel.ld -Wl,-Map=out/kernel-arm.map")
     n.line()
@@ -674,6 +712,21 @@ def arm32_graph(n: Ninja, out_path: Path) -> list[Path]:
         "arm32_cc",
         "$arm_cc $arm_arch_flags $arm_cflags -std=gnu11 -O2 -MF $out.d -c $in -o $out",
         log_desc("CC", "$in -> $out"),
+        depfile="$out.d",
+    )
+    # 上游的 .cpp。与 arm32_cc 的差别只有三处:-std=gnu++17、-fno-rtti
+    # (异常已在 ARM32_COMMON_FLAGS 里关掉),以及它照样能用 -I./include。
+    #
+    # 为什么 C++ 值得单独一条规则(而不是把上游文件改写成 C):
+    # 上游 kernel/、driver/ 全是 .cpp,改写成 C 等于**分叉**;而合流的目标
+    # 恰恰是让它们成为两个架构的共同资产。实测代价很小 —— 只要架构头对
+    # C++ 友好(见 arch/arm32/include/arch/types.h 的 bool 守卫与
+    # krlibc.h 的 extern "C")。
+    n.rule(
+        "arm32_cxx",
+        f"$arm_cc $arm_arch_flags $arm_cxx_cflags {ARM32_UPSTREAM_INCLUDE} -std=gnu++17 -fno-rtti -O2 "
+        "-MF $out.d -c $in -o $out",
+        log_desc("CXX", "$in -> $out"),
         depfile="$out.d",
     )
     # Assembly goes through the GNU driver so it sees the same -mcpu/-mfpu set.
@@ -711,6 +764,14 @@ def arm32_graph(n: Ninja, out_path: Path) -> list[Path]:
     for src in arm_c_sources:
         obj = Path(ARM32_OBJ_ROOT) / src.relative_to(arm_source_root_abs).with_suffix(".o")
         n.build(obj, "arm32_cc", src, implicit=arm_headers)
+        arm_objs.append(obj)
+
+    # 上游的 .cpp:对象放在 out/arm32/upstream/ 下,与移植侧分开放 ——
+    # 这样 `ls out/arm32/upstream` 就是一份"哪些上游文件已经编进来了"的清单。
+    for rel in ARM32_UPSTREAM_CXX:
+        src = ROOT / rel
+        obj = Path(ARM32_OBJ_ROOT) / "upstream" / Path(rel).with_suffix(".o")
+        n.build(obj, "arm32_cxx", src)
         arm_objs.append(obj)
 
     # Create the object directories up front.  Doing it here rather than in the

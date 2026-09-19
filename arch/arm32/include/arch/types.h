@@ -62,19 +62,33 @@ typedef unsigned long long uint64_t;
 typedef signed long long   int64_t;
 
 /*
- * ⚠ C++ 有**内建** bool,再 typedef 会报
- *   "redeclaration of C++ built-in type 'bool' [-fpermissive]"。
- *   ARM 上两边都是 1 字节、布局一致,所以 C++ 翻译单元直接用内建的即可。
+ * bool —— 用**宏**而不是 typedef,而且必须与上游 include/stdint.h 的一致。
  *
- * 为什么架构头要在意 C++:上游的 kernel/、driver/ 全是 .cpp,合流(见
- * docs/ZYNQ7020_INTEGRATION_PLAN.md)迟早要把它们编进 ARM 图 ——
- * 那时这条 typedef 会是第一个拦路的。
+ * ★ 为什么不能是 `typedef u8 bool`:仓库自己的 `include/stdint.h:41` 有
+ *     #define bool _Bool
+ *   于是同一个翻译单元里只要同时出现移植侧与上游的头文件,`bool` 就变成
+ *   **两种不同的类型**(`unsigned char` vs `_Bool`),编译器报
+ *     "conflicting types for 'have_vdisk'; have '_Bool(int)'"
+ *   这不是偶发事件 —— 合流之后每一个混用两边的 TU 都会撞上
+ *   (实测:device.c 引用上游 <id_alloc.h> 时当场就撞了)。
+ *
+ * 换成宏之后两边是同一件事(而且宏的重复定义只要字面相同就是合法的,
+ * 上游那一条不会再冲突),`#ifndef` 让先后顺序无关。
+ *
+ * 语义差别只有一个:把非 0/1 的值赋给 `bool` 会被规范化成 1。
+ * 全树 120 处 `bool` 用法已经扫过 —— **没有任何一处**依赖"它是个字节"
+ * (赋值全是 true/false/比较/返回 bool 的函数)。`_Bool` 在 ARM EABI 上
+ * 与 u8 同为 1 字节,结构体布局不变(percpu_t / heap_t 那些 sizeof 断言照旧)。
+ *
+ * ⚠ C++ 有**内建** bool,绝不能在这里宏掉它 —— 上游 kernel/、driver/ 全是
+ *   .cpp,合流(见 docs/ZYNQ7020_INTEGRATION_PLAN.md)会用到。
  */
 #    ifndef __cplusplus
-typedef u8 bool;
-
-#        define true  1
-#        define false 0
+#        ifndef bool
+#            define bool  _Bool
+#            define true  1
+#            define false 0
+#        endif
 #    endif
 
 #    ifndef NULL
