@@ -2134,6 +2134,7 @@ switched=30 preempted=27 invalid=0
 | D22 | ★ **落地层有四个"响亮拒绝"式实现**（不是空壳）★ | `src/upstream_api.cpp` | 上游要符号，而 ARM 对应物**不存在**：`get_current_directory()`→`NULL`（内核线程没有"当前目录"这个概念，源 OS 里它读 `get_current_task()->cwd`，而我们的 tcb 与上游 tcb_t 不是同一个类型）；`page_map_range_to_random()` 与 `scheduler_wake_task()`→**打印一行 + 计数**（`arm_page_map_unsupported_count()`），因为它们要么依赖用户地址空间（M7）、要么参数类型是上游 `tcb_t`；`get_keyboard_input()`→`0`（PS/2 键盘在 ARM 上不存在；★ `0` 在这里是**正确**答案不是占位 —— `vfs.cpp:1368` 拿它当"有没有按键"，而"没有按键"就是 0） | 逐个随阶段消掉：`get_current_directory` 待 D18 的每进程 `cwd`（M7）；`page_map_range_to_random` 待用户地址空间（M7）；`scheduler_wake_task` 待两边 `tcb_t` 统一（M7）；键盘待某个真输入源接进 tty（M4A-1.5 或之后）。⚠ **"响亮拒绝"是有意的选择**：静默返回成功会让调用点拿到假结果，而那种 bug 会跑到很远才发作 |
 | D23 | ★ **x86 预读路径的两个符号是"响亮拒绝 + 计数"，而不是实现** ★ | `src/upstream_api.cpp` 的 `alloc_frames` / `phys_to_virt` / `ahci_is_qemu_environment` | `diskio.cpp` 有一条 **QEMU/AHCI 专用**的预读优化：`ahci_is_qemu_environment()` → `alloc_frames()` + `phys_to_virt()`。Zynq 上**没有 AHCI 器件** ⇒ 第一个如实返回 `false`、整条路不可达。后面两个按本项目的规矩返回**调用方已经处理**的失败值（`0` / `NULL`）并计数 | **不打算实现**：ARM 的页模型是 palloc/vmap，没有 x86 那个 HHDM 直映射窗口，编一个假的 `phys_to_virt` 只会把错误推到更远。★ 而"不可达"是**可判的**：板上自检 `fatfs_x86_path`（计数必须 0）就是证据 —— M4A-1.4 实测 0 |
 | D24 | ★ **没有墙钟：`realtime_ns()` 返回的是开机以来的纳秒数** ★ | `src/upstream_api.cpp` 的 `realtime_ns()`（转发到移植侧的 `timer_read_ns()`） | 上游的实现在 `driver/rtc.cpp`，读的是 PC 的 **CMOS**（0x70/0x71 端口）—— Zynq 上**不存在这个器件** ⇒ 那份实现不是"还没搬"，是"搬过来也没有硬件"。FATFS 拿它当挂载时刻与文件 mtime 用 | 出现墙钟源时替换：Zynq PS RTC（`0xF8006000`）驱动，或由控制台设一次时间。★ 它**不是常量**（单调递增），所以"后写的文件更新"这类判断仍然成立；但文件日期是"1970 + 启动秒数"，不是真实日期。★ 同一批里 `mktime()` 是**逐行照搬**上游那份纯算术（含它两处非 ISO 语义），并有宿主机逐日期比对（`tests/test_arm32_fatfs.py`） |
+| D25 | ★ **块层 `blk_device_read` / `blk_device_write` 是"响亮拒绝 + 计数"** ★ | `src/upstream_api.cpp` | 上游实现在 `driver/device.cpp`（216/318/415 行），那个文件**还没进 ARM 图**（卡在分区层与进程层，计划归 M4A-3/B5）。而 ARM 侧今天**根本没有块设备**（`sdhci0` 在描述表里但驱动一行没写）⇒ 这两个函数在当前构建里**不可达**（只有节点挂块设备时 `devfs_read/write` 才会走到） | **M4A-1.3 + M4A-3/B5**：接上真实块设备、把 `driver/device.cpp` 的块层搬进来。★ "不可达"是**可判的**：`arm_blk_device_calls()` 必须恒为 0 —— 板上自检读它 |
 
 #### ★ 与源 OS **一致**、别当成缺功能的几处（M4A-1.2b 核对过）★
 
@@ -2840,12 +2841,22 @@ SELF-TEST: 100 passed, 0 failed
 
 - 块层（`device_read` / `device_write` / `blk_device_*` / `device_mmap` / bounce 缓冲）→ M4A-1.3；
 - 自动分区扫描 → M4A-1.3/1.4；
-- `/dev` 下**没有真节点**，也没有文件操作。骨架只有一张"名字 → id"的表。
+- ~~`/dev` 下**没有真节点**，也没有文件操作。骨架只有一张"名字 → id"的表。
   ⚠ 计划 §4.4 第 4 条明写"不允许把只登记不建节点当成完成态" —— 本骨架**不是**
-  完成态，真 devfs 随 M4A-1.2 的 VFS 一起来；
-- `path`（父目录）被**接受但不生效**（骨架没有目录树）。今天所有调用方都传
+  完成态，真 devfs 随 M4A-1.2 的 VFS 一起来；~~
+  ⇒ ✅ **已结案（M4A-1.5）：骨架整个退场，`/dev` 下用的是上游 `driver/fs/vfs/dev.cpp`
+  建出来的真节点**（见下面 M4A-1.5 一节）。注意退场**不是**"顺手换掉"：
+  骨架与上游 dev.cpp 都定义 `devfs_register`/`devfs_delete`（C 链接），
+  而内核链接带 `-z muldefs` ⇒ ld 会静默挑一个 —— 那种"看起来能跑"的重复定义
+  必须显式二选一；
+- ~~`path`（父目录）被**接受但不生效**（骨架没有目录树）。今天所有调用方都传
   NULL，所以不影响任何现有调用。相应地，**同名不同父**的两个设备在骨架里会
-  撞在一起 —— 真 devfs 到位后这个限制自然消失。
+  撞在一起 —— 真 devfs 到位后这个限制自然消失。~~
+  ⇒ ✅ **已结案（M4A-1.5）**：上游 devfs 里 `path` 真的是 `/dev` 下的**子目录**
+  （`dev.cpp:37` 的 `sprintf(buf, "/dev/%s", path)`），而**节点名取
+  `device->drive_name`**（`dev.cpp:68`）。所以"同名不同父"天然分得开。
+  ⚠ 这一条同时改了自检的写法：按名字找 = `vfs_open("/dev/<drive_name>")`，
+  而注册时传的 `path` 只影响"挂在哪个子目录下"。
 
 ---
 
@@ -3083,6 +3094,92 @@ SELF-TEST: 127 passed, 0 failed
 实例同时在场）—— 只判"fsid >= 0"没有区分度：挂载失败时 `/mnt` 会退回成根的
 普通目录，fsid 照样 ≥ 0。
 `fatfs_x86_path` 是 D23 的判据：x86 预读路径的计数必须 **0**。
+
+---
+
+### M4A-1.5：devfs 换成上游那份（骨架退场）+ 抓到一个"幽灵设备"（已完成，板上 127/0）
+
+#### 为什么"换 devfs"不是顺手换，而是被迫的
+
+M4A-1.1b 时移植侧写过一份 devfs **骨架**（一张"名字 → id"私表，`/dev` 下没有节点）。
+M4A-1.5 把上游 `driver/fs/vfs/dev.cpp` 加进图时发现：
+
+    骨架   devfs.o:  T devfs_register   T devfs_delete   T devfs_lookup …
+    上游   dev.o  :  T devfs_register   T devfs_delete   T _Z11devfs_setupv …
+
+**两个对象都定义 `devfs_register` / `devfs_delete`（C 链接、同名）**，
+而本项目的内核链接带 `-Wl,-z,muldefs`（源 OS 自己就带，见 `tools/gen_ninja.py`）
+⇒ **ld 会静默挑一个**，谁生效取决于命令行顺序。那种"看起来能跑"的重复定义
+必须显式二选一。选上游 = 源 OS 优先，顺带把"devfs 骨架"这条退化项消掉。
+
+#### 换掉之后 A/B 反而**更强**了：用上游自己的语义
+
+旧的 A/B 靠移植侧造的一个开关（`devfs_ab_set_disabled`）——它随骨架一起删了。
+新的 A/B 完全建立在上游 `devfs_register()` 的第一句上：
+
+```cpp
+if (devfs_root == NULL) { return EOK; }   // dev.cpp:345 —— /dev 还没挂 ⇒ 登记成功但不建节点
+```
+
+⇒ ① 挂载**前**注册的设备：按名字**找不到**（而 `get_device(id)` 照样成功）；
+② 挂载**后**注册的设备：按名字**找得到**；③ 注销之后：又找不到。
+板上实测 `pre-mount=1 post-mount=1 after-delete=1`。
+
+★ "按名字找"在 M4A-1.5 之后**就是** `vfs_open("/dev/<drive_name>")` ——
+节点名取 `device->drive_name`（`dev.cpp:68`），而 `path` 参数指的是 `/dev` 下的
+**子目录**（`dev.cpp:37`）。所以自检里注册时传 NULL，并按节点名去查。
+
+#### ★ 抓到一个"幽灵设备"（上游把清理写在了拷贝上）
+
+新加的判据 `delete_device(id)` 之后 `get_device(id)` **必须是 NULL** 当场红了。
+去读上游：
+
+```cpp
+void delete_device(int vdiskid) {
+    device_t dev = device_ctl[vdiskid];                 // ← 局部**拷贝**
+    ...
+    dev.path = NULL; dev.flag = 0; dev.vdiskid = 0;     // ← 改的是拷贝,表里一点没变
+}
+```
+
+**意图清清楚楚**（槽位标空闲 + 清三个字段），但那三句没落到表上 ⇒
+删掉之后 `get_device(id)` 仍返非 NULL（`path` 还指着已释放内存）、
+`have_vdisk(id)` 仍为真。上游没发作，只因为四个调用方删完就不再用。
+
+⇒ 按**写出来的意图**修（与 D16 那条同型），判据就是那行断言。
+★ 旧版宿主单测曾经**故意**断言过上游的字面行为，并在注释里写明
+"哪天改成清 flag，要是一个有意识的决定" —— 现在就是，且理由来自上游自己的那三行。
+
+#### 三个符号的链接形状：又是"同名不同符号"
+
+`dev.cpp` 是 C++ TU，它要的是修饰名（`nm -u` 实测）：
+
+    U _Z9disk_sizei                 ← 上游 device.h:59 的 disk_size(int)
+    U _Z15blk_device_readiPvjj      ← 注意这三条是**未修饰**的
+    U _Z16blk_device_write8_device_tPKvjj
+    U _Z18write_serial_stringPKc
+
+★ 为什么 `disk_size` 是修饰的而 `blk_device_*` 不是？因为上游
+`include/device.h` 的 `extern "C"` 块从**第 83 行**才开始，
+而 `disk_size` 在第 **59 行**（在块外）、`blk_device_*` 在 107/108 行（在块内）。
+这条不对称是**量出来的**，不是猜的 —— 所以落地层给出的形状也跟着它走。
+
+⚠ 那为什么不干脆把上游 `disk_size` 的声明挪进 `extern "C"`？
+因为上游 x86 侧**同时**有 `size_t disk_size(int)`（`driver/device.cpp:216`）与
+`u32 disk_size(byte)`（`diskio.cpp:181`），给前者加 C 链接会在 C 里撞名、
+**直接弄坏 x86 构建**。⇒ 落地层给 C++ 名、转发到移植侧实现（`arm_disk_size`，
+与 `arm_mutex_*` 同型），实现仍然只有一份。
+
+#### 上板原文
+
+```
+Device rt   : regist/get/path-copy/delete round trip = PASS
+Device A/B  : pre-mount=1 post-mount=1 after-delete=1
+SELF-TEST: 127 passed, 0 failed
+```
+
+`pipefs.cpp`（管道）同一批进了图（零修改编过），但它自己的自检属
+M4A-1.5 的后续（`pipe` 的读写往返）。
 
 ---
 
