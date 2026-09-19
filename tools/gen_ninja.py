@@ -794,11 +794,33 @@ def arm32_graph(n: Ninja, out_path: Path) -> list[Path]:
         #
         #   理由不是"图省事",是两边编译器不同:上游是用 **clang** 开发的,
         #   而 ARM 图用 **GCC 13**。同一份上游代码在两者下的警告面不一样,
-        #   实测碰到的就有四类:
+        #   实测碰到的就有五类:
         #     - 宏重定义(`include/mm/page.h` 的 PROT_* vs `include/syscall/syscall.h`)
         #     - 函数指针强转(`(vfs_ioctl_t)pipefs_ioctl` —— 回调表本就是一组签名)
         #     - 缺失字段初始化(`vt_mode` 的 acqsig/frsig/…)
         #     - 悬空声明(`proto.hpp` 的 `static inline uint64_t rdtsc();`,已单独删掉)
+        #     - ★ 假阳性:`-Wsequence-point`,只有一处,已逐行分析过(见下)
+        #
+        #   ★ 第五类(`driver/fs/vfs/vfs.cpp:907`)单独说明,因为它的**形状像真 bug**,
+        #     下一步做 tmpfs 的建/读/写时一定会路过它,不该被当成嫌疑犯去查:
+        #
+        #         node->parent->child = list_delete(node->parent->child, node);
+        #
+        #     GCC 报 "operation on 'node->parent->child' may be undefined"。
+        #     逐条对下来它是**良定义**的:
+        #       ① 实参 `node->parent->child` 的读取**先于**调用完成,赋值**后于**
+        #          调用返回 —— 这正是 C 里 `x = f(x)` 这个惯用法的次序保证;
+        #       ② `list_delete(list_t list, void *data)`(`list.h:283`)的链表头是
+        #          **传值**的,它内部对参数 `list` 的写**不可能**指向调用方的
+        #          `child` 字段;它 `free()` 掉的是**链表包装结点**,与 `data`
+        #          (那个 vfs_node)不是同一个对象。
+        #     ⇒ 之所以还是报,是 GCC 把 `list.h` 里那个**头文件内定义**的
+        #       `list_delete` 内联之后,别名分析无法排除"同一个对象被改两次"。
+        #       clang(上游的编译器)不报。
+        #     ⇒ **决定:不动上游代码。** 这是警告级、且改动会碰公共 ABI 头
+        #       (`list.h` 的签名/行为);记录在这里,为了让将来查
+        #       "结点从 child 链表里消失/泄漏"的人先排除它,而不是先怀疑它。
+        #
         #   要"对 GCC 也零警告"只有两条路:改上游(越权)或关掉整类警告(掩盖真问题)。
         #   降级为警告保留了**全部可见性**,而"能不能跑"由链接与板上判据决定。
         "-Wno-error -O2 -MF $out.d -c $in -o $out",
