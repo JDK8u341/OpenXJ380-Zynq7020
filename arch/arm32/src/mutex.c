@@ -309,8 +309,17 @@ tcb_t mutex_get_owner(mutex_t *m)
  *      `mutex_t` 对象,移植侧把它当自己的 16 字节结构写。改大了这个大小,
  *      上游那个对象就可能被写越界 —— 而那种错误在源码上看不出来。
  */
-_Static_assert(sizeof(mutex_t) == 16u,
-               "落地层把上游 mutex_t 对象当 16 字节存储用(见 arch/mutex.h);"
+/*
+ * ⚠ 这条断言**只在 32 位目标上成立**(ARM:`state`4 + `owner`4 + `rcc`4 + `rec`1
+ *   + 填充 3 = 16)。宿主单测把它编到 x86_64 上时 `tcb_t` 是 8 字节指针 ⇒
+ *   结构体是 24 字节 —— 那是**宿主的 ABI**,不是这条断言要说的事。
+ *   所以要判的是"**在指针 4 字节的平台上**它确实是 16 字节",写成
+ *   `sizeof(void *) != 4 || …` 之后:宿主上第一项为真、断言自动通过,
+ *   而 ARM 上第一项为假 ⇒ 真正去核 16 这个数。
+ *   (第一版漏了这个条件,于是宿主单测当场红了 —— 判据写成了"我以为的平台"。)
+ */
+_Static_assert(sizeof(void *) != 4u || sizeof(mutex_t) == 16u,
+               "32 位平台上落地层把上游 mutex_t 对象当 16 字节存储用(见 arch/mutex.h);"
                "改了这个大小必须同时核对 include/mutex.h 的布局");
 
 void arm_mutex_create(void *m, bool recursive)
