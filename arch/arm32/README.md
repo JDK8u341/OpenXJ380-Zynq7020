@@ -2134,7 +2134,7 @@ switched=30 preempted=27 invalid=0
 | D22 | ★ **落地层有四个"响亮拒绝"式实现**（不是空壳）★ | `src/upstream_api.cpp` | 上游要符号，而 ARM 对应物**不存在**：`get_current_directory()`→`NULL`（内核线程没有"当前目录"这个概念，源 OS 里它读 `get_current_task()->cwd`，而我们的 tcb 与上游 tcb_t 不是同一个类型）；`page_map_range_to_random()` 与 `scheduler_wake_task()`→**打印一行 + 计数**（`arm_page_map_unsupported_count()`），因为它们要么依赖用户地址空间（M7）、要么参数类型是上游 `tcb_t`；`get_keyboard_input()`→`0`（PS/2 键盘在 ARM 上不存在；★ `0` 在这里是**正确**答案不是占位 —— `vfs.cpp:1368` 拿它当"有没有按键"，而"没有按键"就是 0） | 逐个随阶段消掉：`get_current_directory` 待 D18 的每进程 `cwd`（M7）；`page_map_range_to_random` 待用户地址空间（M7）；`scheduler_wake_task` 待两边 `tcb_t` 统一（M7）；键盘待某个真输入源接进 tty（M4A-1.5 或之后）。⚠ **"响亮拒绝"是有意的选择**：静默返回成功会让调用点拿到假结果，而那种 bug 会跑到很远才发作 |
 | D23 | ★ **x86 预读路径的两个符号是"响亮拒绝 + 计数"，而不是实现** ★ | `src/upstream_api.cpp` 的 `alloc_frames` / `phys_to_virt` / `ahci_is_qemu_environment` | `diskio.cpp` 有一条 **QEMU/AHCI 专用**的预读优化：`ahci_is_qemu_environment()` → `alloc_frames()` + `phys_to_virt()`。Zynq 上**没有 AHCI 器件** ⇒ 第一个如实返回 `false`、整条路不可达。后面两个按本项目的规矩返回**调用方已经处理**的失败值（`0` / `NULL`）并计数 | **不打算实现**：ARM 的页模型是 palloc/vmap，没有 x86 那个 HHDM 直映射窗口，编一个假的 `phys_to_virt` 只会把错误推到更远。★ 而"不可达"是**可判的**：板上自检 `fatfs_x86_path`（计数必须 0）就是证据 —— M4A-1.4 实测 0 |
 | D24 | ★ **没有墙钟：`realtime_ns()` 返回的是开机以来的纳秒数** ★ | `src/upstream_api.cpp` 的 `realtime_ns()`（转发到移植侧的 `timer_read_ns()`） | 上游的实现在 `driver/rtc.cpp`，读的是 PC 的 **CMOS**（0x70/0x71 端口）—— Zynq 上**不存在这个器件** ⇒ 那份实现不是"还没搬"，是"搬过来也没有硬件"。FATFS 拿它当挂载时刻与文件 mtime 用 | 出现墙钟源时替换：Zynq PS RTC（`0xF8006000`）驱动，或由控制台设一次时间。★ 它**不是常量**（单调递增），所以"后写的文件更新"这类判断仍然成立；但文件日期是"1970 + 启动秒数"，不是真实日期。★ 同一批里 `mktime()` 是**逐行照搬**上游那份纯算术（含它两处非 ISO 语义），并有宿主机逐日期比对（`tests/test_arm32_fatfs.py`） |
-| D25 | ★ **块层 `blk_device_read` / `blk_device_write` 是"响亮拒绝 + 计数"** ★ | `src/upstream_api.cpp` | 上游实现在 `driver/device.cpp`（216/318/415 行），那个文件**还没进 ARM 图**（卡在分区层与进程层，计划归 M4A-3/B5）。而 ARM 侧今天**根本没有块设备**（`sdhci0` 在描述表里但驱动一行没写）⇒ 这两个函数在当前构建里**不可达**（只有节点挂块设备时 `devfs_read/write` 才会走到） | **M4A-1.3 + M4A-3/B5**：接上真实块设备、把 `driver/device.cpp` 的块层搬进来。★ "不可达"是**可判的**：`arm_blk_device_calls()` 必须恒为 0 —— 板上自检读它 |
+| ~~D25~~ | ★ **块层 `blk_device_read` / `blk_device_write` 是"响亮拒绝 + 计数"** ★ | `src/upstream_api.cpp` | 上游实现在 `driver/device.cpp`（216/318/415 行），那个文件**还没进 ARM 图**（卡在分区层与进程层，计划归 M4A-3/B5）。而 ARM 侧今天**根本没有块设备**（`sdhci0` 在描述表里但驱动一行没写）⇒ 这两个函数在当前构建里**不可达**（只有节点挂块设备时 `devfs_read/write` 才会走到） | ✅ **已结案（M4A-3/B5，2026-09-19）**：换成**端口原生块层**（`src/device.c`：接口与三段式算术照上游，去掉 x86 的 DMA bounce —— 那套只在 HHDM 下成立，侦察量出它拖着 8 个 x86 页层符号）。判据是**宿主单测**（`tests/test_arm32_device.py` 块层一节，真执行）：非对齐偏移 / 跨扇区 / 超 `SECTORS_ONCE` 分块 / ★**非对齐写是读-改-写** / 流设备参数原样转交 / 各条错误返回值。⚠ **板上仍不可达**（还没有块设备，要等 M4A-1.3）⇒ 上板只能证明**没有回归**。⚠ 并纠正一处：原条目写"板上自检读它"，当时**并没有接进报告**（kmain 没读那个计数）—— 文档写了、代码没做 |
 
 #### ★ 与源 OS **一致**、别当成缺功能的几处（M4A-1.2b 核对过）★
 
@@ -3321,6 +3321,20 @@ ARM 上这些位没有意义 —— ARM 的 `/proc/cpuinfo` 必须由 **MIDR/MPI
 接口与 LBA/偏移算术照上游（`blk_device_read/write` 的签名不变），
 但 ARM 侧目的地址**恒为内核地址** ⇒ 不需要 bounce，头 / 整扇区 / 尾三段即可。
 **判据（done 的定义）**：宿主单测钉住扇区算术，含**非对齐偏移**与短读。
+
+#### ✅ 已落地（2026-09-19）
+
+`blk_device_read()` / `blk_device_write()` 现在在 `src/device.c` 里是**真实现**：
+
+- 三段式（头 / 整扇区 / 尾）照上游；**非对齐写是读-改-写**（只改那几个字节）；
+- 去掉 x86 的 bounce 与 direct-span（ARM 侧目的地址恒为内核地址）；
+- 中间整扇区按 `SECTORS_ONCE` **分块**（单次回调的传输量要有上界）；
+- 三处与上游的差异逐条写在 `src/device.c` 的块层一节：
+  去掉 `blk_user_buffer_valid()`（**M7 必须补等价物**）、中转缓冲是 static（不重入）、分块策略。
+
+判据在**宿主**：`tests/test_arm32_device.py` 的块层一节真的跑了一遍扇区算术
+（非对齐 / 跨扇区 / 超 `SECTORS_ONCE` / 读-改-写不动周围字节 / 流设备参数 / 错误返回值）。
+⚠ **板上仍不可达** —— ARM 侧还没有块设备，那要等 M4A-1.3（届时扇区读写才第一次上板）。
 
 ---
 
