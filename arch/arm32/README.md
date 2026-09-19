@@ -3218,6 +3218,34 @@ pipe_short_write 8   pipe_short_read 8
 **同一个符号**（实测两边都未修饰）。这也是上游 `extern device_t device_ctl[26];`
 能直接接到移植侧 C 定义上的原因 —— 别为它去加 `extern "C"`。
 
+#### pty：已起搏，**读写往返还没验**（M4A-1.5 未完成项）
+
+`pty.cpp` 进图的链接缺口只有 **1 个符号**：`snprintf` —— 上游那个**有边界**的
+格式化函数（`serial_port.cpp:761`，声明在 `proto.hpp:31`，**不在** `extern "C"` 里
+⇒ 要修饰名 `_Z8snprintfPcjPKcz`）。移植侧补了一个**有边界的缓冲区汇**
+（`console_vsnprintf`），语义照上游、也是 C99：
+
+- `size == 0` ⇒ 直接返回 0，**连 buf 都不碰**；
+- 最多存 `size - 1` 个字符，结尾**永远**是 NUL；
+- ★ 返回值是"**本该写多长**"，截断时**大于**实际存下的长度
+  （`pty.cpp:164-165` 拿它拼 `/dev/pts/<id>`，按"存了多少"返回会让
+  "名字被截断"看不出来）。
+
+板上判据（`SELF-TEST: 138 passed`）：
+
+```
+pty_init        1   ← pty_init() 跑完且 /dev/ptmx 建出来了
+pty_ptmx_node   1
+```
+
+⚠ **这一笔只到起搏**：配对的**读写往返还没有判据**。形状已经查清
+（`ptmx_open` 会：分配 pair → `calloc` 两块 `PTY_BUFF_SIZE` → 默认 termios →
+取 id → `snprintf(name, "%d", id)` → 在 `/dev/pts` 下建从设备 →
+**把打开的那个节点从 `/dev` 摘下、再挂一个新的 `/dev/ptmx`**）
+⇒ 下一步：`vfs_open("/dev/ptmx")` 拿主设备、`vfs_open("/dev/pts/<id>")` 拿从设备、
+写一端读另一端。**从设备号不要假定是 0**（应从 `/dev/pts` 的子项里取）——
+这条写在这里，免得下一次又"按我以为的"写判据（坑表 57/58 同一类）。
+
 ---
 
 ### 12. 其它待办（AM3 及以后）
