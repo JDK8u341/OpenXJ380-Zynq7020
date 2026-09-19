@@ -10,6 +10,17 @@
 #include "krlibc.h"
 // #include "sprintf.h"
 #include "fs/vfs/vfs.h"
+/*
+ * 2026-09-18:`device.h` 不再 `#include "proto.hpp"`(平台中立重构,见那份头)
+ * 之后,本文件原先**传递地**拿到的两样东西要自己开口要:
+ *
+ *   - `sprintf` —— 它的声明在 `include/proto.hpp:42`(不在 krlibc.h,
+ *     也不在 stdio.h;用预处理定位过);
+ *   - `spin_t` / `spin_lock` / `spin_unlock` —— 第 150 行那个 `RD_lk`
+ *     用它,声明在 `<cpu/lock.h>`(ARM 侧由架构覆盖层给)。
+ */
+#include <proto.hpp>
+#include <cpu/lock.h>
 
 extern device_t device_ctl[26]; // vdisk.c
 
@@ -258,26 +269,37 @@ static int dummy() {
     return -ENOSYS;
 }
 
+/*
+ * ⚠ 指示符必须按 `vfs_callback` 的**声明顺序**排(平台中立修复,2026-09-18)。
+ *
+ * C++20 起指定初始化器要求按声明顺序出现,而 GCC 13 在 C++17 下也执行这条
+ * (clang 宽容,所以 x86 侧一直没暴露)。ARM 侧一编就报:
+ *   error: designator order for field 'vfs_callback::close' does not match
+ *          declaration order in 'vfs_callback'
+ *
+ * 这次只是**把行重新排序**,每个字段指定的值一个都没动 —— 语义完全相同
+ * (指定初始化器本来就与书写顺序无关),顺带让这份代码是合法的 C++20。
+ */
 static struct vfs_callback devfs_callbacks = {
     .mount    = devfs_mount,
     .unmount  = (vfs_unmount_t)empty,
-    .mkdir    = devfs_mkdir,
-    .close    = (vfs_close_t)empty,
-    .stat     = devfs_stat,
     .open     = devfs_open,
+    .close    = (vfs_close_t)empty,
     .read     = devfs_read,
     .write    = devfs_write,
     .readlink = (vfs_readlink_t)dummy,
+    .mkdir    = devfs_mkdir,
     .mkfile   = (vfs_mk_t)empty,
     .link     = (vfs_mk_t)dummy,
     .symlink  = (vfs_mk_t)dummy,
+    .stat     = devfs_stat,
     .ioctl    = devfs_ioctl,
     .dup      = devfs_dup,
-    .resize   = (vfs_resize_t)dummy,
-    .del   = (vfs_del_t)empty,
-    .rename   = (vfs_rename_t)empty,
     .poll     = devfs_poll,
     .map      = devfs_map,
+    .resize   = (vfs_resize_t)dummy,
+    .del      = (vfs_del_t)empty,
+    .rename   = (vfs_rename_t)empty,
 };
 
 void devfs_setup() {

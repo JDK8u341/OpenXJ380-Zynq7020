@@ -67,6 +67,8 @@ DEFAULT_SET = [
     "lib/stdio.cpp",
     # 顺带:设备层与 id 分配器(与 ARM 侧的契约相关)
     "driver/device.cpp", "kernel/id_alloc.cpp",
+    # are_interrupts_enabled() 的调用者(2026-09-18 从 krlibc.h 挪到 cpu/regio.h)
+    "driver/rtc.cpp", "kernel/memory/page.cpp",
 ]
 
 

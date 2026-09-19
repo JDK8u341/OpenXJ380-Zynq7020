@@ -685,6 +685,17 @@ void mount_root()
     write_serial_string("system not found\n");
     while (1)
     {
-        __asm__ volatile("pause\n\t");
+        /*
+         * 平台中立修复(2026-09-18):原先是手写的 `__asm__ volatile("pause\n\t")`。
+         *
+         * `pause` 是 **x86 专属指令** —— ARM 上汇编器直接报
+         * `Error: bad instruction 'pause'`;而它在**文件正文里**,
+         * 头文件层的架构覆盖层救不了它。
+         *
+         * 换成现成的 `cpu_relax()`(`<cpu/lock.h>`):它本来就是干这个的 ——
+         * x86 上展开成 `pause`(**逐指令相同**,行为零变化),
+         * ARM 上由 `arch/arm32/include/upstream/cpu/lock.h` 给 `arch/cpu.h` 的实现。
+         */
+        cpu_relax();
     }
 }

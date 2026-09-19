@@ -11,7 +11,7 @@
  *   `pushfq` / `popfq` / `cli` / `lock btsq` / `mfence` / `pause` ……
  * 它在 ARM 上不是"编出来行为不对",而是**根本编不过**:
  *   error: impossible constraint in 'asm'
- * 而 `driver/fs/**` 里 **9 个上游文件**都直接或间接包含它
+ * 而 `driver/fs` 下 **9 个上游文件**都直接或间接包含它
  * (vfs.cpp / tmpfs.cpp / dev.cpp / pty.cpp / socketfs.cpp / unixsock.cpp /
  *  dnsfs.cpp / pipefs.cpp / procfs.cpp)⇒ 不解决它,VFS 就搬不动。
  *
@@ -43,12 +43,28 @@
  * 与上游的两处已知差异(都是刻意的,不是遗漏)
  * ====================================================================
  *
- * - 上游那个头还 `#include <task/scheduler.h>`。这里没有跟着包含:
- *   那份是 x86 的调度器头,而 ARM 侧用 `<arch/sched.h>`。
- *   谁需要调度器就自己包含自己的 —— "用了什么就包含什么"。
  * - `spin_t` 的字段名是 `locked`/`cpsr`,上游是 `lock`/`rflags`。
  *   这是**架构事实的反映**(见 arch/cpu.h 的说明),不是笔误;
  *   任何"逐字段比对上下游"的检查都不该要求这两个名字相同。
  */
 
 #include <arch/cpu.h>
+
+/*
+ * ★ 这里刻意**跟着上游**一起包含 `<task/scheduler.h>`。
+ *
+ * 上游那份 `cpu/lock.h` 的头部有这一行,而 driver/fs 下的文件里
+ * (pipefs.cpp / unixsock.cpp / vfs.cpp)靠**它**拿到
+ * `scheduler_yield` / `scheduler_sleep_ns` / `scheduler_wake_task`。
+ * 覆盖层第一版漏了它,于是那些文件报 "was not declared in this scope" ——
+ * 看起来像缺 API,其实是**少了一层传递包含**。
+ *
+ * 覆盖层的职责是"同名同契约",这里面**包括上游顺带提供的包含关系** ——
+ * 否则就不是替换,而是悄悄改了依赖图。
+ *
+ * ★ 好消息:实测 `<task/scheduler.h>` **在 ARM 上编得过**(rc=0,零错误)——
+ *   与计划 §0.5.7 的预判一致("`scheduler.h` 本身架构无关可直接复用")。
+ *   所以这里直接用上游那一份,不另写影子(影子会漂移,而契约测试钉不住它)。
+ */
+#include <task/scheduler.h>
+

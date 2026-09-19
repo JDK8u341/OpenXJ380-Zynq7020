@@ -2,7 +2,25 @@
 
 #define SECTORS_ONCE 8
 
-#include "proto.hpp"
+/*
+ * 平台中立重构(2026-09-18):这一行原先是 `#include "proto.hpp"`。
+ *
+ * 这是**最后一处**把整个 x86 内核主干拖进文件系统接口链的过度包含 ——
+ * `proto.hpp` 拉 `<ps2/keyboard.h>`、`<efi/fbc.h>`、mm 下的头文件、
+ * `<smp/smp.h>`,还在里面留了一个 `static inline uint64_t rdtsc();`
+ * 的**空声明**(GCC 报 `-Werror=unused-function`)。
+ *
+ * 本文件真正用到的基础类型只有 size_t / uint8_t / uint64_t / bool / errno_t
+ * (逐个查过:唯一的其它复合类型 `struct vecbuf` 来自下面那个 vbuffer.h),
+ * 而它们全在 `<krlibc.h>`(它再带 `<stdint.h>`)里。
+ *
+ * 为什么必须改:上游 `driver/fs/vfs/vfs.cpp` 包含本文件,而 VFS 是要在
+ * **两个架构上共用**的 —— 它不该因为"设备表里有个 uint8_t"就把键盘和
+ * 显存的头拖进来。
+ *
+ * 按计划 §7.2,上游文件只在平台中立重构时改动、每处都有理由。
+ */
+#include "krlibc.h" /* size_t / uint8_t / uint64_t / bool / errno_t */
 #include "vbuffer.h"
 #include <fs/vfs/vfs.h>
 

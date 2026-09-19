@@ -125,6 +125,25 @@ typedef struct _device
  */
 extern device_t device_ctl[DEVICE_TABLE_SIZE];
 
+/*
+ * ★ 从下面这一行起,所有函数声明都放进 `extern "C"`(2026-09-18)。
+ *
+ * 为什么必须:**移植侧的实现是 C**(src/device.c),导出的符号是未修饰的
+ * `regist_device`;而上游的 C++ 文件(如 driver/fs/vfs/vfs.cpp)默认按
+ * **C++ 名字修饰**去找它 —— 实测链不上,报的是
+ *     undefined reference to `regist_device(char const*, _device)'
+ * (注意那是修饰过的签名)。加上 `extern "C"` 之后两边对上。
+ *
+ * ⚠ 对 x86 **零影响**:那边用的是上游自己的 `include/device.h`,
+ *   根本不包含本文件。
+ *
+ * 这条与"上游 C++ 导出 C 符号 + 移植侧给 C 声明"那条边界规矩是**对称**的:
+ * 这里是反过来 —— C 实现 + C++ 调用方。
+ */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* ---- 设备管理器 ---- */
 
 /*
@@ -208,3 +227,7 @@ void devfs_reset(void);
  * 与本项目其它几组 A/B 同样的性质:**预期它坏**。
  */
 void devfs_ab_set_disabled(u32 on);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif

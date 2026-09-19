@@ -1,5 +1,8 @@
 #include "rtc.h"
 #include "proto.hpp"
+/* `are_interrupts_enabled()`(第 29/44 行用它)—— 2026-09-18 它从
+ * <krlibc.h> 挪回了 x86 该在的 `cpu/regio.h`,这里要自己包含。 */
+#include <cpu/regio.h>
 
 
 #define CMOS_ADDR 0x70 // CMOS 地址寄存器

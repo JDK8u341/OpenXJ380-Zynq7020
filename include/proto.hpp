@@ -116,8 +116,21 @@ void mtrr_save();
 void mtrr_restore();
 
 // kernel/cpu/delay.cpp
-// 读取TSC
-static inline uint64_t rdtsc();
+/*
+ * 平台中立修复(2026-09-18):这里原有一行
+ *     static inline uint64_t rdtsc();
+ * 已删除 —— 它是一条**悬空的声明**。
+ *
+ * `rdtsc()` 的唯一定义在 `kernel/cpu/delay.cpp:9`,而且是 `static`
+ * (文件局部);全仓库没有任何其它定义,调用者也只有 delay.cpp 自己
+ * (第 27/29 行)。所以对**任何**包含 proto.hpp 的翻译单元来说,
+ * 这个声明都承诺了一个永远不会出现的定义。
+ *
+ * clang 对此不吭声,x86 侧一直没暴露;GCC 报
+ *     error: 'uint64_t rdtsc()' declared 'static' but never defined
+ *     [-Werror=unused-function]
+ * ARM 侧一编上游 driver/fs/vfs/vfs.cpp(它经 device.h 走到这里)就炸。
+ */
 void                   delay(uint32_t count);
 uint64_t               get_cpu_freq_mhz();
 void                   delay_us(uint64_t us);

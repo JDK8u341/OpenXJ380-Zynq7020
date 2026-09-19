@@ -16,6 +16,12 @@
 #include "task/pcb.h"
 #include <ioctl.h>
 #include <cpu/lock.h>
+/*
+ * `are_interrupts_enabled()`(第 1334 行用它)。2026-09-18 之前它住在
+ * <krlibc.h> 里,靠传递包含就够;把它挪回 x86 该在的 `cpu/regio.h`
+ * 之后,这里必须自己开口要 —— "用了什么就包含什么"。
+ */
+#include <cpu/regio.h>
 // #include "pipefs.h"
 #include <syscall/syscall.h>
 #include <device.h>

@@ -33,9 +33,23 @@ static inline bool check_user_overflow(uint64_t addr, uint64_t size) {
     return size > (KERNEL_AREA_MEM - addr);
 }
 
+/*
+ * 平台中立修复(2026-09-18):原先是 `(void)(0, ##__VA_ARGS__);`。
+ *
+ * 那个前缀 `0` 只有一个用途 —— 让**零参数**调用 `UNUSED()` 也能展开
+ * (`##__VA_ARGS__` 会把逗号吃掉,得到 `(void)(0)`)。代价是:逗号左边
+ * 那个 `0` 在 GCC 眼里是"求了值却没用",报 `-Werror=unused-value`;
+ * clang 不报这一条 ⇒ x86 侧(用 clang 编)一直看不出来,
+ * ARM 侧(用 GCC 13)一编上游 `driver/fs/vfs/vfs.cpp` 就炸。
+ *
+ * 改成直接 `(void)(__VA_ARGS__)`:
+ *   - 两边编译器都干净;
+ *   - **并且更严格**:零参数调用会当场编不过,而不是被悄悄容忍。
+ *     全仓库 24 处 `UNUSED(...)` 用法**没有一处**是空参数的(已扫过)。
+ */
 #define UNUSED(...)                                                                                \
     do {                                                                                           \
-        (void)(0, ##__VA_ARGS__);                                                                  \
+        (void)(__VA_ARGS__);                                                                       \
     } while (0)
 #define waitif(cond)                                                                                                   \
     ((void)({                                                                                                          \
@@ -194,14 +208,20 @@ int atoi(const char *pstr);
  */
 int skip_atoi(const char **s);
 
-static inline bool are_interrupts_enabled()
-{
-    uint64_t rflags = 0;
-    __asm__ volatile("pushfq\n\t"
-                     "pop %0"
-                     : "=r"(rflags));
-    return (rflags & (1 << 9)) != 0;
-}
+/*
+ * `are_interrupts_enabled()` 原先长在这里 —— 已挪到 `include/cpu/regio.h`
+ * (平台中立重构,2026-09-18)。
+ *
+ * 理由:它读的是 **x86 的 RFLAGS.IF**,是**架构相关**的东西,却住在一个
+ * 平台中立的"libc"头里。后果不是"不优雅"而是**编不过**:
+ * 移植侧(ARMv7-A)编到它时,汇编器报 `Error: bad instruction 'pushfq'`。
+ * 而它是 `static inline`,只有被调用才会生成代码 —— 所以这个雷一直埋着,
+ * 直到上游 `driver/fs/vfs/vfs.cpp`(它调用它)被编进 ARM 才响。
+ *
+ * 新家 `cpu/regio.h` 本来就是 x86 的控制寄存器/标志头(get_cr0/get_rflags/
+ * flush_tlb 都在那儿);ARM 侧由 arch/arm32/include/upstream/cpu/regio.h
+ * 提供同名同语义的实现。
+ */
 static inline char *LeadingWhitespace(char *beg, char *end)
 {
     while (end > beg && *--end <= 0x20)

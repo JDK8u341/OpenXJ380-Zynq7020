@@ -252,6 +252,7 @@ errno_t pipefs_stat(void *file, vfs_node_t node) {
     return EOK;
 }
 
+/* 指示符按 `vfs_callback` 的声明顺序排 —— 理由见 dev.cpp 的同名注释 */
 static struct vfs_callback pipefs_callbacks = {
     .mount    = pipefs_mount,
     .unmount  = (vfs_unmount_t)empty,
@@ -264,14 +265,14 @@ static struct vfs_callback pipefs_callbacks = {
     .mkfile   = (vfs_mk_t)empty,
     .link     = (vfs_mk_t)dummy,
     .symlink  = (vfs_mk_t)dummy,
-    .del   = (vfs_del_t)empty,
-    .rename   = (vfs_rename_t)empty,
-    .map      = (vfs_mapfile_t)empty,
     .stat     = pipefs_stat,
     .ioctl    = (vfs_ioctl_t)pipefs_ioctl,
-    .poll     = pipefs_poll,
     .dup      = (vfs_dup_t)empty,
+    .poll     = pipefs_poll,
+    .map      = (vfs_mapfile_t)empty,
     .resize   = (vfs_resize_t)dummy,
+    .del      = (vfs_del_t)empty,
+    .rename   = (vfs_rename_t)empty,
 };
 
 void pipefs_setup() {

@@ -9,6 +9,7 @@
 #include <fs/partition.h>
 #include <fs/vfs/devfs.h>
 #include <fs/vfs/vfs.h>
+#include <cpu/regio.h> /* are_interrupts_enabled()(第 762 行)—— 2026-09-18 从 krlibc.h 挪来这里 */
 #include <krlibc.h>
 #include <mm/frame.h>
 #include <pci/pci.h>
