@@ -594,13 +594,14 @@ ARM32_UPSTREAM_CXX = (
     # 的临时品;C++ 规则到位后就该删掉、改回共用这一份(源 OS 优先)。
     "kernel/id_alloc.cpp",
     #
-    # ⬜ **下一步(尚未加入)**:`driver/fs/vfs/vfs.cpp`(1433 行)与
-    #    `driver/fs/vfs/tmpfs.cpp`(323 行)。
+    # ✅ `driver/fs/vfs/vfs.cpp`(1433 行)与 `driver/fs/vfs/tmpfs.cpp`(323 行)
     #
-    #    实测状态(2026-09-18):这两个文件**已经能编过**(`-c`,零错误)——
-    #    卡住它们的是**链接**,缺 18 个符号,清单在
-    #    `docs/ZYNQ7020_PORT_PLAN.md` §4.6 的 M4A-1.2b 行里。
-    #    加进来之前内核会链不上(那是**有意的**:不拿空壳假装兼容)。
+    #    **链接缺口已经清零**(2026-09-19)。缺口是一步步关掉的:
+    #      18 → 11(`a8de6d2`:落地层补进程层最小切片与一批 getter)
+    #      11 →  2(同批:id_alloc/lock_queue 到位后重测)
+    #       2 →  0(本次:`sprintf` / `write_serial_fmt` —— 定义在 C++ 落地层,
+    #              转发到 console.c 里重构后的格式化核心)
+    #    清单与理由见 `docs/ZYNQ7020_PORT_PLAN.md` §4.6 的 M4A-1.2b 行。
     #
     #    它们能编过的前提都已经落地:平台中立的头重构(vfs.h / list.h /
     #    device.h 去掉 proto.hpp)、架构覆盖层(cpu/lock.h、cpu/regio.h)、
@@ -610,24 +611,13 @@ ARM32_UPSTREAM_CXX = (
     #    `kernel/lock_queue.cpp` —— 提供 VFS 缺的 `queue_get`/`queue_dequeue`/
     #    `queue_destroy`,实测在 ARM 上零错误编过。
     #
-    # ⚠ **当前状态:这两个文件还没接进构建图**(加了内核会链不上)。
-    #    `lock_queue.cpp` 与 `ARCH32_PORT_CXX` 那个落地层现在**没有调用者** ——
-    #    这是一个**过渡态**,不是完成态。等下面那 11 个符号补齐、vfs.cpp 进来
-    #    之后它们立刻就是承重的。记在这里以免被当成"没人用的代码"删掉:
-    #    每一条都是**实测撞出来的链接缺口**,不是提前造的东西。
-    #
-    # ⬜ 剩余 11 个符号(2026-09-18 实测;加起来就是 M4A-1.2b 剩下的工作面):
-    #    get_current_task() / kernel_group / get_current_directory()
-    #        → **进程层最小切片**(上游的 pcb_t/tcb_t;移植侧有 tcb 但没有 pcb)
-    #    sprintf(char*, const char*, ...) / write_serial_fmt(const char*, ...)
-    #        → 格式化器。上游在 driver/serial/serial_port.cpp(那是 x86 串口驱动,
-    #          ARM 编不了);移植侧 console.c 里有一个,但只往串口写、不往缓冲区写
-    #    get_random_bytes(void*, unsigned int) → rng(上游 kernel/rng.cpp 用 x86 指令)
-    #    free_frames(uint64_t, uint32_t) / page_map_range_to_random(page_directory*, ...)
-    #        → x86 页层(mmap 路径);ARM 的 vmap/page 模型不同,要单独想清楚
-    #    get_keyboard_input() / p_xapi_output_kernel(const char*) / pathacat
-    #        → 逐个查(前两个看着像 x86 输入与 XAPI 输出)
+    # ⚠ 仍然**没有调用者**的是:落地层里的 `page_map_range_to_random` /
+    #   `scheduler_wake_task` / `get_current_directory`(都是"响亮拒绝"式实现),
+    #   以及 VFS 本体 —— 后者要等 heap 与 `vfs_init()` 接上(M4A-1.2 的验收项)。
+    #   这是**过渡态**,不是完成态 —— 记在这里以免被当成"没人用的代码"删掉。
     "kernel/lock_queue.cpp",
+    "driver/fs/vfs/vfs.cpp",
+    "driver/fs/vfs/tmpfs.cpp",
 )
 
 # 移植侧的 C++ 源文件(**只有落地层**)。
@@ -740,7 +730,16 @@ def arm32_graph(n: Ninja, out_path: Path) -> list[Path]:
     # `char` 默认无符号)。上游文件只该看见上游的世界。
     n.var("arm_cxx_cflags", " ".join(f for f in ARM32_COMMON_FLAGS if f != "-I./arch/arm32/include"))
     n.var("arm_arch_flags", " ".join(ARM32_ARCH_FLAGS))
-    n.var("arm_ldflags", f"-nostdlib -T {ARM32_SOURCE_ROOT}/boot/kernel.ld -Wl,-Map=out/kernel-arm.map")
+    # ⚠ `-Wl,-z,muldefs`(= --allow-multiple-definition)**不是移植侧发明的**:
+    # 源 OS 自己的内核链接就带这个标志(见本文件 x86 内核的链接命令:
+    # `ld -z muldefs -T linker.ld --static ...`)。
+    # 为什么非它不可:`include/fs/vfs/list.h` 在**头文件里直接定义**了
+    # `list_delete` 一族(不是 inline、不是 static)。上游 x86 侧只有一个
+    # TU(vfs.cpp)包含它,所以没暴露;ARM 侧一旦有两个 TU 包含
+    # (vfs.cpp 与落地层 upstream_api.cpp),ld 就报 multiple definition。
+    # ⇒ 与源 OS 保持同一条链接语义,而不是去改上游头(list.h 是公共 ABI 头)。
+    n.var("arm_ldflags",
+          f"-nostdlib -T {ARM32_SOURCE_ROOT}/boot/kernel.ld -Wl,-z,muldefs -Wl,-Map=out/kernel-arm.map")
     n.line()
 
     # Source discovery stays explicit: the ARM tree is small and every file in

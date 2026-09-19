@@ -193,7 +193,26 @@ void init_heap();
 // kernel/memory/frame.cpp
 void init_frame(MEMORY_MAP map);
 void free_frames(uint64_t addr, size_t size);
-void free_frame(uint64_t addr)
+
+/*
+ * 平台中立修复(2026-09-18):这一行原先**没有 `inline`** ——
+ * 一个在头文件里定义的普通函数。
+ *
+ * 后果不是"不优雅",而是**每个包含 proto.hpp 的翻译单元都会生成一个
+ * 全局符号 `free_frame`,并且因此拖着 `free_frames`** —— 哪怕它一次都
+ * 没被调用过(实测:`nm -u tmpfs.o` 里有 `free_frames`,而 tmpfs.cpp
+ * 全文没有一处调用 `free_frame`/`free_frames`)。
+ *
+ * 这在 x86 上只是白白多几个符号;到了移植侧就是**硬链接错误**:
+ * ARM 没有 x86 的 buddy 帧分配器,`free_frames` 无处可来。
+ *
+ * 加上 `inline` 之后,没用到的 TU 不再生成它。C++ 里 `inline` 还顺带
+ * 解决了"同一份定义出现在多个 TU"的 ODR 问题(原先靠各 TU 定义完全一致
+ * 侥幸不报错)。
+ *
+ * 这是 proto.hpp 里**唯一**一处"头文件里定义的非 inline 函数"(已扫过)。
+ */
+inline void free_frame(uint64_t addr)
 {
     free_frames(addr, 1);
 }

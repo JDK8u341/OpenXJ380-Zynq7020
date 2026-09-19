@@ -19,10 +19,81 @@ void console_puts(const char *str);
 
 /*
  * 格式化输出。支持:
- *   %c %s %d %i %u %x %X %p %%  以及 %08x / %-8s 这类宽度与 0 填充
- * 不支持浮点、不支持 64 位长度修饰符(需要时再扩)。
+ *   %c %s %d %i %u %o %x %X %b %p %n %%
+ *   标志 - 0 #(以及被接受但**不生效**的 + 与空格)
+ *   宽度(含 `*`)、精度(含 `.*`)、长度修饰符 hh h l ll L z t j
+ *
+ * ⚠ M4A-1.2 起这一族不再是"移植侧自己的小格式化器",而是**源 OS 的语义**:
+ *   同一个核心(console.c 的 `format_core`)供三个入口共用 ——
+ *   `console_printf`(控制台)、`write_serial_fmt`(串口)、`sprintf`(内存缓冲区),
+ *   正如源 OS 的 `vwprintf(Writer *, ...)` 供 `write_serial_fmt`/`sprintf`/`printk` 共用
+ *   (driver/serial/serial_port.cpp:463)。
+ *
+ *   为什么要做到这个程度:**长度修饰符缺失会让实参错位**。
+ *   上游到处在打 `%llx`(kernel/memory/page.cpp:416 等),解析器若不认识 `l`,
+ *   就不会取走那个 64 位实参,后面**每一个**实参都会取到别人的值 ——
+ *   那不是"打得难看",是打出错误的数据。
+ *
+ * 不支持:浮点(`%f` 一族)。源 OS 支持,移植侧没有浮点格式化需求,
+ *         需要时按同样的结构补(见 README 的退化清单)。
+ *
+ * 与源 OS 的**已知差异**(都记在 README 退化清单):
+ *   1. 未知格式符:移植侧**原样吐出** `%x` 里的那个字符便于查错;
+ *      源 OS 是**直接结束**(serial_port.cpp:382-384 的 `return 0`)。
+ *   2. `+` 与空格标志:接受、但不产生正号。源 OS 生效。
+ *   3. `%p`:形状与源 OS 一致(`0x` + 按指针宽度零填充),
+ *      但宽度随架构 —— 32 位 ARM 上是 8 位,源 OS 的 x86_64 上是 16 位。
  */
+/* ------------------------------------------------------------------ */
+/* 格式化的**可变参数**入口                                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * `va_list` 由编译器内建提供,不用 <stdarg.h>:本项目是 -nostdinc,
+ * 而且上游与移植两侧都不该依赖 C 库头文件(上游那份
+ * `include/stdarg.h` 也是同样一行 typedef)。
+ * 两种写法是**同一个类型**,所以 C 侧与 C++ 侧的声明能对上。
+ */
+typedef __builtin_va_list va_list_t;
+
 void console_printf(const char *fmt, ...);
+
+/* 把已展开的可变参数打出去(console_printf 就是它的一层薄壳) */
+int console_vprintf(const char *fmt, va_list_t args);
+
+/* 把已展开的可变参数格式化进缓冲区,返回写入的字符数(不含结尾 NUL) */
+int console_vsprintf(char *buf, const char *fmt, va_list_t args);
+
+/* ------------------------------------------------------------------ */
+/* ★ 源 OS 同名导出:sprintf / write_serial_fmt 为什么**不在**这里 ★   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 上游的 VFS/tmpfs 会直接调 `sprintf`(路径拼接)与 `write_serial_fmt`
+ * (tty 输出),所以链接期必须有这两个符号。**但它们不能由 C 侧给出**:
+ *
+ *   `include/proto.hpp` 里这两条声明**不在** `extern "C"` 块内
+ *   (proto.hpp:38 与 :42),所以上游调用点要的是**经过 C++ 名字修饰**的符号。
+ *   实测(`arm-none-eabi-nm out/arm32/upstream/driver/fs/vfs/vfs.o`):
+ *
+ *       U _Z16write_serial_fmtPKcz
+ *       U _Z7sprintfPcPKcz
+ *
+ *   ⇒ 在 C 里定义 `sprintf` 得到的是**未修饰**符号,链接器照样报
+ *     `undefined reference to 'sprintf(char*, char const*, ...)'`,
+ *     而这一点从源码上完全看不出来 —— 只有 nm 才知道。
+ *
+ * ⇒ 那两个符号由 **C++ 落地层**(`arch/arm32/src/upstream_api.cpp`)给出,
+ *   在那里只是转发到本文件的 `console_vprintf` / `console_vsprintf`:
+ *   **实现只有一份**(在这里),符号形状则由上游的声明决定。
+ *   所以本头文件**刻意不声明** `sprintf` / `write_serial_fmt` ——
+ *   一份 C 链接的同名声明在这里就是个陷阱,契约测试
+ *   (tests/test_arm32_console.py)专门盯着"它没有被加回来"。
+ *
+ * ⚠ 无边界检查 —— 名字就叫 sprintf,和源 OS 一样危险。
+ *   上游另有 `snprintf` 做安全版本(serial_port.cpp:761);移植侧暂时只有这一个,
+ *   调用点必须自己保证缓冲区够大。
+ */
 
 /* 直接写入 32 位十六进制,便于打印寄存器 */
 void console_put_hex32(u32 value);
