@@ -139,6 +139,19 @@ static int h_vsprintf(char *buf, const char *fmt, ...)
     return written;
 }
 
+/* 有边界的那个(M4A-1.5):落地层定义上游 `snprintf` 时走的就是它 */
+static int h_vsnprintf(char *buf, size_t size, const char *fmt, ...)
+{
+    va_list args;
+    int     written;
+
+    va_start(args, fmt);
+    written = console_vsnprintf(buf, size, fmt, args);
+    va_end(args);
+
+    return written;
+}
+
 /* ------------------------------------------------------------------ */
 /* 测试骨架                                                            */
 /* ------------------------------------------------------------------ */
@@ -378,6 +391,57 @@ int main(void)
     }
 
     /*
+     * ================================================================
+     * ★ 有边界的版本(上游 `snprintf`,M4A-1.5)★
+     * ================================================================
+     *
+     * 语义照上游 `serial_port.cpp:761-790`(也是 C99):
+     *   - `size == 0` ⇒ 直接返回 0,**连 buf 都不碰**;
+     *   - 最多存 `size - 1` 个字符,结尾**永远**是 NUL;
+     *   - ★ 返回值是"**本该写多长**",截断时**大于**实际存下的长度。
+     *     最后那一条最容易搞错:`pty.cpp:164-165` 拿它拼 `/dev/pts/<id>`
+     *     的名字,按"存了多少"返回会让"名字被截断"这件事看不出来。
+     */
+    {
+        char buf[16];
+        int  n;
+
+        n = h_vsnprintf(buf, sizeof(buf), "%s", "hello");
+        check("snprintf fits len", n == 5);
+        expect_buf("snprintf fits", buf, "hello");
+
+        /* 刚好放下:4 字节的缓冲放 3 个字符 + NUL */
+        n = h_vsnprintf(buf, 4u, "abc");
+        check("snprintf exact len", n == 3);
+        expect_buf("snprintf exact", buf, "abc");
+
+        /* ★ 截断:返回**本该**的长度 10,但只存下 7 个 */
+        n = h_vsnprintf(buf, 8u, "abcdefghij");
+        check("snprintf trunc returns would-be", n == 10);
+        expect_buf("snprintf trunc stores size-1", buf, "abcdefg");
+
+        /* size == 1:一个字符都存不下,但结尾必须仍然是 NUL(空串) */
+        n = h_vsnprintf(buf, 1u, "abc");
+        check("snprintf size1 returns would-be", n == 3);
+        expect_buf("snprintf size1 empty", buf, "");
+
+        /* size == 0:**不碰 buf**(哨兵必须原封不动),返回 0 */
+        memset(buf, 'Z', sizeof(buf));
+        n = h_vsnprintf(buf, 0u, "abc");
+        check("snprintf size0 returns 0", n == 0);
+        check("snprintf size0 leaves buf alone", buf[0] == 'Z');
+
+        /*
+         * 数字与宽度在截断下也一样(格式化核心是同一份)。
+         * ⚠ `size = 6` ⇒ 最多存 **5** 个字符(`size - 1`)+ NUL ——
+         *   第一版这里把期望写成了 6 个字符,于是判据自己错了(代码是对的)。
+         */
+        n = h_vsnprintf(buf, 6u, "%08X", 0x1234u);
+        check("snprintf bounded number len", n == 8);
+        expect_buf("snprintf bounded number", buf, "00001");
+    }
+
+    /*
      * ---- 排他输出(M4-8.4;★ M4-11.1 起本文件只做"转发" ★)----
      *
      * ⚠ 判据在 M4-11.1 **必须**改,而且理由来自上板实测:
@@ -579,7 +643,7 @@ class Arm32UpstreamFormatterContract(unittest.TestCase):
     UPSTREAM_KRLIBC = "user/xapi/include/krlibc.h"
     LANDING_LAYER = "arch/arm32/src/upstream_api.cpp"
     PORT_HEADER = "arch/arm32/include/arch/console.h"
-    SYMBOLS = ("sprintf", "write_serial_fmt")
+    SYMBOLS = ("sprintf", "write_serial_fmt", "snprintf")
 
     def _upstream(self, name: str) -> tuple[str, tuple[str, ...]]:
         for relative in (self.UPSTREAM_PROTO, self.UPSTREAM_KRLIBC):

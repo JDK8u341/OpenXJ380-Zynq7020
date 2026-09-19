@@ -53,6 +53,7 @@
 #include <mm/page.h>
 #include <mutex.h> /* mutex_t:落地层要给出上游那三个 C++ 链接的互斥函数(M4A-1.4) */
 #include <pipe.h>  /* pipe_info_t / pipe_specific_t / PIPE_BUFF(M4A-1.5 的管道)*/
+#include <pty.h>   /* pty_init()(M4A-1.5:伪终端)*/
 #include <rtc.h>   /* tm / mktime / realtime_ns(纯算术部分照搬上游,见下) */
 #include <stdarg.h> /* va_list:下面那两条格式化转发要展开可变参数 */
 #include <task/pcb.h>
@@ -73,6 +74,7 @@ uint64_t timer_read_ns(void);        /* arch/timer.h:27 —— FATFS 的时间�
 void     console_puts(const char *); /* arch/console.h:18 */
 int      console_vprintf(const char *fmt, va_list args);             /* arch/console.h:34 */
 int      console_vsprintf(char *buf, const char *fmt, va_list args); /* arch/console.h:37 */
+int      console_vsnprintf(char *buf, size_t size, const char *fmt, va_list args); /* arch/console.h:52 */
 }
 /*
  * ⚠ `arch_irq_disable()` / `arch_irq_enable()` **刻意没有**在这里声明:
@@ -434,6 +436,32 @@ int sprintf(char *buf, const char *fmt, ...)
 
     va_start(args, fmt);
     written = console_vsprintf(buf, fmt, args);
+    va_end(args);
+
+    return written;
+}
+
+/*
+ * ★ 有边界的版本(名字就叫 `snprintf`,与源 OS 一致)★
+ *
+ * 声明:`include/proto.hpp:31` `int snprintf(char *buf, size_t size, const char *fmt, ...);`
+ * 实现在上游是 `driver/serial/serial_port.cpp:761`(x86 串口驱动,ARM 编不了)。
+ *
+ * ⚠ 与 `sprintf` 同样的形状问题:上游这条声明**不在** `extern "C"` 里 ⇒
+ *   `driver/fs/vfs/pty.cpp` 要的是**修饰名** `_Z8snprintfPcjPKcz`
+ *   (`nm` 实测的未定义符号就是这个;写成 C 链接的 `snprintf` 会链接失败)。
+ *
+ * ⚠ 返回值语义(与上游、也与 C99 一致):**截断时返回"本该写多长"**,
+ *   不是"实际存了多少"。`pty.cpp:164-165` 就是拿它拼 `/dev/pts/<id>` 的名字,
+ *   两边搞混会让"名字被截断"这件事看不出来。
+ */
+int snprintf(char *buf, size_t size, const char *fmt, ...)
+{
+    va_list args;
+    int     written;
+
+    va_start(args, fmt);
+    written = console_vsnprintf(buf, size, fmt, args);
     va_end(args);
 
     return written;
@@ -1136,6 +1164,34 @@ extern "C" int arm_devfs_node_exists(const char *path)
     }
     vfs_close(node);
     return 1;
+}
+
+/*
+ * ---- pty 起搏(M4A-1.5)----
+ *
+ * ← `driver/fs/vfs/pty.cpp:725` 的 `void pty_init()`(C++ 链接 `_Z8pty_initv`)。
+ * 内部 = `id_allocator_create()` + `vfs_regist` ×2(`ptyfs_master`/`ptyfs_slave`)
+ * + **要求 `/dev` 已经在**(它 `vfs_open("/dev")` 并建 `/dev/ptmx` 与 `/dev/pts`)。
+ *
+ * ⚠ 位置约束:`pty_init()` **必须在 `arm_devfs_setup()` 之后** —— 它自己会
+ *   `write_serial_fmt("pty: /dev not ready\n")` 然后**静默返回**(什么都不建),
+ *   而那种失败在报告里会表现成"pty 相关的项全是 0",很难一眼归因。
+ *   ⇒ 这里把"有没有建成"变成返回值的一部分:`/dev/ptmx` 在不在。
+ *
+ * ## 这一笔**只到起搏**,配对的读写往返是下一步
+ *
+ * 完整验收的形状已经查清(`ptmx_open` 会:分配 pair → `calloc` 两块
+ * `PTY_BUFF_SIZE` 缓冲 → 默认 termios → 取 id → **`snprintf(name, "%d", id)`**
+ * (这就是 pty 需要那个格式化符号的原因) → 在 `/dev/pts` 下建从设备节点 →
+ * **把打开的那个节点从 `/dev` 摘下、再挂一个新的 `/dev/ptmx`**)
+ * ⇒ 下一步:`vfs_open("/dev/ptmx")` 拿主设备、`vfs_open("/dev/pts/<id>")`
+ *   拿从设备、写一端读另一端。⚠ 从设备号不要**假定**是 0 —— 应该从
+ *   `/dev/pts` 的子项里取(留待那一步实现)。
+ */
+extern "C" int arm_pty_init(void)
+{
+    pty_init();
+    return arm_devfs_node_exists("/dev/ptmx") ? 0 : -1;
 }
 
 /* ====================================================================

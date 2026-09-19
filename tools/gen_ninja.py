@@ -650,6 +650,17 @@ ARM32_UPSTREAM_CXX = (
     #      选上游(源 OS 优先)顺带把"devfs 骨架"那条退化项消掉。
     "driver/fs/vfs/dev.cpp",
     "driver/fs/vfs/pipefs.cpp",
+    #
+    # ✅ **pty(M4A-1.5)**。链接缺口只有 **1 个符号**:`snprintf(char*, size_t, …)`
+    #    —— 上游那个**有边界**的格式化函数(`serial_port.cpp:761`),声明在
+    #    `proto.hpp:31`(**不在** `extern "C"` 里 ⇒ 要的是修饰名
+    #    `_Z8snprintfPcjPKcz`,所以定义在 C++ 落地层,转发布移植侧
+    #    `console_vsnprintf()` 那个有边界的缓冲区汇)。
+    #
+    # ⚠ 这一笔**只到起搏**:`pty_init()` 已被调用(板上判据 `pty_init`/`pty_ptmx_node`),
+    #   但**配对的读写往返还没有判据** —— 形状已查清(见 upstream_api.cpp 的
+    #   pty 一节:从设备号不能假定是 0),留作下一步。
+    "driver/fs/vfs/pty.cpp",
 )
 
 # 移植侧的 C++ 源文件(**只有落地层**)。

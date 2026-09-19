@@ -64,6 +64,20 @@ int console_vprintf(const char *fmt, va_list_t args);
 /* 把已展开的可变参数格式化进缓冲区,返回写入的字符数(不含结尾 NUL) */
 int console_vsprintf(char *buf, const char *fmt, va_list_t args);
 
+/*
+ * ★ 有边界版本(M4A-1.5,给落地层定义上游 `snprintf` 用)★
+ *
+ * 语义照上游 `serial_port.cpp:761-790`(那也是 C99 的语义):
+ *   - `size == 0` ⇒ **直接返回 0**,连 buf 都不碰;
+ *   - 最多存 `size - 1` 个字符,**结尾永远是 NUL**;
+ *   - 返回值是"**本该写多长**"(截断时**大于**实际存下的长度),不是存了多少。
+ *
+ * ⚠ 最后那一条是这一族函数最容易搞错的地方:按"存了多少"返回会让
+ *   调用方以为写完了(上游 `pty.cpp:165` 就是拿它做 `slave_name`,
+ *   截断与否必须能看出来)。
+ */
+int console_vsnprintf(char *buf, size_t size, const char *fmt, va_list_t args);
+
 /* ------------------------------------------------------------------ */
 /* ★ 源 OS 同名导出:sprintf / write_serial_fmt 为什么**不在**这里 ★   */
 /* ------------------------------------------------------------------ */

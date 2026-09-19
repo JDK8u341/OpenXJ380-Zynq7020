@@ -1431,6 +1431,11 @@ static u32 g_heap_bind_ab;
 /* 落地层转发(M4A-1.5;VFS 的 API 是 C++ 链接的,理由见 upstream_api.cpp) */
 extern void arm_devfs_setup(void);
 extern int  arm_devfs_node_exists(const char *path);
+extern int  arm_pty_init(void);
+
+/* pty 起搏的结果(M4A-1.5)。⚠ 读写往返还没做,见 9.45d 的说明 */
+static u32 g_pty_init;
+static u32 g_pty_node;
 
 static u32 g_device_roundtrip;
 static u32 g_device_devfs_ab;
@@ -2629,6 +2634,20 @@ void kmain(void)
 
         console_printf(" Device A/B  : pre-mount=%u post-mount=%u after-delete=%u\n",
                        (u32)pre_missing, (u32)post_found, (u32)gone_after);
+
+        /*
+         * ---- pty 起搏(M4A-1.5)----
+         *
+         * ⚠ 必须**紧跟 `arm_devfs_setup()`**:`pty_init()` 自己要求 `/dev` 已在
+         *   (它 `vfs_open("/dev")` 并建 `/dev/ptmx`、`/dev/pts`),失败时它只是
+         *   打一行然后静默返回 —— 那种失败在报告里会表现成"pty 的项全 0",
+         *   很难一眼归因,所以返回值里带上"`/dev/ptmx` 建出来没有"。
+         *
+         * ⚠ 这一笔**只到起搏**:配对的读写往返是下一步(形状已查清并写在
+         *   `upstream_api.cpp` 的 pty 一节里 —— 关键是从设备号**不能假定**是 0)。
+         */
+        g_pty_init = (arm_pty_init() == 0) ? 1u : 0u;
+        g_pty_node = arm_devfs_node_exists("/dev/ptmx") ? 1u : 0u;
     }
 
     /* ---- 9.45c ★ FATFS 起搏 + RAM 盘验收(M4A-1.4)★ ---- */
@@ -3931,6 +3950,16 @@ void kmain(void)
      */
     selftest_report("device_roundtrip", g_device_roundtrip, 1u, SELFTEST_EQ);
     selftest_report("device_devfs_ab", g_device_devfs_ab, 1u, SELFTEST_EQ);
+
+    /*
+     * pty 起搏(M4A-1.5)。⚠ **只到起搏**:`pty_init()` 跑完且 `/dev/ptmx` 建出来了;
+     * 配对的读写往返**还没有判据**(见 9.45d 的说明与 README 的 M4A-1.5 一节)。
+     * 这两条判据的区分度有限(`pty_init` 失败时它自己会打一行日志),
+     * 之所以仍然要留,是为了把"pty 这一段到底走到哪"在报告里说清楚 ——
+     * 而不是让"没有 pty 判据"看起来像"pty 没必要验"。
+     */
+    selftest_report("pty_init", g_pty_init, 1u, SELFTEST_EQ);
+    selftest_report("pty_ptmx_node", g_pty_node, 1u, SELFTEST_EQ);
 
     /*
      * ---- VFS 起搏 + tmpfs 验收(M4A-1.2b 的验收项)----

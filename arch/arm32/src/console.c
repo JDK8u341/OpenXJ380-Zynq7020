@@ -680,6 +680,60 @@ int console_vsprintf(char *buf, const char *fmt, va_list_t args)
     return state.len;
 }
 
+/*
+ * ★ 有边界的缓冲区汇(M4A-1.5,给上游的 `snprintf` 用)★
+ *
+ * 与上面那个 `buf_sink_t` 的差别只有一个:**写满就不写了**,但**照样计数**。
+ * 计数是关键 —— 上游 `snprintf` 的返回值在截断时返回的是"**本该写多长**"
+ * (`serial_port.cpp:761-790`:`return (int)(data.truncated ? result : data.idx);`
+ * 而 `result` 是格式化出的总字符数)。C99 也是这个语义,两者一致。
+ */
+typedef struct {
+    char *buf;
+    int   len;
+    int   limit; /* 最多能存几个字符(不含结尾 NUL)*/
+} bounded_buf_sink_t;
+
+static void sink_buffer_bounded(void *ctx, char c)
+{
+    bounded_buf_sink_t *state = (bounded_buf_sink_t *)ctx;
+
+    if (state->len < state->limit) {
+        state->buf[state->len] = c;
+    }
+    state->len++;
+}
+
+int console_vsnprintf(char *buf, size_t size, const char *fmt, va_list_t args)
+{
+    fmt_out_t          out;
+    bounded_buf_sink_t state;
+    int                stored;
+
+    /* ⚠ 与上游一致:`size == 0` **直接返回 0**,连碰都不碰 buf */
+    if (buf == NULL || size == 0u) {
+        return 0;
+    }
+
+    state.buf   = buf;
+    state.len   = 0;
+    state.limit = (int)size - 1;
+
+    buf[0] = '\0';
+
+    out.sink    = sink_buffer_bounded;
+    out.ctx     = &state;
+    out.written = 0;
+
+    format_core(&out, fmt, args);
+
+    /* 截断时结尾照样要有 NUL —— 位置是"实际存下的那几个字符之后" */
+    stored         = (state.len < state.limit) ? state.len : state.limit;
+    buf[stored]    = '\0';
+
+    return state.len; /* ← 截断时是"本该多长",不是"存了多少" */
+}
+
 void console_printf(const char *fmt, ...)
 {
     va_list_t args;
