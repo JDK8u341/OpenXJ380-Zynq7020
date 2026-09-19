@@ -706,11 +706,26 @@ ARM32_UPSTREAM_EXCLUDED = (
     ),
     (
         "driver/device.cpp",
-        "块层(`device_read`/`blk_device_*`/`device_mmap`/bounce 缓冲)。"
-        "它依赖**分区层**与 x86 的帧分配器(`alloc_frames`/`phys_to_virt`)"
-        "⇒ 属 M4A-3/B5 的工作面。今天 ARM 侧那两个符号是\"响亮拒绝 + 计数\""
-        "(README 退化清单 D25,`arm_blk_device_calls()` 必须恒为 0)。"
-        "解开条件:M4A-1.3(真实块设备)+ M4A-3/B5。",
+        "块层本体(`device_read`/`blk_device_*`/`device_mmap`/bounce 缓冲)。"
+        "★ M4A-3/B5 侦察实测(2026-09-19):这个文件**能干净编过** ARM"
+        "(`-c` rc=0,11.5KB 目标文件),但把它接进图的**真缺口是 11 个符号**,"
+        "其中 **8 个是 x86 的页层**:`_Z14page_map_rangeP14page_directoryyyyy`、"
+        "`_Z16unmap_page_rangeP14page_directoryyy`、`_Z17translate_addressP14page_directoryy`、"
+        "`_Z17page_virt_to_physy`、`_Z20page_table_get_flagsP14page_directoryyPy`、"
+        "`_Z11free_framesyj`、`_Z19driver_phys_to_virt`、`_Z19driver_virt_to_phys`;"
+        "再加进程层 `_Z13lazy_tryallocP21process_control_blocky`(属 M7)、"
+        "分区层 `partition_device_added`(可搬)、`mutex_trylock`(落地层补一行转发即可)。"
+        "★ 那 8 个**不是欠账而是架构差异**:上游 `blk_device_read()` 里有一整套"
+        "**DMA bounce 缓冲 + direct-span 判定**(`blk_acquire_bounce`/"
+        "`blk_direct_span_bytes`),它的存在理由是\"用户缓冲区可能不在 DMA 安全窗口里\" —— "
+        "那只有 x86 的 HHDM 布局下才成立。"
+        "⇒ ARM 的答案是**另写一份端口原生块层**(同样的接口与 LBA/偏移算术,"
+        "但目的地址恒为内核地址 ⇒ 不需要 bounce,头/整扇区/尾三段即可),"
+        "而不是拿假实现把这 11 个符号顶上去。"
+        "解开条件:实现端口原生 `blk_device_read/write`(M4A-3/B5),"
+        "并用宿主单测钉住扇区算术(含**非对齐偏移**与短读);"
+        "今天那两条是\"响亮拒绝 + 计数\"(README 退化清单 D25,"
+        "`arm_blk_device_calls()` 必须恒为 0)。",
     ),
 )
 
