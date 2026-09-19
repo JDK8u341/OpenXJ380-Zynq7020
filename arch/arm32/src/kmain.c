@@ -44,6 +44,7 @@
 #include <arch/types.h>
 #include <arch/uart_ps.h>
 #include <arch/vfs_check.h>
+#include <arch/fatfs_check.h>
 
 /* libc 子集。M4A-1.1a 起 malloc/free 也在里面(见 arch/kmalloc.h) */
 #include <krlibc.h>
@@ -1436,6 +1437,9 @@ static u32 g_device_devfs_ab;
  */
 static vfs_check_t g_vfs;
 
+/* FATFS 验收的实测读数(M4A-1.4)。同样是"一次探针运行"的整张表 */
+static fatfs_check_t g_fatfs;
+
 /* SMP 压力测试的结果,供自检报告使用 */
 static smp_stress_result_t g_smp_stress;
 
@@ -2572,6 +2576,21 @@ void kmain(void)
         const vfs_check_t *vfs = vfs_check_run();
 
         g_vfs = *vfs;
+    }
+
+    /* ---- 9.45c ★ FATFS 起搏 + RAM 盘验收(M4A-1.4)★ ---- */
+    /*
+     * 位置:紧跟在 VFS 起搏之后。FATFS 要挂在一个**已经存在的 VFS** 上
+     * (它把卷当成 `vfs_node_t` 用,见 `diskio.cpp`),所以顺序不能反。
+     *
+     * 三个取舍(RAM 盘 = tmpfs 文件、FAT16、以及为什么不用上游那个
+     * 写死 FAT32 的辅助函数)写在 `arch/fatfs_check.h` 的文件头与
+     * `upstream_api.cpp` 的 FATFS 一节 —— 一句话:这个 OS 的块层就是 VFS。
+     */
+    {
+        const fatfs_check_t *fatfs = fatfs_check_run();
+
+        g_fatfs = *fatfs;
     }
 
     /* ---- 9.46 内核栈池 + guard page(M4-5) ---- */
@@ -3876,6 +3895,48 @@ void kmain(void)
     selftest_report("vfs_list_before", (u32)g_vfs.list_before, 0u, SELFTEST_EQ);
     selftest_report("vfs_cwd_root", (u32)g_vfs.cwd_root, 1u, SELFTEST_EQ);
     selftest_report("vfs_negative_ok", (u32)g_vfs.negative_ok, 1u, SELFTEST_EQ);
+
+    /*
+     * ---- FATFS 验收(M4A-1.4):挂载 + 读写文件 + 与主机侧比对 ----
+     *
+     * 三条判据的分工与理由见 <arch/fatfs_check.h>。这里点出两处最容易看漏的:
+     *
+     *   - `fatfs_volume_fsid` 要求**三个 fsid 两两不同** —— 根 / tmpfs / fatfs
+     *     三个文件系统实例同时在场。只判"fatfs 的 fsid >= 0"是没有区分度的:
+     *     挂载失败时 `/mnt` 会退回成根文件系统的一个普通目录,fsid 照样 >= 0。
+     *   - `fatfs_x86_path` 必须 **0**:x86 的预读路径会用到 `alloc_frames` /
+     *     `phys_to_virt`(ARM 上没有),那两个函数是"响亮拒绝 + 计数"。
+     *     计数恒 0 就是"那条路确实没跑"的证据 —— 否则"能读写"可能来自
+     *     一条本来就不该存在的路径。
+     */
+    selftest_report("fatfs_init", (u32)((g_fatfs.init == 0) ? 1u : 0u), 1u, SELFTEST_EQ);
+    selftest_report("fatfs_ramdisk", (u32)((g_fatfs.ramdisk == 0) ? 1u : 0u), 1u, SELFTEST_EQ);
+    selftest_report("fatfs_ramdisk_size", (u32)g_fatfs.ramdisk_size, FATFS_CHECK_VOLUME_BYTES,
+                    SELFTEST_EQ);
+    selftest_report("fatfs_format", (u32)((g_fatfs.format == 0) ? 1u : 0u), 1u, SELFTEST_EQ);
+    selftest_report("fatfs_mount", (u32)((g_fatfs.mount == 0) ? 1u : 0u), 1u, SELFTEST_EQ);
+    selftest_report("fatfs_create", (u32)((g_fatfs.create == 0) ? 1u : 0u), 1u, SELFTEST_EQ);
+    selftest_report("fatfs_write", (u32)g_fatfs.write, 32u, SELFTEST_EQ);
+    selftest_report("fatfs_read", (u32)g_fatfs.read, 32u, SELFTEST_EQ);
+    selftest_report("fatfs_roundtrip", (u32)g_fatfs.roundtrip, 1u, SELFTEST_EQ);
+    /* 挂载点下至少要有刚建的那个文件 */
+    selftest_report("fatfs_list", (u32)((g_fatfs.list_after >= 1) ? 1u : 0u), 1u, SELFTEST_EQ);
+    selftest_report("fatfs_volume_fsid",
+                    (u32)((g_fatfs.fsid_mnt >= 0 && g_fatfs.fsid_mnt != g_fatfs.fsid_root &&
+                           g_fatfs.fsid_mnt != g_fatfs.fsid_tmp &&
+                           g_fatfs.fsid_root != g_fatfs.fsid_tmp) ? 1u : 0u),
+                    1u, SELFTEST_EQ);
+    selftest_report("fatfs_x86_path", (u32)g_fatfs.x86_calls, 0u, SELFTEST_EQ);
+    /* 引导扇区:板子这一侧只做最便宜的四项;宿主机侧脚本会独立再核一遍 */
+    selftest_report("fatbs_read", (u32)g_fatfs.bs_len, 512u, SELFTEST_EQ);
+    selftest_report("fatbs_signature", (u32)g_fatfs.bs_sig_ok, 1u, SELFTEST_EQ);
+    selftest_report("fatbs_bytes_per_sector", (u32)g_fatfs.bs_bytes_per_sector, 512u, SELFTEST_EQ);
+    selftest_report("fatbs_total_sectors", (u32)g_fatfs.bs_total_sectors,
+                    FATFS_CHECK_VOLUME_BYTES / 512u, SELFTEST_EQ);
+    /* ⚠ 只判**族**标签("FAT" 开头)。子类型(FAT12/16)由 FatFs 按簇数自选,
+       板子这边写死过一次 FAT16 ⇒ 对一个正确的卷报了假 FAIL。
+       子类型交给宿主机用算术独立推(tmp-test/verify_fat_bootsector.py)。 */
+    selftest_report("fatbs_fat_family", (u32)g_fatfs.bs_fat_family_ok, 1u, SELFTEST_EQ);
 
     /* 至少 32MB 可用 —— 判据写小了等于没判 */
     selftest_report("heap_size_ok", (g_heap.total_bytes >= (32u * 1024u * 1024u)) ? 1u : 0u, 1u, SELFTEST_EQ);

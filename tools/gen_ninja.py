@@ -618,6 +618,25 @@ ARM32_UPSTREAM_CXX = (
     "kernel/lock_queue.cpp",
     "driver/fs/vfs/vfs.cpp",
     "driver/fs/vfs/tmpfs.cpp",
+    #
+    # ✅ **FATFS(M4A-1.4)**。5 个文件全部**零修改**编过(`-c`),链接缺口
+    #    **正好 8 个符号** —— 两个来源:
+    #      fatfs.cpp   mutex_create/lock/unlock、mktime、realtime_ns、
+    #                  ahci_is_qemu_environment
+    #      diskio.cpp  ahci_is_qemu_environment、alloc_frames、phys_to_virt
+    #    全部是 **C++ 链接**(`_Z12mutex_createP5mutexb` 实测),所以实现在
+    #    C++ 落地层、**不能**写 `extern "C"`(与 VFS 那组正好相反,见
+    #    tests/test_arm32_fatfs.py 的开头)。落地层的取舍见
+    #    `arch/arm32/src/upstream_api.cpp` 的 FATFS 一节。
+    #
+    #    ⚠ `ffunicode.cpp` 是 2MB 的表(Unicode 大小写/码页),`ff.cpp` 322KB。
+    #      它们只在配置打开 LFN 时才会被真正用到,但**必须链进来**
+    #      (`FF_USE_LFN 3`)。编译时间因此明显变长,这是它的正常代价。
+    "driver/fs/fatfs/ff.cpp",
+    "driver/fs/fatfs/ffunicode.cpp",
+    "driver/fs/fatfs/ffsystem.cpp",
+    "driver/fs/fatfs/diskio.cpp",
+    "driver/fs/fatfs/fatfs.cpp",
 )
 
 # 移植侧的 C++ 源文件(**只有落地层**)。

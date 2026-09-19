@@ -44,10 +44,14 @@
  *   `arch/cpu.h`、`arch/timer.h` 里(它们已被板上自检覆盖)。
  */
 
+#include <fs/fatfs/fatfs.h> /* fatfs_init / FATFS 的格式化与挂载(M4A-1.4) */
+#include <fs/fatfs/ff.h>     /* f_mkfs / MKFS_PARM / FM_FAT / FF_MAX_SS */
 #include <fs/vfs/vfs.h>
 #include <krlibc.h>
 #include <lock_queue.h>
 #include <mm/page.h>
+#include <mutex.h> /* mutex_t:落地层要给出上游那三个 C++ 链接的互斥函数(M4A-1.4) */
+#include <rtc.h>   /* tm / mktime / realtime_ns(纯算术部分照搬上游,见下) */
 #include <stdarg.h> /* va_list:下面那两条格式化转发要展开可变参数 */
 #include <task/pcb.h>
 #include <task/scheduler.h>
@@ -63,6 +67,7 @@ void     sched_yield(void);        /* arch/sched.h:434 */
 void     sched_sleep_ns(uint64_t); /* arch/sched.h:507 */
 void     sched_wake_task(void *);  /* arch/sched.h:515 —— 参数类型见下面的说明 */
 uint32_t timer_read_ticks_low(void); /* arch/timer.h:24 */
+uint64_t timer_read_ns(void);        /* arch/timer.h:27 —— FATFS 的时间戳用它(M4A-1.4) */
 void     console_puts(const char *); /* arch/console.h:18 */
 int      console_vprintf(const char *fmt, va_list args);             /* arch/console.h:34 */
 int      console_vsprintf(char *buf, const char *fmt, va_list args); /* arch/console.h:37 */
@@ -578,4 +583,415 @@ extern "C" int arm_vfs_cwd_is_root(void)
     tcb_t task = get_current_task();
 
     return (task != NULL && task->cwd != NULL && task->cwd == get_rootdir()) ? 1 : 0;
+}
+
+/* ====================================================================
+ * ★★ FATFS 需要的 8 个符号(M4A-1.4)★★
+ * ====================================================================
+ *
+ * 把 `driver/fs/fatfs/` 那 5 个文件(含 2MB 的 `ffunicode.cpp`)编进 ARM 后,
+ * 链接缺口**正好 8 个**,全部来自两个上游文件:
+ *
+ *     driver/fs/fatfs/fatfs.cpp   mutex_create / mutex_lock / mutex_unlock
+ *                                 mktime / realtime_ns / ahci_is_qemu_environment
+ *     driver/fs/fatfs/diskio.cpp  ahci_is_qemu_environment
+ *                                 alloc_frames / phys_to_virt
+ *
+ * ## ⚠ 这 8 个**不能**写成 `extern "C"`
+ *
+ * 实测目标文件里的名字:
+ *
+ *     $ arm-none-eabi-nm out/arm32/upstream/driver/fs/fatfs/fatfs.o | grep ' U '
+ *     U _Z12mutex_createP5mutexb      U _Z6mktimeP2tm
+ *     U _Z10mutex_lockP5mutex         U _Z11realtime_nsv
+ *     U _Z12mutex_unlockP5mutex       U _Z24ahci_is_qemu_environmentv
+ *     $ ... diskio.o
+ *     U _Z12alloc_framesj             U _Z12phys_to_virty
+ *
+ * 全是**修饰名**(上游这些声明都不在 `extern "C"` 块里)。
+ * ⇒ 写成 `extern "C"` 就是坑表 55 那个错误的重演:C 侧给出未修饰符号,
+ *   而调用点要的是修饰过的,**源码上两个名字一模一样**。
+ * ⇒ 所以下面这 8 个定义**故意不带** `extern "C"`,而且它们产生的修饰名
+ *   由 `tests/test_arm32_fatfs.py` 对着上游目标文件的符号表钉住。
+ */
+
+/* ---- ① 互斥锁:转发到移植侧那把已验证的 yield 型互斥 ---- */
+
+/*
+ * ⚠ 上游 `mutex_t` 与移植侧 `mutex_t` **布局不同**,不能互相 reinterpret:
+ *
+ *     上游: { spin_t lock; state; owner; lock_queue *wait_queue; size_t rcc; rec; }
+ *     移植: {               state; owner;                       u32 rcc;    rec; }
+ *
+ * 移植侧**刻意**省掉了 `spin_t lock`(锁由 `enter_state`/`leave_state`
+ * 钩子负责)与 `wait_queue`(源 OS 的实现里它只在 create/destroy 出现过,
+ * 是化石 —— 见 arch/mutex.h)。
+ *
+ * ⇒ 做法:把上游那个对象当成**一块不透明存储**交给移植侧那把 mutex 用
+ *   (移植侧只占前 16 字节,而**上游的对象更大**)。这样:
+ *     - 不复制第二套互斥逻辑 —— 语义只有一份,就是 M4-11.1 板上验过的;
+ *     - 不动移植侧那个已验证的结构 —— 它的证据链保持完整;
+ *     - 状态存在**上游对象自己**里,不需要旁表,也不需要额外分配。
+ *
+ * ⚠ 前提有两条,各有一条静态断言或契约测试钉住:
+ *     1. 移植侧 `mutex_t` 只占 16 字节(`src/mutex.c` 的 `_Static_assert`);
+ *     2. ARM 图里**没有**上游的 mutex 实现(`kernel/task/mutex.cpp` 不在
+ *        构建里)⇒ 那 16 字节在 ARM 上只有这一条读写路径。
+ *        下面那条 `static_assert` 是第 2 条的另一半:上游对象必须**够大**。
+ */
+extern "C" {
+void arm_mutex_create(void *m, bool recursive);
+int  arm_mutex_lock(void *m);
+int  arm_mutex_unlock(void *m);
+}
+
+static_assert(sizeof(mutex_t) >= 16u,
+              "上游 mutex_t 必须至少容得下移植侧那份 mutex 的 16 字节存储");
+
+void mutex_create(mutex_t *mtx, bool recursive)
+{
+    arm_mutex_create(mtx, recursive);
+}
+
+int mutex_lock(mutex_t *mtx)
+{
+    return arm_mutex_lock(mtx);
+}
+
+int mutex_unlock(mutex_t *mtx)
+{
+    return arm_mutex_unlock(mtx);
+}
+
+/* ---- ② 时间:文件时间戳 ---- */
+
+/*
+ * `mktime(tm *)` —— **逐行照搬** `driver/rtc.cpp:100-127`(连同它依赖的
+ * `is_leap_year` 与 `days_in_month`)。
+ *
+ * 为什么不直接编 `driver/rtc.cpp`:那个文件 = CMOS 读写(0x70/0x71 端口)
+ * + 纯算术。Zynq 上**没有 CMOS 这个器件**,整份搬过来只能靠假端口访问
+ * 顶上去 —— 那正是本项目禁止的做法(见 `get_current_directory()` 那条)。
+ * 而 `mktime` 是**纯算术**,照搬它没有任何硬件假设。
+ *
+ * ⚠ 上游这个 `mktime` **不是** ISO C 的语义,照搬必须连这两点一起搬:
+ *     1. `tm_year` 是**完整年份**(不是"1900 起的年数");
+ *     2. `tm_mon` 是 **1..12**(不是 ISO 的 0..11)。
+ *   `driver/fs/fatfs/fatfs.cpp:293-312` 正是按这两点构造 `tm` 的
+ *   (`year = 1980 + …`、`month = 1..12`)⇒ 移植侧**必须**保持同一语义,
+ *   否则文件时间会**整体错位**而且不报错。
+ *   `tests/test_arm32_fatfs.py` 把这里和上游那份**逐日期比对**。
+ */
+static const int g_days_in_month[2][12] = {
+    {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31},
+    {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31},
+};
+
+static bool arm_is_leap_year(int year)
+{
+    return (year % 4 == 0) && ((year % 100 != 0) || (year % 400 == 0));
+}
+
+int64_t mktime(tm *time)
+{
+    int64_t seconds = 0;
+    int     leap;
+
+    int year  = time->tm_year;
+    int month = time->tm_mon - 1;
+    month -= (month > 11) ? 11 : 0;
+    int day = time->tm_mday - 1;
+
+    for (int y = 1970; y < year; y++) {
+        leap = arm_is_leap_year(y);
+        seconds += (365 + leap) * 86400;
+    }
+
+    leap = arm_is_leap_year(year);
+    for (int m = 0; m < month; m++) {
+        seconds += g_days_in_month[leap][m] * 86400;
+    }
+
+    seconds += day * 86400;
+    seconds += time->tm_hour * 3600;
+    seconds += time->tm_min * 60;
+    seconds += time->tm_sec;
+
+    return seconds;
+}
+
+/*
+ * `realtime_ns()` —— 墙钟。**ARM 侧今天没有墙钟**:
+ * 上游实现在 `driver/rtc.cpp:180`,读 PC 的 CMOS。Zynq 上没有那个器件
+ * ⇒ 那份实现不是"还没搬",而是"搬过来也没有硬件"。
+ *
+ * ⇒ 返回**开机以来的纳秒数**(移植侧的全局定时器),记进 README 的退化清单
+ *   (D24):文件时间戳是"启动后的相对时间",不是真实日期。
+ *   替换条件:出现墙钟源(Zynq PS RTC 驱动,或由控制台设一次时间)。
+ *
+ * ⚠ 它**不是常量**,也不是 0:FATFS 会把它当"挂载时刻"和"mtime"用,
+ *   单调递增才让"后写的文件更新"这类判断成立。
+ */
+uint64_t realtime_ns()
+{
+    return timer_read_ns();
+}
+
+/* ---- ③ x86 专属的两个符号:响亮拒绝 + 计数器 ---- */
+
+/*
+ * 先看这三个为什么绑在一起:
+ *
+ *   `diskio.cpp` 的预读优化(**QEMU/AHCI 专用**)流程是
+ *       fatfs_readahead_allowed()  ← 就是 ahci_is_qemu_environment()
+ *         → fatfs_cache_ensure()  → alloc_frames() + phys_to_virt()
+ *
+ * `ahci_is_qemu_environment()` 在 Zynq 上如实返回 **false** —— 这不是
+ * 假实现,是**正确回答**("这台机器上没有 AHCI")。后果是整条预读路径
+ * 在 ARM 上**不可达**,而 `alloc_frames` / `phys_to_virt` 只被那条路径调用。
+ *
+ * ⇒ 那两个函数按本项目的规矩做**响亮拒绝**,返回值取调用方**已经处理**的
+ *   失败值(于是即使真被调用也不会把错误推到更远的地方):
+ *        alloc_frames → 0      (`if (phys == 0) return false;`)
+ *        phys_to_virt → NULL   (`if (cache->data == NULL) return false;`)
+ *
+ * ★ 而"不可达"这件事是**可判的**,不是嘴上说的:
+ *   两个函数各自计数,计数必须**恒为 0** —— 板上自检读它
+ *   (`arm_fatfs_x86_path_calls`)。这就是"预读确实没跑"的证据。
+ */
+static unsigned int g_fatfs_x86_path_calls;
+
+bool ahci_is_qemu_environment()
+{
+    /* Zynq 上没有 AHCI 控制器 ⇒ 不是"QEMU 的 AHCI 环境"。如实回答。 */
+    return false;
+}
+
+uint64_t alloc_frames(size_t count)
+{
+    (void)count;
+    g_fatfs_x86_path_calls++;
+    /* 0 = 分配失败(调用方按失败处理)。ARM 侧的页分配器是 palloc,
+       它不是 x86 那个"帧"模型 —— 见 README 的退化清单 D23。 */
+    return 0;
+}
+
+void *phys_to_virt(uint64_t phys_addr)
+{
+    (void)phys_addr;
+    g_fatfs_x86_path_calls++;
+    /* ARM 没有 x86 那个 HHDM 直映射窗口。返回 NULL 让调用方按失败处理。 */
+    return NULL;
+}
+
+extern "C" unsigned int arm_fatfs_x86_path_calls(void)
+{
+    return g_fatfs_x86_path_calls;
+}
+
+/* ====================================================================
+ * ★★ FATFS 起搏 + 验收转发(M4A-1.4)★★
+ * ====================================================================
+ *
+ * ## 为什么 RAM 盘是一个 **tmpfs 文件**
+ *
+ * 计划 §4.6 的**决策 3**:"M4A-1.4 先接 RAM 盘 …… RAM 盘与真实块设备走
+ * **完全相同**的 `diskio` 路径"。查过 `diskio.cpp` 之后,这条路比预想的更直:
+ *
+ *     disk_read(pdrv, buff, sector, count)
+ *        → fatfs_get_node_by_number(pdrv)      // 一个 **vfs_node_t**
+ *        → vfs_read(node, buff, sector*512, count*512)
+ *
+ * **这个 OS 的块层就是 VFS**:没有独立的 `block_device_t`,`disk_*` 全部
+ * 落成"按字节偏移读写一个 VFS 节点"。于是"RAM 盘"= 一个能按偏移读写的
+ * 节点,而 tmpfs 文件**本来就是**那个东西(M4A-1.2b 已在板上验过
+ * 建/读/写/列目录,以及 32 字节往返)。⇒ **零新增块驱动代码**,
+ * 而且走的正是决策 3 说的那条同路径。
+ *
+ * ## 为什么格式化用 `FM_FAT`(FAT12/16 族)、而不是上游那个 `fatfs_format_node()`
+ *
+ * 上游的格式化辅助函数把 `opt.fmt` **写死成 `FM_FAT32 | FM_SFD`**
+ * (`driver/fs/fatfs/fatfs.cpp:57`)。FAT32 按规范要求卷内至少 ~65525 个簇
+ * (512 字节簇 ⇒ **≥ 34MB**),而这个 RAM 盘要装在内核堆里,堆是
+ * **正好 32MB**(`src/kmain.c` 的 `HEAP_PAGES = 8192`)⇒ **装不下**。
+ *
+ * ⇒ 不往上堆内存(那是拿"改大内存"掩盖设计),改用 `FM_FAT | FM_SFD`
+ *   调**同一个上游 API** `f_mkfs()`。差别只在**格式化参数**:
+ *   同一份 FATFS 代码、同一个 `diskio`、同一套挂载机制。
+ *
+ * ⚠ **子类型(FAT12 还是 FAT16)不由我们指定** —— `FM_FAT` 只说是这一族,
+ *   由 FatFs 按算出来的簇数自己选(`ff.cpp:6718` 附近那段重试逻辑)。
+ *   8MB 的卷上**实测选到 FAT12**,不是 FAT16:
+ *       8 扇区/簇(4KB)⇒ 2043 簇 ⇒ FAT 占 **7 扇区**
+ *       (2043 簇的 FAT12 需要 ceil(2043*1.5/512) = 6 扇区;FAT16 需要 8 扇区)
+ *   这条是**量出来的,不是推出来的**:板子把引导扇区原样打出来,
+ *   宿主机独立解析后得到的结论(`tmp-test/verify_fat_bootsector.py`)。
+ *   我原先在移植侧写死"必须是 FAT16",于是对一个**正确**的卷报了假 FAIL
+ *   —— 记在坑表里,免得下次又在"我以为什么"上写判据。
+ *
+ * ## 为什么不用上游的 `fatfs_format_node(node)`
+ *
+ * 除了上面那条 FAT32 的硬限制,还有一条更本质的:它内部走
+ * `alloc_number()` —— 那是 `fatfs.cpp` 里的 **`static`** 函数,落地层拿不到;
+ * 而 `drive_number_mapping` 是**非 static** 的全局数组(`fatfs.cpp:20`)。
+ * ⇒ 落地层自己挑一个空槽位填节点,再调 `f_mkfs`(与上游辅助函数
+ *   同一套三步:填映射 → `f_mkfs` → `f_unmount` → 清映射)。
+ */
+
+/* `driver/fs/fatfs/fatfs.cpp:20`(非 static,上游自己在 diskio.cpp 里也 extern 它)*/
+extern vfs_node_t drive_number_mapping[10];
+
+/* 卷最大 10 个(上游就是 10)*/
+#define ARM_FATFS_DRIVES 10
+
+static int arm_fatfs_free_drive(void)
+{
+    for (int i = 0; i < ARM_FATFS_DRIVES; i++) {
+        if (drive_number_mapping[i] == NULL) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+extern "C" int arm_fatfs_init(void)
+{
+    /* ← `driver/fs/fatfs/fatfs.cpp:831`:`mutex_create()` + `vfs_regist("fatfs", …)`。
+       返回 void,所以"注册失败"只能从它自己打的那行日志看出来;这里返回 0。 */
+    fatfs_init();
+    return 0;
+}
+
+/*
+ * 建 RAM 盘文件并把大小撑开。
+ *
+ * ⚠ `vfs_resize()` **吞掉** resize 回调的失败(回调是 `void`),所以
+ *   "设成功了没有"**不能靠它的返回值** —— 这里重新打开一次、把
+ *   `node->size` **读回来**交出去。判据看的是读回来的值。
+ *   `disk_size()` 用的正是 `node->size / 512`(`diskio.cpp:186`),
+ *   所以这一步不成立,后面 `f_mkfs` 会因为"卷里 0 个扇区"而失败。
+ */
+extern "C" int arm_fatfs_make_ramdisk(const char *path, unsigned int bytes)
+{
+    vfs_node_t node;
+    int        rc;
+
+    rc = (int)vfs_mkfile(path);
+    if (rc != 0) {
+        return -1;
+    }
+
+    node = vfs_open(path);
+    if (node == NULL) {
+        return -2;
+    }
+
+    (void)vfs_resize(node, (uint64_t)bytes);
+
+    node = vfs_open(path);
+    if (node == NULL) {
+        return -3;
+    }
+    return (node->size == (size_t)bytes) ? 0 : -4;
+}
+
+extern "C" unsigned long arm_fatfs_node_size(const char *path)
+{
+    vfs_node_t node = vfs_open(path);
+
+    return (node == NULL) ? 0UL : (unsigned long)node->size;
+}
+
+/*
+ * 格式化(FAT16)。三步与上游 `fatfs_format_node()` 一致:
+ * 占一个 drive 槽 → `f_mkfs("N:", …)` → `f_unmount("N:")`。
+ */
+extern "C" int arm_fatfs_format(const char *path)
+{
+    char      drive_path[4];
+    void     *work;
+    MKFS_PARM opt;
+    FRESULT   res;
+    int       drive;
+
+    vfs_node_t node = vfs_open(path);
+
+    if (node == NULL) {
+        return -1;
+    }
+
+    drive = arm_fatfs_free_drive();
+    if (drive < 0) {
+        return -2;
+    }
+    drive_number_mapping[drive] = node;
+
+    drive_path[0] = (char)('0' + drive);
+    drive_path[1] = ':';
+    drive_path[2] = '\0';
+    drive_path[3] = '\0';
+
+    memset(&opt, 0, sizeof(opt));
+    opt.fmt   = FM_FAT | FM_SFD; /* FAT12/16 族,无分区表(超级软盘布局)。
+                                    子类型由 FatFs 按簇数自选 —— 8MB 上实测 FAT12 */
+    opt.n_fat = 1;
+
+    work = malloc((size_t)FF_MAX_SS);
+    if (work == NULL) {
+        drive_number_mapping[drive] = NULL;
+        return -3;
+    }
+
+    res = f_mkfs(drive_path, &opt, work, (uint)FF_MAX_SS);
+    free(work);
+    f_unmount(drive_path);
+
+    drive_number_mapping[drive] = NULL;
+
+    return (res == FR_OK) ? 0 : (int)res;
+}
+
+/*
+ * 挂载:`vfs_mount(src, 挂载点目录)`。
+ *
+ * `vfs_mount()` 的实现是"**挨个试每个已注册文件系统的 mount 回调**"
+ * (`vfs.cpp:246` 的 `for (i = 1; i < fs_nextid; i++)`),所以这里不需要
+ * 指名道姓说"用 fatfs",把路径交出去即可 —— 这也是源 OS `mount_root()`
+ * 的用法。`src` 是**路径**(RAM 盘文件),于是 `fatfs_mount()` 里
+ * `is_virtual_fs(src)` 为假、走"把路径 `vfs_open()` 成卷"那条分支。
+ */
+extern "C" int arm_fatfs_mount(const char *src, const char *mnt)
+{
+    vfs_node_t node;
+
+    /* 目录可能已经存在(重复调用),所以**不看返回值**,看能不能打开 */
+    (void)vfs_mkdir(mnt);
+
+    node = vfs_open(mnt);
+    if (node == NULL) {
+        return -1;
+    }
+    if (node->type != file_dir) {
+        return -2;
+    }
+    return ((int)vfs_mount(src, node) == 0) ? 0 : -3;
+}
+
+/*
+ * 把 RAM 盘的**原始扇区**读出来(按字节偏移 0 读 len 字节)。
+ *
+ * 这是"**与主机侧比对**"那条验收判据的入口(计划 §4.6 M4A-1.4 的验收写法):
+ * 板子把卷的引导扇区原样打出来,宿主机用**自己的** FAT 解析去核
+ * (0x55AA 结束标志、BPB 里的 bytes/sector、total sectors 是否等于我们
+ * 设的 8MB、FAT16 的类型串)。板子自说自话不算数 —— 那正是本项目
+ * "证据分层"的第三条:**让另一个系统去读同一个产物**。
+ */
+extern "C" int arm_fatfs_read_raw(const char *path, void *buf, unsigned int len)
+{
+    vfs_node_t node = vfs_open(path);
+
+    if (node == NULL) {
+        return -1;
+    }
+    return (int)vfs_read(node, buf, 0u, (size_t)len);
 }

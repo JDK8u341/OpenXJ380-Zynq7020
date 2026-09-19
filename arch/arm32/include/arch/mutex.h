@@ -149,6 +149,34 @@ bool  mutex_is_locked(mutex_t *m);
 tcb_t mutex_get_owner(mutex_t *m);
 
 /* ------------------------------------------------------------------ */
+/* ★ 落地层入口(M4A-1.4):只换名字、不换语义 ★                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 为什么需要这三个"换名字"的入口 —— 不是冗余,是 C++ 语言层面的硬约束:
+ *
+ * 上游 `include/mutex.h` 声明的是 **C++ 链接** 的
+ * `void mutex_create(mutex_t*, bool)`(实测符号 `_Z12mutex_createP5mutexb`),
+ * 而 `driver/fs/fatfs/fatfs.cpp` 会调它 ⇒ 落地层**必须**给出那些修饰名。
+ * 落地层同时还要调移植侧这份**已经板上验证过**的实现 ——
+ * 但移植侧的函数**同名**(`mutex_create`)。在 C++ 里"同一个名字、两种链接"
+ * 是**非法**的(`conflicts with a previous declaration`),所以落地层
+ * 无法用同一个名字声明两边。
+ * ⇒ 由移植侧提供这三个入口:函数体就是一行转发,语义**一个字都没变**。
+ *
+ * ⚠ 参数是 `void *`,因为上游 `mutex_t` 与移植侧 `mutex_t` **布局不同**
+ *   (上游多了 `spin_t lock` 与 `lock_queue *wait_queue`),两边不能互相
+ *   reinterpret。落地层只是把**上游那个对象的前 16 字节**当存储交过来 ——
+ *   这在本项目里是安全的,因为 ARM 图里**没有**上游的 mutex 实现
+ *   (`kernel/task/mutex.cpp` 不在构建里),那些字节在 ARM 上只有这一条
+ *   读写路径。两侧各有一条静态断言钉住这个前提(见 `src/mutex.c` 与
+ *   `src/upstream_api.cpp`)。
+ */
+void arm_mutex_create(void *m, bool recursive);
+int  arm_mutex_lock(void *m);
+int  arm_mutex_unlock(void *m);
+
+/* ------------------------------------------------------------------ */
 /* 内核侧(实现在 src/mutex_kern.c)                                    */
 /* ------------------------------------------------------------------ */
 

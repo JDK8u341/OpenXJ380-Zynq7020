@@ -293,3 +293,37 @@ tcb_t mutex_get_owner(mutex_t *m)
 
     return owner;
 }
+
+/* ------------------------------------------------------------------ */
+/* ★ 落地层入口(M4A-1.4):只换名字、不换语义 ★                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 为什么需要它们、为什么参数是 `void *`,写在 <arch/mutex.h> 的同一节。
+ * 这里只说实现上的两条:
+ *
+ *   1. **语义一个字没变** —— 每个函数体就是一行转发。上游 FATFS 拿到的
+ *      就是 M4-11.1 在板上验过的那把 mutex(含 -EPERM/-EDEADLK/-EBUSY
+ *      那几条边界),不是另一套实现。
+ *   2. **"只占 16 字节"这个前提由静态断言钉住**:落地层交过来的是上游
+ *      `mutex_t` 对象,移植侧把它当自己的 16 字节结构写。改大了这个大小,
+ *      上游那个对象就可能被写越界 —— 而那种错误在源码上看不出来。
+ */
+_Static_assert(sizeof(mutex_t) == 16u,
+               "落地层把上游 mutex_t 对象当 16 字节存储用(见 arch/mutex.h);"
+               "改了这个大小必须同时核对 include/mutex.h 的布局");
+
+void arm_mutex_create(void *m, bool recursive)
+{
+    mutex_create((mutex_t *)m, recursive);
+}
+
+int arm_mutex_lock(void *m)
+{
+    return mutex_lock((mutex_t *)m);
+}
+
+int arm_mutex_unlock(void *m)
+{
+    return mutex_unlock((mutex_t *)m);
+}
