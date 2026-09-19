@@ -1,7 +1,23 @@
 #pragma once
 
-#include "cpu/lock.h"
-#include "stdint.h"
+/*
+ * ⚠ 这里必须是**尖括号**(平台中立修复,2026-09-18),不能是引号。
+ *
+ * 引号形式的搜索顺序是"**先看包含者所在目录**",于是这一行会命中
+ * `include/cpu/lock.h`(x86 内联汇编版),而**绕过** `-I` 顺序 ——
+ * 移植侧给 `<cpu/lock.h>` 准备的架构覆盖层
+ * (`arch/arm32/include/upstream/cpu/lock.h`)就永远轮不到。
+ *
+ * 症状很隐蔽:同一个 TU 里会同时出现两份 `spin_t`
+ * (x86 的 `struct spinlock` 与 ARM 的匿名 struct),报一堆
+ * "has no member named 'cpsr' / 'locked'" —— 看起来像字段名写错了,
+ * 其实是**两个不同的类型**。
+ *
+ * 改成尖括号在 x86 上是**同一个文件**(include/ 本来就在 -I 里),
+ * 行为零变化;在 ARM 上才让覆盖层生效。
+ */
+#include <cpu/lock.h>
+#include <stdint.h>
 
 typedef struct LockNode
 {

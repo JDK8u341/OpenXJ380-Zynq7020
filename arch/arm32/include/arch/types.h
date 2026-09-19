@@ -92,7 +92,23 @@ typedef signed long long   int64_t;
 #    endif
 
 #    ifndef NULL
-#        define NULL ((void *)0)
+/*
+ * ⚠ C++ 里必须是 `nullptr`(或 `0`),**不能**是 `((void *)0)`。
+ *
+ * C++ 不允许 `void*` 隐式转换成别的指针类型,于是
+ *   `list_t node = NULL;`   // list_t 是 struct list *
+ * 会报 "invalid conversion from 'void*' to 'list_t' [-fpermissive]"。
+ * 实测:上游 `driver/fs/vfs/tmpfs.cpp` 在 ARM 上就是这么炸的 ——
+ * 而同一份文件在 x86 上是好的,因为上游 `include/stdint.h` 用的是 `#define NULL 0`。
+ *
+ * 这个头会被**上游的 C++ 翻译单元**看到(架构覆盖层 `upstream/cpu/lock.h`
+ * 要 include <arch/cpu.h> 拿 spin_t),所以它必须对 C++ 友好。
+ */
+#        ifdef __cplusplus
+#            define NULL nullptr
+#        else
+#            define NULL ((void *)0)
+#        endif
 #    endif
 
 #else

@@ -565,8 +565,19 @@ ARM32_COMMON_FLAGS = (
 #   两边唯一的交界是"上游 C++ 导出 C 链接符号 + 移植侧给出 C 声明",
 #   由 tests/test_arm32_device.py 之类的契约测试钉住。
 #
-# 所以这条 `-I./include` 只挂在 arm32_cxx 规则上(见下面)。
-ARM32_UPSTREAM_INCLUDE = "-I./include"
+# C++(上游)文件的 `-I` 顺序 —— 三层,顺序本身是**契约**:
+#
+#   1. arch/arm32/include/upstream   覆盖层:架构相关的上游头(如 cpu/lock.h,
+#                                    那份是 x86 内联汇编)在这里换成 ARM 版。
+#                                    **只有架构相关的头可以放这里**。
+#   2. include                       上游头文件树(默认那一层)。
+#   3. arch/arm32/include            移植侧自己的头(`<arch/...>`),给覆盖层用。
+#
+# ⚠ 顺序不能反:把 (3) 提到最前会让上游文件拿到移植侧的 <krlibc.h>,
+#   而它与上游的 <stdint.h> 在 int8_t/NULL 上直接冲突(实测)。
+ARM32_UPSTREAM_INCLUDE = (
+    "-I./arch/arm32/include/upstream -I./include -I./arch/arm32/include"
+)
 
 # 上游(.cpp)里被编进 ARM 内核的文件。
 #
