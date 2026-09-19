@@ -663,6 +663,57 @@ ARM32_UPSTREAM_CXX = (
     "driver/fs/vfs/pty.cpp",
 )
 
+# 上游文件里**刻意没有**进 ARM 图的那些 —— 每条都要写清"为什么"与"什么能解开它"。
+#
+# 为什么要有这张表:一张"哪些文件没编进来"的清单如果只存在于人的记忆里,
+# 它就分不清两种情况 —— **"决定不编"** 与 **"忘了编"**。
+# 这两种情况的后续动作完全相反(前者要写理由并等条件,后者要立刻补上),
+# 而它们在构建图里长得一模一样。所以把它写成数据,并由
+# `tests/test_arm32_upstream_excluded.py` 钉住两条不变量:
+#   ① 每条都有非空理由;② 同一路径**不能**同时出现在 ARM32_UPSTREAM_CXX 里。
+#
+# ⚠ 这里只放**有实测证据**的条目。写"大概不行"会把这表变成猜测集,
+#   而猜测集的下场是没人再信它。
+ARM32_UPSTREAM_EXCLUDED = (
+    (
+        "driver/fs/vfs/procfs.cpp",
+        "GCC 的 **C++** 前端直接拒绝:procfs.cpp:595 的稀疏数组指定初始化器"
+        "(`[0]=\"fpu\", [1]=\"vme\", …`)报 "
+        "'sorry, unimplemented: non-trivial designated initializers not supported'"
+        "(上游用 clang,它把这个当扩展收下了)。"
+        "★ 但就算语法能过**也不该搬**:那张表是 **CPUID 的 EDX/ECX 位名**"
+        "(`tsc`/`sse`/`avx`/`rdrand`…),ARM 上这些位没有意义 —— "
+        "ARM 的 `/proc/cpuinfo` 必须由 **MIDR/MPIDR/CTR/CCSIDR** 拼出来。"
+        "⇒ 这是\"要另写一份 ARM 的\",不是\"差一点就能编\"。"
+        "解开条件:有东西真的读 `/proc`(现实里是 M7 的用户态;今天 ARM 上没有读者)。",
+    ),
+    (
+        "driver/serial/serial_port.cpp",
+        "x86 的 8250/16550 串口驱动:直接用 `inb`/`outb` 操作 0x3F8 一族端口,"
+        "而 Zynq 的串口是 MMIO(PS UART1 @ 0xE0001000)。"
+        "移植侧的输出通道是 `arch/arm32/src/console.c` + `uart_ps.c`;"
+        "★ 它需要的两个符号(`sprintf`/`write_serial_fmt`)已经由落地层给出,"
+        "所以上游**代码**能调它们,但这**份实现**搬不过来。"
+        "解开条件:不需要 —— 这是架构差异,不是欠账。",
+    ),
+    (
+        "driver/rtc.cpp",
+        "PC 的 CMOS 时钟(0x70/0x71 端口)。Zynq 上**没有这个器件** ⇒ "
+        "那份实现不是\"还没搬\",是\"搬过来也没有硬件\"(已记进 README 退化清单 D24)。"
+        "★ 其中**纯算术**的部分(`mktime`)已经逐行照搬到落地层,"
+        "并有宿主逐日期比对(`tests/test_arm32_fatfs.py`)。"
+        "解开条件:Zynq PS RTC(`0xF8006000`)驱动,或由控制台设一次时间。",
+    ),
+    (
+        "driver/device.cpp",
+        "块层(`device_read`/`blk_device_*`/`device_mmap`/bounce 缓冲)。"
+        "它依赖**分区层**与 x86 的帧分配器(`alloc_frames`/`phys_to_virt`)"
+        "⇒ 属 M4A-3/B5 的工作面。今天 ARM 侧那两个符号是\"响亮拒绝 + 计数\""
+        "(README 退化清单 D25,`arm_blk_device_calls()` 必须恒为 0)。"
+        "解开条件:M4A-1.3(真实块设备)+ M4A-3/B5。",
+    ),
+)
+
 # 移植侧的 C++ 源文件(**只有落地层**)。
 #
 # `arch/arm32/src/` 下除它之外全是 `.c` —— 这是刻意的:落地层是唯一需要
