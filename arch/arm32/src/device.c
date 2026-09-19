@@ -203,3 +203,226 @@ size_t arm_disk_size(int drive)
 {
     return disk_size(drive);
 }
+
+/* ------------------------------------------------------------------ */
+/* 块层:按**字节偏移**读写(M4A-3/B5)                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 这一对是上游 `driver/device.cpp:318/415` 的**端口原生版**:
+ * 接口、返回值和那套 LBA/偏移算术照上游,但**去掉了 x86 的 DMA bounce 机制**。
+ *
+ * ## 为什么去掉 bounce(这是本笔的核心决定)
+ *
+ * 上游那套 bounce + direct-span(`blk_acquire_bounce`/`blk_direct_span_bytes`)
+ * 存在的理由是"**目的缓冲区可能不在 DMA 安全窗口里**" —— 那是 x86 HHDM 布局
+ * 下的问题:用户缓冲区可能是另一套页表映射的物理页,设备不能直接 DMA 进去,
+ * 于是先搬进一块**保证物理连续**的中转缓冲。M4A-3/B5 侦察时量过:它拖着
+ * **8 个 x86 页层符号**(`page_map_range`/`translate_address`/`free_frames`…),
+ * 而那些在 ARM 上**不是欠账而是架构差异**(ARM 用 palloc/vmap,没有那个窗口)。
+ *
+ * ⇒ ARM 侧**目的地址恒为内核地址**(今天没有用户态;M7 到来时这里要重新审),
+ *   所以三段式(头 / 整扇区 / 尾)就够:
+ *     头:偏移不在扇区边界 ⇒ 先读**一扇区**到中转,拷出需要的那几个字节;
+ *     中:整扇区 ⇒ **直接**读进/写出目的缓冲,按 `SECTORS_ONCE` 分块;
+ *     尾:不足一扇区 ⇒ 读出那一扇区再拷需要的部分(写方向还要写回)。
+ *
+ * ## ⚠ 三条与上游的**已知差异**(都写在这里而不是藏着)
+ *
+ *   1. **去掉了 `blk_user_buffer_valid()`** —— 那是 x86 的"这块地址映射了吗"检查。
+ *      ARM 侧今天没有用户地址空间可查,所以改为**只拒绝 NULL**(并顺手做了
+ *      `vdiskid` 的边界检查)。⚠ M7 有用户态之后,这里必须补一个等价物,
+ *      否则"用户传进来的野指针"会直接进设备回调。
+ *   2. **中转缓冲是 `static`**(一块,不重入)。上游是每设备一份、按需分配。
+ *      今天块层只在启动自检与内核上下文里被调用(单线程),所以一块够用;
+ *      ⚠ 一旦有并发调用者(比如多个线程同时读盘),这里要改成加锁或每调用一份。
+ *   3. **中间整扇区按 `SECTORS_ONCE` 分块**,而不是上游那种"一次给到底"。
+ *      理由:单次回调的传输量应该有上界 —— 我们没有 x86 那个 bounce 窗口
+ *      去隐式限制它,而 SDHCI 一类的控制器对一次传输的长度是有限制的。
+ */
+
+#define BLK_SCRATCH_BYTES 4096u
+
+static u8  g_blk_scratch[BLK_SCRATCH_BYTES];
+static u32 g_blk_calls; /* 块层被调用过多少次(自检用:今天应当是 0 —— 还没有块设备)*/
+
+u32 blk_device_calls(void)
+{
+    return g_blk_calls;
+}
+
+size_t blk_device_read(int drive, void *buffer, size_t offset, size_t length)
+{
+    device_t device;
+    u64      sector_size;
+    u64      sector;
+    u64      offset_in_block;
+    u64      remaining;
+    u64      total = 0;
+    u8      *dest  = (u8 *)buffer;
+
+    if (!have_vdisk(drive) || length == 0u) {
+        return 0u; /* 与上游一致:没有这个盘 / 长度为 0 ⇒ 0 */
+    }
+    if (buffer == NULL) {
+        return (size_t)-1; /* ARM 侧没有 x86 那个"地址有效吗"检查,至少挡住 NULL */
+    }
+
+    device = device_ctl[drive];
+
+    if (device.type == DEVICE_STREAM) {
+        if (device.read == NULL) {
+            return (size_t)-1;
+        }
+        /* ⚠ 流设备把这两个参数**原样**转交(上游也是这么做的):
+           对块设备它们是 (扇区数, LBA),对流设备它们由驱动自己解释 */
+        return device.read(drive, (uint8_t *)buffer, length, offset);
+    }
+
+    if (device.sector_size == 0u || device.read == NULL ||
+        device.sector_size > BLK_SCRATCH_BYTES) {
+        return (size_t)-1;
+    }
+
+    sector_size     = device.sector_size;
+    sector          = (u64)offset / sector_size;
+    offset_in_block = (u64)offset % sector_size;
+    remaining       = (u64)length;
+
+    if (offset_in_block != 0u) {
+        u64 head = sector_size - offset_in_block;
+
+        if (head > remaining) {
+            head = remaining;
+        }
+        if (device.read(device.vdiskid, g_blk_scratch, 1u, sector) != 1u) {
+            return (size_t)-1;
+        }
+        memcpy(dest, g_blk_scratch + offset_in_block, (size_t)head);
+        dest += head;
+        remaining -= head;
+        total += head;
+        sector++;
+    }
+
+    /* 中间:整扇区直接进目的缓冲(ARM 上不需要中转),按 SECTORS_ONCE 分块 */
+    while (remaining >= sector_size) {
+        u64 secs = remaining / sector_size;
+
+        if (secs > (u64)SECTORS_ONCE) {
+            secs = (u64)SECTORS_ONCE;
+        }
+        if (device.read(device.vdiskid, dest, (size_t)secs, (size_t)sector) != (size_t)secs) {
+            return (size_t)-1;
+        }
+        dest += secs * sector_size;
+        remaining -= secs * sector_size;
+        total += secs * sector_size;
+        sector += secs;
+    }
+
+    if (remaining > 0u) {
+        if (device.read(device.vdiskid, g_blk_scratch, 1u, sector) != 1u) {
+            return (size_t)-1;
+        }
+        memcpy(dest, g_blk_scratch, (size_t)remaining);
+        total += remaining;
+    }
+
+    return (size_t)total;
+}
+
+size_t blk_device_write(device_t device, const void *buffer, size_t offset, size_t length)
+{
+    u64        sector_size;
+    u64        sector;
+    u64        offset_in_block;
+    u64        remaining;
+    u64        total = 0;
+    const u8  *src   = (const u8 *)buffer;
+
+    g_blk_calls++;
+
+    if (length == 0u) {
+        return 0u;
+    }
+    if (buffer == NULL || device.vdiskid >= DEVICE_TABLE_SIZE) {
+        return (size_t)-1;
+    }
+
+    if (device.type == DEVICE_STREAM) {
+        if (device.write == NULL) {
+            return (size_t)-1;
+        }
+        return device.write(device.vdiskid, (uint8_t *)buffer, length, offset);
+    }
+
+    if (device.sector_size == 0u || device.write == NULL ||
+        device.sector_size > BLK_SCRATCH_BYTES) {
+        return (size_t)-1;
+    }
+
+    sector_size     = device.sector_size;
+    sector          = (u64)offset / sector_size;
+    offset_in_block = (u64)offset % sector_size;
+    remaining       = (u64)length;
+
+    /*
+     * 头:非对齐 ⇒ 这是**读-改-写**(只改那几个字节,其余保持盘上原样)。
+     * ⚠ 上游在这里显式要求 `device.read != NULL` —— 没有读能力的设备
+     *   做不了非对齐写(要么拒绝,要么把整扇区当垃圾写回去,那更糟)。
+     */
+    if (offset_in_block != 0u) {
+        u64 head = sector_size - offset_in_block;
+
+        if (head > remaining) {
+            head = remaining;
+        }
+        if (device.read == NULL) {
+            return (size_t)-1;
+        }
+        if (device.read(device.vdiskid, g_blk_scratch, 1u, sector) != 1u) {
+            return (size_t)-1;
+        }
+        memcpy(g_blk_scratch + offset_in_block, src, (size_t)head);
+        if (device.write(device.vdiskid, g_blk_scratch, 1u, sector) != 1u) {
+            return (size_t)-1;
+        }
+        src += head;
+        remaining -= head;
+        total += head;
+        sector++;
+    }
+
+    while (remaining >= sector_size) {
+        u64 secs = remaining / sector_size;
+
+        if (secs > (u64)SECTORS_ONCE) {
+            secs = (u64)SECTORS_ONCE;
+        }
+        if (device.write(device.vdiskid, (uint8_t *)src, (size_t)secs, (size_t)sector) != (size_t)secs) {
+            return (size_t)-1;
+        }
+        src += secs * sector_size;
+        remaining -= secs * sector_size;
+        total += secs * sector_size;
+        sector += secs;
+    }
+
+    /* 尾:同样读-改-写 */
+    if (remaining > 0u) {
+        if (device.read == NULL) {
+            return (size_t)-1;
+        }
+        if (device.read(device.vdiskid, g_blk_scratch, 1u, sector) != 1u) {
+            return (size_t)-1;
+        }
+        memcpy(g_blk_scratch, src, (size_t)remaining);
+        if (device.write(device.vdiskid, g_blk_scratch, 1u, sector) != 1u) {
+            return (size_t)-1;
+        }
+        total += remaining;
+    }
+
+    return (size_t)total;
+}

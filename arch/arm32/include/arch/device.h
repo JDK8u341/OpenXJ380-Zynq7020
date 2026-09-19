@@ -199,6 +199,33 @@ size_t disk_size(int drive);
  */
 size_t arm_disk_size(int drive);
 
+/* ------------------------------------------------------------------ */
+/* 块层:按**字节偏移**读写(M4A-3/B5)                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 上游同名同接口(`include/device.h:107-108`,且那两条声明在 `extern "C"` 块里
+ * ⇒ **移植侧这份 C 实现直接就是上游要的符号**,不需要落地层转发)。
+ *
+ * 语义照上游 `driver/device.cpp:318/415`:
+ *   - 块设备:按字节偏移读写,内部拆成 头 / 整扇区 / 尾 三段;
+ *     非对齐的**写**是**读-改-写**(只改那几个字节);
+ *   - 流设备(`DEVICE_STREAM`):两个参数由驱动自己解释(原样转交);
+ *   - 返回**实际传输的字节数**;失败返回 `(size_t)-1`;
+ *     "没有这个盘"或"长度为 0"返回 `0`。
+ *
+ * ⚠ 与上游的**三条已知差异**(理由见 `src/device.c` 的块层一节):
+ *   ① 去掉了 x86 的 `blk_user_buffer_valid()`(改用"只拒绝 NULL" +
+ *      `vdiskid` 边界检查)—— M7 有用户态后必须补等价物;
+ *   ② 中转缓冲是**一块 `static`**(不重入)—— 有并发调用者时要改;
+ *   ③ 中间整扇区按 `SECTORS_ONCE` **分块**,不像上游那样一次给到底。
+ */
+size_t blk_device_read(int drive, void *buffer, size_t offset, size_t length);
+size_t blk_device_write(device_t device, const void *buffer, size_t offset, size_t length);
+
+/* 块层被调用过多少次。今天应当是 0(ARM 侧**还没有块设备**)*/
+u32 blk_device_calls(void);
+
 /* ---- devfs ---- */
 
 /*

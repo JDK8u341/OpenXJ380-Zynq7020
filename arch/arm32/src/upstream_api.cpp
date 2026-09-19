@@ -1090,45 +1090,23 @@ void write_serial_string(const char *str)
 /*
  * ---- 块层:`blk_device_read` / `blk_device_write` ----
  *
- * 上游实现在 `driver/device.cpp`(216/318/415 行),而那个文件**还没进 ARM 图**
- * —— 它卡在分区层与进程层上(计划把它归到 M4A-3/B5)。
+ * ★ M4A-3/B5 起这一对**不再由本文件给出**,而是移植侧的**真实现**:
+ *   `src/device.c` 的 `blk_device_read()` / `blk_device_write()`。
+ *   之所以不需要落地层转发:上游 `include/device.h:107-108` 把这两条声明
+ *   放在 `extern "C"` 块**里面** ⇒ 上游 C++ 要的就是**未修饰**符号,
+ *   而移植侧那份 C 实现产出的正是它(实测 `nm` 里是 `T blk_device_read`)。
  *
- * 而 ARM 侧今天**根本没有块设备**:`sdhci0` 在描述表里,但驱动一行没写
- * (M4A-1.3 的活)。所以这两个函数在当前构建里是**不可达**的
- * (`devfs_read`/`devfs_write` 只在节点挂的是块设备时才会走到它们)。
+ * ⚠ 这里曾经放的是"响亮拒绝 + 计数"(原 D25) —— 它退场的理由是:
+ *   侦察量出上游那份实现拖着 **8 个 x86 页层符号**
+ *   (`page_map_range`/`translate_address`/`free_frames`…),而那 8 个
+ *   **不是欠账而是架构差异**(DMA bounce / direct-span 只在 HHDM 下成立)。
+ *   ⇒ 决定**另写一份端口原生块层**(接口与偏移算术照上游,去掉 bounce),
+ *     详见 `src/device.c` 的块层一节与 README 的 M4A-3/B5 一节。
  *
- * ⇒ 按本项目的规矩做**响亮拒绝**:返回 0(调用方按"读到 0 字节"处理)
- *   并计数。★ "不可达"是**可判的**:计数必须恒为 0
- *   (`arm_blk_device_calls()`),由板上自检读。
- *   替换条件写进 README 的退化清单(D25):M4A-1.3 接上真实块设备、
- *   并把 `driver/device.cpp` 的块层搬进来时。
+ * ⚠ 同样要记下的是:那个"计数必须恒为 0"的判据**当时并没有真的接进报告**
+ *   (kmain 里没有读它)—— 文档写了、代码没做,属于我自己的记录与实现不一致。
+ *   现在计数改在移植侧(`blk_device_calls()`),而且它记的是**真实调用次数**。
  */
-static unsigned int g_blk_device_calls;
-
-size_t blk_device_read(int drive, void *buffer, size_t offset, size_t length)
-{
-    (void)drive;
-    (void)buffer;
-    (void)offset;
-    (void)length;
-    g_blk_device_calls++;
-    return 0u;
-}
-
-size_t blk_device_write(device_t device, const void *buffer, size_t offset, size_t length)
-{
-    (void)device;
-    (void)buffer;
-    (void)offset;
-    (void)length;
-    g_blk_device_calls++;
-    return 0u;
-}
-
-extern "C" unsigned int arm_blk_device_calls(void)
-{
-    return g_blk_device_calls;
-}
 
 /*
  * ---- 挂 `/dev` ----

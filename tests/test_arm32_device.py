@@ -238,7 +238,9 @@ class DeviceShapeContractTests(unittest.TestCase):
         for proto in sorted(ours):
             # 移植侧专有的入口(上游没有对应物):内核侧 A/B 与落地层转发
             # 是骨架特有的(上游靠 vfs_open 做这件事),不在比对范围内
-            if proto.startswith(("size_t arm_disk_size", "void arm_devfs_setup")):
+            if proto.startswith(("size_t arm_disk_size", "void arm_devfs_setup",
+                                 "size_t blk_device_read", "size_t blk_device_write",
+                                 "u32 blk_device_calls")):
                 continue
             if proto not in theirs:
                 missing.append(proto)
@@ -324,6 +326,46 @@ errno_t devfs_delete(const char *path)
 {
     (void)path;
     return EOK;
+}
+
+/* ------------------------------------------------------------------ */
+/* 块层的假设备(M4A-3/B5):扇区读写回调 + 一块内存盘                    */
+/* ------------------------------------------------------------------ */
+
+static uint8_t *g_fake_disk;     /* 只有这一块盘,回调靠它找到数据 */
+static uint32_t g_seen_number;   /* 回调最近一次收到的 (number, lba) —— 流设备要判它 */
+static size_t   g_seen_lba;
+
+static size_t blk_read_cb(int drive, uint8_t *buffer, size_t number, size_t lba)
+{
+    (void)drive;
+    if (g_fake_disk == NULL || buffer == NULL) return 0;
+    if ((lba + number) * 512u > 4u * 512u) return 0; /* 越界 ⇒ 按"没读到"处理 */
+    memcpy(buffer, g_fake_disk + lba * 512u, number * 512u);
+    return number;
+}
+
+static size_t blk_write_cb(int drive, uint8_t *buffer, size_t number, size_t lba)
+{
+    (void)drive;
+    if (g_fake_disk == NULL || buffer == NULL) return 0;
+    if ((lba + number) * 512u > 4u * 512u) return 0;
+    memcpy(g_fake_disk + lba * 512u, buffer, number * 512u);
+    return number;
+}
+
+static size_t stream_read_cb(int drive, uint8_t *buffer, size_t number, size_t lba)
+{
+    (void)drive;
+    (void)buffer;
+    g_seen_number = (uint32_t)number;
+    g_seen_lba    = lba;
+    return number;
+}
+
+static size_t stream_write_cb(int drive, uint8_t *buffer, size_t number, size_t lba)
+{
+    return stream_read_cb(drive, buffer, number, lba);
 }
 
 static void make_dev(device_t *dev, const char *name, device_flag_t type, size_t size)
@@ -470,6 +512,124 @@ int main(void)
         CHECK(id_free(a, 999u) == false);           /* 越界必须被拒 */
         CHECK(id_alloc(a) == x[1]);                 /* 释放掉的能被重新分配 */
         CHECK(id_alloc(a) == -1);
+    }
+
+    /*
+     * ================================================================
+     * ★ 块层:按字节偏移读写(M4A-3/B5)★
+     * ================================================================
+     *
+     * 这一节要钉住的是**扇区算术**,而它恰恰是"看起来对、边界上错"的重灾区:
+     *   - 非对齐偏移(头的片段)
+     *   - 跨扇区(头 + 尾)
+     *   - 一次超过 `SECTORS_ONCE` 的传输(分块)
+     *   - **非对齐写是读-改-写**:只改那几个字节,周围必须原样
+     *     (这一条最容易错成"把整扇区当垃圾写回去")
+     *   - 流设备走另一条路(参数原样转交)
+     */
+    {
+        /* 一块 4 扇区的假盘,内容 = 可预测的图案(= 扇区号 * 16 + 扇区内偏移)*/
+        static uint8_t disk[4 * 512];
+        device_t       blk;
+        device_t       stream;
+        uint8_t        buf[4096];
+        uint8_t        before[8];
+        int            id_blk;
+        int            id_stream;
+        size_t         i;
+
+        for (i = 0; i < sizeof(disk); i++) {
+            disk[i] = (uint8_t)((i / 512u) * 16u + (i % 512u));
+        }
+
+        memset(&blk, 0, sizeof(blk));
+        blk.flag        = 1;
+        blk.type        = DEVICE_BLOCK;
+        blk.size        = sizeof(disk);
+        blk.sector_size = 512u;
+        strcpy(blk.drive_name, "blk0");
+
+        id_blk = regist_device(NULL, blk);
+        CHECK(id_blk >= 0);
+        if (id_blk >= 0) {
+            device_ctl[id_blk].read  = blk_read_cb;
+            device_ctl[id_blk].write = blk_write_cb;
+            /* 回调要拿到盘 —— 用一张只有这一块的静态指针 */
+            g_fake_disk = disk;
+
+            /* ① 对齐的整扇区读 */
+            memset(buf, 0, sizeof(buf));
+            CHECK(blk_device_read(id_blk, buf, 0u, 512u) == 512u);
+            CHECK(buf[0] == disk[0]);
+            CHECK(buf[511] == disk[511]);
+
+            /* ② 非对齐偏移读(第 100 字节起 100 字节)⇒ 走"头"那一段 */
+            memset(buf, 0, sizeof(buf));
+            CHECK(blk_device_read(id_blk, buf, 100u, 100u) == 100u);
+            CHECK(memcmp(buf, disk + 100, 100) == 0);
+
+            /* ③ 跨扇区读(500 起 100 字节 ⇒ 头 12 + 尾 88)*/
+            memset(buf, 0, sizeof(buf));
+            CHECK(blk_device_read(id_blk, buf, 500u, 100u) == 100u);
+            CHECK(memcmp(buf, disk + 500, 100) == 0);
+
+            /* ④ 一次超过 SECTORS_ONCE 的传输(要分块,内容仍必须完全一致)*/
+            memset(buf, 0, sizeof(buf));
+            CHECK(blk_device_read(id_blk, buf, 0u, 4u * 512u) == 4u * 512u);
+            CHECK(memcmp(buf, disk, sizeof(disk)) == 0);
+
+            /* ⑤ ★ 非对齐写 = 读-改-写:只改那几个字节,周围原样 */
+            memcpy(before, disk + 96, sizeof(before));
+            memset(buf, 0xAB, sizeof(buf));
+            CHECK(blk_device_write(device_ctl[id_blk], buf, 100u, 100u) == 100u);
+            CHECK(disk[100] == 0xAB);          /* 改到了 */
+            CHECK(disk[199] == 0xAB);
+            CHECK(memcmp(disk + 96, before, 4) == 0); /* 前面 4 字节没被动过 */
+            CHECK(disk[96] == before[0]);
+            CHECK(disk[200] == (uint8_t)((200u / 512u) * 16u + (200u % 512u))); /* 后面也没被动 */
+
+            /* ⑥ 边界与错误:没有这个盘 / 长度 0 ⇒ 0;NULL 缓冲 ⇒ -1 */
+            CHECK(blk_device_read(DEVICE_TABLE_SIZE + 3, buf, 0u, 8u) == 0u);
+            CHECK(blk_device_read(id_blk, buf, 0u, 0u) == 0u);
+            CHECK(blk_device_read(id_blk, NULL, 0u, 8u) == (size_t)-1);
+            CHECK(blk_device_write(device_ctl[id_blk], NULL, 0u, 8u) == (size_t)-1);
+
+            /* ⑦ 没有扇区大小 / 没有回调 ⇒ -1(不是 0 —— 0 会被上层当 EOF)*/
+            {
+                device_t broken;
+                int      id_broken;
+
+                memset(&broken, 0, sizeof(broken));
+                broken.flag = 1;
+                broken.type = DEVICE_BLOCK;
+                strcpy(broken.drive_name, "bad0");
+                id_broken = regist_device(NULL, broken);
+                CHECK(id_broken >= 0);
+                if (id_broken >= 0) {
+                    CHECK(blk_device_read(id_broken, buf, 0u, 8u) == (size_t)-1);
+                }
+            }
+
+            delete_device(id_blk);
+            g_fake_disk = NULL;
+        }
+
+        /* ⑧ 流设备:两个参数**原样**转交给驱动(上游同一语义)*/
+        memset(&stream, 0, sizeof(stream));
+        stream.flag = 1;
+        stream.type = DEVICE_STREAM;
+        strcpy(stream.drive_name, "stm0");
+        id_stream = regist_device(NULL, stream);
+        CHECK(id_stream >= 0);
+        if (id_stream >= 0) {
+            device_ctl[id_stream].read  = stream_read_cb;
+            device_ctl[id_stream].write = stream_write_cb;
+            CHECK(blk_device_read(id_stream, buf, 7u, 13u) == 13u);
+            CHECK(g_seen_number == 13u && g_seen_lba == 7u); /* (number, lba) = (len, offset) */
+            CHECK(blk_device_write(device_ctl[id_stream], buf, 5u, 9u) == 9u);
+            CHECK(g_seen_number == 9u && g_seen_lba == 5u);
+            delete_device(id_stream);
+        }
     }
 
     printf("checks=%d\n", checks);
