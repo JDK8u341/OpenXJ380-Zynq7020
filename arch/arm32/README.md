@@ -3231,20 +3231,41 @@ pipe_short_write 8   pipe_short_read 8
   （`pty.cpp:164-165` 拿它拼 `/dev/pts/<id>`，按"存了多少"返回会让
   "名字被截断"看不出来）。
 
-板上判据（`SELF-TEST: 138 passed`）：
+板上判据（`SELF-TEST: 148 passed`）：
 
 ```
-pty_init        1   ← pty_init() 跑完且 /dev/ptmx 建出来了
-pty_ptmx_node   1
+pty_init        1   pty_ptmx_node   1   pty_pair  1   pty_slave_path_len 1
+pty_a_write    32   pty_a_read     32   pty_a_roundtrip 1
+pty_a_short_write 8 pty_a_short_read 8
+pty_b_write    32   pty_b_read     32   pty_b_roundtrip 1
 ```
 
-⚠ **这一笔只到起搏**：配对的**读写往返还没有判据**。形状已经查清
-（`ptmx_open` 会：分配 pair → `calloc` 两块 `PTY_BUFF_SIZE` → 默认 termios →
-取 id → `snprintf(name, "%d", id)` → 在 `/dev/pts` 下建从设备 →
-**把打开的那个节点从 `/dev` 摘下、再挂一个新的 `/dev/ptmx`**）
-⇒ 下一步：`vfs_open("/dev/ptmx")` 拿主设备、`vfs_open("/dev/pts/<id>")` 拿从设备、
-写一端读另一端。**从设备号不要假定是 0**（应从 `/dev/pts` 的子项里取）——
-这条写在这里，免得下一次又"按我以为的"写判据（坑表 57/58 同一类）。
+#### ★★ 上板才看得见的一道坎：两个方向的载荷约束**相反** ★★
+
+第一版**挂住了** —— 日志停在 `pty: initialized` 之后,没有任何别的输出。
+根因是两个默认 termios 行为叠加（`pty_termios_default()`,`pty.cpp:60-62`:
+
+```c
+term->c_oflag = OPOST | ONLCR;
+term->c_lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK;
+```
+
+| 方向 | 路径性质 | 约束 | 为什么 |
+|---|---|---|---|
+| **A** 写主设备 → 读从设备 | **输入**路径 | 载荷**必须以 `'\n'` 结尾** | `ICANON` 开着 ⇒ `pts_data_available()`（`pty.cpp:117-129`）**只认行结束符**（`'\n'`/VEOF/VEOL）;没有它返回 0 ⇒ `pts_read` 一直空转 |
+| **B** 写从设备 → 读主设备 | **输出**路径 | 载荷**必须避开 `'\n'`/`'\r'`** | `OPOST\|ONLCR` ⇒ `pts_write()`（`pty.cpp:503`）把 `'\n'` 改写成 `"\r\n"`,逐字节比对会被行规约搅乱 |
+
+★ 而且**顺序也要紧**:默认 `ECHO` 是开着的,先做 A 有可能把回显留在主设备那一侧,
+挡住 B 的读取 ⇒ 所以**先 B 后 A**（这条也写成宿主测试里的断言）。
+
+⚠ 与 pipe 同一条安全约束依然成立:**不要读空的那一端**（`ptmx_read`/`pts_read`
+会 `scheduler_yield()` 空转,只有对端 `fds == 0` 才返回 0）⇒ 判据一律先写后读,
+由 `tests/test_arm32_vfs.py` 的**顺序检查**钉住（pipe 与 pty 各一条）。
+
+从设备路径是 **`TIOCGPTN` 问出来的**（`ptmx_ioctl`,`pty.cpp:329`）,不是假定 0 ——
+`ptmx_open` 每条 pair 都从共享的 `pty_id_alloc()` 取号,写死 0 的判据第一次能过、
+之后随机失败。开从设备前还按真实用户态的做法 `TIOCSPTLCK(0)` 解锁一次
+（`pts_open` 会拒锁着的,`pty.cpp:400`）。
 
 ---
 
