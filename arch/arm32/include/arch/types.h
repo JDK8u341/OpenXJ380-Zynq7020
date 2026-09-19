@@ -111,6 +111,26 @@ typedef signed long long   int64_t;
 #        endif
 #    endif
 
+/*
+ * C11 关键字 → C++ 拼写(2026-09-18)。
+ *
+ * 移植侧的架构头里用了 `_Static_assert` 与 `_Alignof`(C11),而它们
+ * **不是 C++ 的关键字** —— C++ 用 `static_assert` / `alignof`。
+ *
+ * 后果不是"不优雅"而是编不过:落地层 `arch/arm32/src/upstream_api.cpp`
+ * 一 include `<arch/sched.h>`(→ `<arch/tcb.h>`),就报
+ *   error: expected constructor, destructor, or type conversion before '(' token
+ * 指向 `_Static_assert(...)`。
+ *
+ * 这两个宏在 C 里不会被定义(C11 的它们是关键字),在 C++ 里则把名字接上 ——
+ * 于是同一份头在两个语言下都能用,而那几条静态断言在 C++ 侧**照常生效**
+ * (static_assert 在 C++ 里同样是编译期检查)。
+ */
+#    ifdef __cplusplus
+#        define _Static_assert static_assert
+#        define _Alignof       alignof
+#    endif
+
 #else
 
 /* ---------------- hosted:借用 libc ---------------- */

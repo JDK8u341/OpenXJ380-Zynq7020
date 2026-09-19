@@ -80,7 +80,17 @@ def _struct_members(text: str, tag: str, typedef_name: str) -> list[str]:
 
 
 def _top_level_prototypes(text: str) -> set[str]:
-    """文件里所有以 `;` 结尾、且带括号的声明(规范化)。"""
+    """文件里所有以 `;` 结尾、且带括号的声明(规范化)。
+
+    ⚠ 两处归一化是**必须**的,而且都是被真实改动打出来的:
+
+    1. 按行删预处理指令(`#include`/`#pragma` 等)—— 否则
+       `#define BITS_PER_WORD (sizeof(uint32_t) * 8)` 会被当成函数声明。
+    2. 去掉 `extern "C" {` —— 2026-09-18 给上游 `device.h` 与 `id_alloc.h`
+       加了那个块(理由:实现方是 C、调用方是 C++),它会让紧随其后的第一条
+       声明**多出一截前缀**。这个测试当时就是这么被抓住的。
+    """
+    text = _strip_directives(text).replace('extern "C" {', " ")
     out = set()
     for piece in text.split(";"):
         n = _normalize(piece)

@@ -1,6 +1,26 @@
 #pragma once
 
 /*
+ * ★ 整份声明放进 `extern "C"`(2026-09-18)。
+ *
+ * 理由与 `arch/device.h` 那次完全相同,而且这次是**实测撞出来的**:
+ * 落地层 `arch/arm32/src/upstream_api.cpp` 是 C++(它必须跨两个世界,
+ * 理由见那个文件头),它调用移植侧的 `sched_yield()` /
+ * `sched_sleep_ns()` / `sched_wake_task()` —— 而这三个的**实现是 C**
+ * (`src/sched_kern.c`)。声明若按 C++ 链接,链接期就报
+ *     undefined reference to `sched_yield()'
+ * (实测正是如此。同一批里 `arch_irq_disable()` 没出问题 —— 它是
+ *  `static inline`,根本不产生符号。)
+ *
+ * ⇒ 由此得到一条**通用规则**:
+ *   **移植侧的头文件只要会被 C++ 翻译单元看到,就必须声明 C 链接。**
+ *   已照此办过的:`arch/device.h`、`krlibc.h`、本文件。
+ */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
  * 调度策略 —— M4-8.2(纯逻辑)
  *
  * ====================================================================
@@ -659,3 +679,7 @@ void sched_ctx_restore_all(const arm_task_ctx_t *in, u32 n);
 
 /* 一次快照能装下的线程数上限(队列不会比这更长;超出的会被忽略) */
 #define SCHED_CTX_SNAPSHOT_MAX 32u
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif

@@ -605,6 +605,38 @@ ARM32_UPSTREAM_CXX = (
     #    它们能编过的前提都已经落地:平台中立的头重构(vfs.h / list.h /
     #    device.h 去掉 proto.hpp)、架构覆盖层(cpu/lock.h、cpu/regio.h)、
     #    以及一批平台中立修复(见各自提交)。
+    #
+    # ✅ 已经落进来的一批(纯复用,不是重写):
+    #    `kernel/lock_queue.cpp` —— 提供 VFS 缺的 `queue_get`/`queue_dequeue`/
+    #    `queue_destroy`,实测在 ARM 上零错误编过。
+    #
+    # ⚠ **当前状态:这两个文件还没接进构建图**(加了内核会链不上)。
+    #    `lock_queue.cpp` 与 `ARCH32_PORT_CXX` 那个落地层现在**没有调用者** ——
+    #    这是一个**过渡态**,不是完成态。等下面那 11 个符号补齐、vfs.cpp 进来
+    #    之后它们立刻就是承重的。记在这里以免被当成"没人用的代码"删掉:
+    #    每一条都是**实测撞出来的链接缺口**,不是提前造的东西。
+    #
+    # ⬜ 剩余 11 个符号(2026-09-18 实测;加起来就是 M4A-1.2b 剩下的工作面):
+    #    get_current_task() / kernel_group / get_current_directory()
+    #        → **进程层最小切片**(上游的 pcb_t/tcb_t;移植侧有 tcb 但没有 pcb)
+    #    sprintf(char*, const char*, ...) / write_serial_fmt(const char*, ...)
+    #        → 格式化器。上游在 driver/serial/serial_port.cpp(那是 x86 串口驱动,
+    #          ARM 编不了);移植侧 console.c 里有一个,但只往串口写、不往缓冲区写
+    #    get_random_bytes(void*, unsigned int) → rng(上游 kernel/rng.cpp 用 x86 指令)
+    #    free_frames(uint64_t, uint32_t) / page_map_range_to_random(page_directory*, ...)
+    #        → x86 页层(mmap 路径);ARM 的 vmap/page 模型不同,要单独想清楚
+    #    get_keyboard_input() / p_xapi_output_kernel(const char*) / pathacat
+    #        → 逐个查(前两个看着像 x86 输入与 XAPI 输出)
+    "kernel/lock_queue.cpp",
+)
+
+# 移植侧的 C++ 源文件(**只有落地层**)。
+#
+# `arch/arm32/src/` 下除它之外全是 `.c` —— 这是刻意的:落地层是唯一需要
+# 同时站在"上游名字"与"移植侧原语"两个世界里的地方,而它必须用 C++ 的
+# 理由写在那个文件头上(上游声明没有 extern "C")。
+ARM32_PORT_CXX = (
+    "arch/arm32/src/upstream_api.cpp",
 )
 
 # Candidate install roots for the Vitis GNU toolchain, used only when the
@@ -770,7 +802,7 @@ def arm32_graph(n: Ninja, out_path: Path) -> list[Path]:
         #     - 悬空声明(`proto.hpp` 的 `static inline uint64_t rdtsc();`,已单独删掉)
         #   要"对 GCC 也零警告"只有两条路:改上游(越权)或关掉整类警告(掩盖真问题)。
         #   降级为警告保留了**全部可见性**,而"能不能跑"由链接与板上判据决定。
-        "-Wno-error -Wno-macro-redefined -O2 -MF $out.d -c $in -o $out",
+        "-Wno-error -O2 -MF $out.d -c $in -o $out",
         log_desc("CXX", "$in -> $out"),
         depfile="$out.d",
     )
@@ -816,6 +848,15 @@ def arm32_graph(n: Ninja, out_path: Path) -> list[Path]:
     for rel in ARM32_UPSTREAM_CXX:
         src = ROOT / rel
         obj = Path(ARM32_OBJ_ROOT) / "upstream" / Path(rel).with_suffix(".o")
+        n.build(obj, "arm32_cxx", src)
+        arm_objs.append(obj)
+
+    # 移植侧的 C++ **落地层**(arch/arm32/src 下唯一不是 .c 的东西)。
+    # 它必须用 C++ 的理由写在文件头上:上游那三个调度器函数的声明没有
+    # `extern "C"`,C 实现给不出对应的符号。
+    for rel in ARM32_PORT_CXX:
+        src = ROOT / rel
+        obj = Path(ARM32_OBJ_ROOT) / Path(rel).relative_to(ARM32_SOURCE_ROOT).with_suffix(".o")
         n.build(obj, "arm32_cxx", src)
         arm_objs.append(obj)
 
