@@ -2832,6 +2832,70 @@ SELF-TEST: 100 passed, 0 failed
 
 ---
 
+### M4A-1.2a：ARM 内核里编进第一个上游 C++ 文件（已完成，板上 100/0）
+
+上游 `kernel/id_alloc.cpp`（57 行）现在**真的**被编进 ARM 内核了，移植侧那份
+C 副本（`arch/arm32/src/id_alloc.c`）随之删除。这是合流的第一块砖：
+从"照抄一份"变成"共用同一份"。
+
+#### ★ 一条边界规矩（下一步全靠它）
+
+实测发现**上游头文件在 C 里根本编不过**，四条证据：
+
+| 位置 | 问题 |
+|---|---|
+| `include/stdint.h:20` | `typedef char int8_t` 与移植侧的 `signed char` 冲突 —— ARM 上 `char` 默认**无符号**，上游那条在 ARM 上本身就是错的 |
+| `include/stdint.h:38` | `#define NULL 0` 与 `((void *)0)` 冲突 |
+| `include/krlibc.h:22` | `typedef typeof(nullptr) nullptr_t` —— C++ 专属语法 |
+| `include/krlibc.h:217` | `static memmove` 与移植侧的非 static 声明冲突 |
+
+⇒ 规矩：
+
+> **移植侧的 C 文件看不到上游头文件；上游的 C++ 文件看不到移植侧头文件。**
+> 两边唯一的交界 = "上游 C++ 导出 C 链接符号 + 移植侧给出 C 声明"，
+> 且这条交界由契约测试钉住。
+
+构建图上就是两条规则各带自己的 `-I`：`arm32_cc` 只有
+`-I./arch/arm32/include`，`arm32_cxx` 只有 `-I./include`。
+（中间两种组合都试过：给 C 文件加 `-I./include` 炸在 `int8_t`/`NULL`/`typeof` 上；
+给 C++ 文件加移植侧的 `-I` 炸在 `int8_t` 上。）
+
+#### 顺带修掉一个更深的坑：`bool`
+
+仓库自己的 `include/stdint.h:41` 有 `#define bool _Bool`，而移植侧是
+`typedef u8 bool` ⇒ 同一个 TU 里 `bool` 变成**两种类型**，报
+`conflicting types for 'have_vdisk'`。改成**同样的宏形式**（带 `#ifndef` 守卫）
+之后两边统一。
+
+安全性先扫过：全树 120 处 `bool` 用法**没有一处**依赖"它是个字节"
+（赋值全是 `true`/`false`/比较/返回 `bool` 的函数）。`_Bool` 在 ARM EABI 上
+与 `u8` 同为 1 字节，结构体布局不变。
+
+#### 链接约定是承重的
+
+`include/id_alloc.h` 加了 `extern "C"`。没有它时 `kernel/id_alloc.cpp` 编出来的
+符号是 `_Z8id_allocP14id_allocator_t`，C 侧根本找不到；加了之后 `nm` 看到的是
+**未修饰**的 `T id_alloc` / `T id_allocator_create` / `T id_free`。
+
+#### 上板判据
+
+```
+Device rt   : regist/get/get-by-name/delete round trip = PASS
+Device A/B  : devfs-off -> by_id=1 by_name_missing=1
+SELF-TEST: 100 passed, 0 failed
+```
+
+★ 这一次的上板**有分量**：设备管理器的 id 分配现在走的是 **C++ 对象**，
+链接约定或结构体布局错了往返就会失败。100/0 说明边界在真板上成立。
+
+#### 本机环境的一个坑（免得下次误判）
+
+MinGW `gcc` **无法编译 C++** —— 连一个 trivial 的 `.cpp` 都**静默** `rc=1`
+（无任何诊断；`cc1plus.exe` 文件在，但跑不起来）。所以宿主测试里的 C++
+那一半实际走 **clang**（测试的候选列表本来就有回退）。
+
+---
+
 ### 12. 其它待办（AM3 及以后）
 
 - 缓存维护与 Cortex-A9/PL310 勘误 —— **L1 与 L2 均已使能**；

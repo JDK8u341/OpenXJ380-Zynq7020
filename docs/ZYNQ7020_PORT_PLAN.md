@@ -308,9 +308,17 @@ M4-8 里我推出一个"纯协作式调度器到不了 idle"的死结，并准�
 > `tests/test_arm32_device.py` **逐字段机械比对**钉住。
 > ⚠ **上一版这段写的"1.1b 会第一次把上游 `include/device.h` 拉进 ARM 图"是错的**：
 > 上游 `driver/device.cpp` 卡在 VFS/分区层（M4A-1.3/1.4）与**进程层**（M7）上，
-> 与 C++ 无关 ⇒ 那件事属于 M4A-3/B5，C++ 规则的前置是 M4A-1.2（搬上游 VFS）。
-> ⇒ **下一步 M4A-1.2**：上游 include 路径映射（`<mm/alloc/alloc.h>` / `<mm/heap.h>` /
-> `<fs/vfs/vfs.h>`）+ VFS 核心 + `tmpfs`。
+> 与 C++ 无关 ⇒ 那件事属于 M4A-3/B5。
+>
+> ★ **M4A-1.2a 已完成（`60789b3` + `03ed5cf`，板上 100/0）**：ARM 内核里编进了
+> **第一个上游 C++ 文件**（`kernel/id_alloc.cpp`，移植侧那份 C 副本已删）。
+> ★ 它立下了**一条边界规矩**（下一步全靠它）：**移植侧 C 看不到上游头文件；
+> 上游 C++ 看不到移植侧头文件**，两边唯一的交界是"C++ 导出 C 链接符号 +
+> 移植侧给出 C 声明"，由契约测试钉住。理由是实测的四条硬证据
+> （`int8_t` / `NULL` / `typeof(nullptr)` / `static memmove`）。
+> ⇒ **下一步 M4A-1.2b**：VFS 核心 + `tmpfs`。**做法已定：搬上游文件 + 薄适配**
+> （实测耦合面：`tmpfs.cpp` **0**、`ff.cpp` **0**、`vfs.cpp` **31**、`procfs.cpp` **43**），
+> 而不是在移植侧重写。
 
 **M4-8.5（无饥饿）、M4-10（SMP 调度）、M4-11（串口真锁 + 线程退出路径）都已完成并
 板上验证。板级自检 97 passed / 0 failed，八组破坏性 A/B 全部检出。**
@@ -2489,7 +2497,8 @@ M4A-4 用户态与 syscall 层          <- 2026-09-18 新增(合流决策 D4);�
 |---|---|---|---|
 | ~~**M4A-1.1a**~~ | ~~D2 的接口层：`malloc/calloc/realloc/free` 接到 ARM 堆上~~ | M4-3 的堆 ✅ | ✅ **已完成（`6b82a0e`）**：板上 **98/0**；`Heap smoke` 改走 `malloc/free`（每次上板都验这条接线）+ 新增 `heap_bind_ab` 破坏性 A/B（解绑后 `malloc` 必须返回 NULL）。宿主新增 `tests/test_arm32_kmalloc.py`（含"把释放失败吞掉"的破坏性对照）。⚠ 上游的 `<mm/alloc/alloc.h>` 路径映射**还没做**，今天只保证符号存在 |
 | ~~**M4A-1.1b**~~ | ~~device manager + `regist_device` + devfs 骨架（+ 上游 include 路径映射）~~ | 1.1a ✅ | ✅ **已完成（`1a4aa3f`）**：板上 **100/0**；`device_roundtrip`（注册 → 按 id 取回 → 按**名字**取回 → 注销）+ `device_devfs_ab` **破坏性对照**（关掉 devfs 后 `get_device` 照样成功、`devfs_lookup` 必须找不到 —— 即计划 §4.4 点名的 B5-b 退化形态）。形状由 `tests/test_arm32_device.py` 对着上游 `include/device.h` **逐字段比对**；与上游的 4 处加固 + 1 个已知缺口（块设备不会自动扫分区）逐条记在 `arch/device.h` 与 `arch/arm32/README.md`。<BR>⚠ 本行原文写"此时 `mutex` 已可睡眠，不再是退化版"—— **这句是错的**：源 OS 的 mutex 是 **yield 型**（D13/D17）。<BR>⚠ **上游 include 路径映射仍未做**（原计划并进本行，实际属 M4A-1.2） |
-| **M4A-1.2** | **VFS 核心 + `tmpfs`** | M4A-1.1b | **第一个完整切片**：建/读/写/列目录全在内存，不需要块设备 |
+| ~~**M4A-1.2a**~~ | ~~C++ 规则 + 第一个上游 `.cpp` 编进 ARM 内核~~ | — ✅ | ✅ **已完成（`60789b3` + `03ed5cf`）**：`kernel/id_alloc.cpp` 真的编进来了，移植侧那份 C 副本**删除**；板上 **100/0**（设备管理器的 id 分配现在走 **C++ 对象**，链接约定或结构体布局错了往返就会失败）。<BR>★ 顺带立下**一条边界规矩**：上游头文件在 C 里编不过（`int8_t` / `NULL` / `typeof(nullptr)` / `static memmove` 四处实测证据）⇒ **移植侧 C 看不到上游头文件；上游 C++ 看不到移植侧头文件**，两边唯一的交界是"C++ 导出 C 链接符号 + 移植侧给出 C 声明"，由 `tests/test_arm32_device.py` 的契约比对钉住。<BR>⚠ `60789b3` **单独一个提交是编不过的**（那条 `git add` 因路径已被 `git rm` 而整体失效，只提交了删除），bisect 要跳过它 |
+| **M4A-1.2b** | **VFS 核心 + `tmpfs`** | 1.2a ✅ | **第一个完整切片**：建/读/写/列目录全在内存，不需要块设备。<BR>⚠ 动手前已实测上游 `driver/fs/**` 的耦合面，**结论是"搬 + 薄适配"而不是重写**：`tmpfs.cpp` **0** 耦合、FATFS `ff.cpp` **0**、`vfs.cpp` **31**（`get_current_task` 8 + PCB 字段 14 + `device_t` 9，集中在 cwd / fd 表 / tty / pid）、`procfs.cpp` **43**（进程信息 fs，天然要 PCB） |
 | **M4A-1.3** | 块设备（SD/arasan）+ `diskio` | 独立，可并行 | 读写扇区 + 写回读 |
 | **M4A-1.4** | **FATFS** | M4A-1.2 + M4A-1.3 | 挂载 + 读写文件 + 与主机侧比对 |
 | **M4A-1.5** | `procfs` / `dev` / `pipe` / `pty` | M4A-1.2 | 逐项 |
