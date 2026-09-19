@@ -42,13 +42,16 @@
 ★ M4-11 的三步都结掉了：11.1（串口真锁，D13）、11.2（线程退出路径，D14）、
 11.3（`sched_park_self` 退场，并入 11.2）。**
 
-**★ M4A-1.1a / 1.1b / 1.2a / 1.2b 全部完成 —— 上游 VFS 在板上真的跑起来了：
-板上 110 passed / 0 failed，`ninja -f build-arm.ninja arm32` = 40/40、0 个未定义符号
-（`vfs.cpp` + `tmpfs.cpp` 已永久进构建图）。**
+**★ M4A-1.1a / 1.1b / 1.2a / 1.2b / 1.4 全部完成 —— 上游 VFS 与 FATFS 都在板上跑起来了：
+板上 127 passed / 0 failed，`ninja -f build-arm.ninja arm32` = 41/41、0 个未定义符号。**
 ★ **1.2b 的验收判据"建 / 读 / 写 / 列目录"已上板**（十条新判据，含**反面控制**：
 在未挂载的根 fs 上做同样的往返必须不成立 —— 因为上游给未挂载节点的回调是
 `empty_func`(返回 void 却被当 `size_t` 用)，"调用成功"本身不携带信息）。
-**下一步是 M4A-1.3（块设备 + `diskio`）与 1.4（FATFS，先接 RAM 盘）。**
+★ **1.4 的验收判据"挂载 + 读写文件 + 与主机侧比对"也已上板**：FATFS 在 **8MB 的 RAM 盘**
+（一个 tmpfs 文件 —— 这个 OS 的块层**就是 VFS**）上格式化、挂载、建文件、写 32 字节、
+读回逐字节相同；**与主机侧比对**由宿主机用自己的解析独立核引导扇区
+（并在**不看标签**的前提下由算术反推出子类型 FAT12）。
+**下一步是 M4A-1.3（真实块设备 SD/arasan）与 M4A-1.5（`procfs`/`dev`/`pipe`/`pty`）。**
 
 **八个**破坏性 A/B 全部成立：搬帧、VFP 现场、扫描唤醒、无饥饿、选核、不换栈、
 **串口锁（`sched_off=+0ms/alive=+19` vs `+1200ms/+0`）**、
@@ -133,6 +136,7 @@
 | **M4A-1.2b 链接缺口 18 → 11** | `a8de6d2` `b79b189` | **100/0** |
 | **M4A-1.2b 链接缺口 11 → 0（落地层进程切片 + 格式化器三入口合一）** | `da645bf` `f8e57d0` `6120e90` | **39/39、0 未定义符号**；板上 **100/0**、八组 A/B 全检出（退出码 0）；宿主 `test_arm32_console.py` 7 条 + 10 子判据 |
 | **★ M4A-1.2b 验收：上游 VFS 在板上跑起来（起搏 + tmpfs 建/读/写/列目录）** | 本笔提交 | **110/0**、八组 A/B 全检出（退出码 0）；十条新判据 `vfs_bringup` / `vfs_tmpfs_mounted` / `vfs_create` / `vfs_write=32` / `vfs_read=32` / `vfs_roundtrip` / `vfs_list_delta` / `vfs_list_before=0` / `vfs_cwd_root` / `vfs_negative_ok`；宿主 `test_arm32_vfs.py` 9 条 + 27 子判据 |
+| **★ M4A-1.4：FATFS 在 8MB RAM 盘上跑起来（挂载 + 读写 + 与主机侧比对）** | 本笔提交 | **127/0**、八组 A/B 全检出（退出码 0）；19 条新判据（`fatfs_*` 13 条 + `fatbs_*` 5 条 + 卷大小）；宿主机独立解析引导扇区（`verify_fat_bootsector.py`），**由算术反推子类型 = FAT12**；宿主 `test_arm32_fatfs.py` 8 条 + 39 子判据（含把 `mktime` 编到宿主上与 `datetime` 逐日期比对） |
 
 ### 0.5.3 构建与验证命令（照抄即可）
 
@@ -264,6 +268,8 @@ for l in text.splitlines():
 | 55 | ★★ **"同名"不等于"同一个符号"—— 链接约定是接口的一部分，而且只有 `nm` 看得见** ★★ | M4A-1.2b 收尾时，`sprintf` / `write_serial_fmt` 这两个缺口在 C 里**明明定义了**，链接器却照样报 `undefined reference to 'sprintf(char*, char const*, ...)'`。真因：`include/proto.hpp:38,42` 把这两条声明写在 `extern "C"` 块**之外** ⇒ 上游调用点要的是**名字修饰过**的 `_Z7sprintfPcPKcz` / `_Z16write_serial_fmtPKcz`（`arm-none-eabi-nm out/arm32/upstream/driver/fs/vfs/vfs.o` 实证），而我们给的是未修饰的 `sprintf`。**源码上两个名字长得一模一样。** ⇒ 教训：跨"两个世界"的符号，判据不能是"文本上有没有这个声明"，必须是**目标文件里的符号名**；`tests/test_arm32_console.py` 因此新增三条断言（上游是 C++ 链接 / 落地层同形 / **移植侧 C 头里不许再出现这个名字**），`arch/console.h` 里也写明"刻意不声明"。<BR>★ 附带一条：同一批还撞上 `include/fs/vfs/list.h` 在头文件里**直接定义** `list_delete` 一族（非 `inline`）⇒ ARM 侧两个 TU 包含它 = `multiple definition`。**源 OS 自己的内核链接就带 `-z muldefs`** ⇒ 对齐这个标志，而不是去改公共 ABI 头 |
 | 56 | ★★ **`va_list` 传值 = 游标推进在返回时丢掉 ⇒ 从第二次转换起全部读同一个槽位** ★★ | 宿主单测当场抓到：`console_printf("%d|%s", 42, "ok")` **访问违例**（`%d` 在子函数里取走 42，但拿的是自己的副本，回到格式化循环后游标没动 ⇒ `%s` 把 42 当指针解引用）；`"%llx|%d", 0x1122334455667788ull, 42` 打出 `1432778632`，正好是那个 64 位量的**低半部分**。★ 关键认识：**这不是宿主特有的** —— ARM EABI 的 `va_list` 是 `struct __va_list { void *__ap; }`（结构体，传值即复制），Windows x64 的是 `char *`（传值同样是复制），**两种 ABI 下都会丢** ⇒ 这个写法在**目标板**上一样会打出错值。⇒ `take_unsigned`/`take_signed` 的形参改成 `va_list_t *`。★ 意义：这是"宿主单测能在上板前拦下目标 bug"的第一个实例，而不是"宿主与目标行为不同" |
 
+| 56 | ★★ **`va_list` 传值 = 游标推进在返回时丢掉 ⇒ 从第二次转换起全部读同一个槽位** ★★ | 宿主单测当场抓到：`console_printf("%d|%s", 42, "ok")` **访问违例**（`%d` 在子函数里取走 42，但拿的是自己的副本，回到格式化循环后游标没动 ⇒ `%s` 把 42 当指针解引用）；`"%llx|%d", 0x1122334455667788ull, 42` 打出 `1432778632`，正好是那个 64 位量的**低半部分**。★ 关键认识：**这不是宿主特有的** —— ARM EABI 的 `va_list` 是 `struct __va_list { void *__ap; }`（结构体，传值即复制），Windows x64 的是 `char *`（传值同样是复制），**两种 ABI 下都会丢** ⇒ 这个写法在**目标板**上一样会打出错值。⇒ `take_unsigned`/`take_signed` 的形参改成 `va_list_t *`。★ 意义：这是"宿主单测能在上板前拦下目标 bug"的第一个实例，而不是"宿主与目标行为不同" |
+| 57 | ★★ **判据里写死"我以为的事实"= 假 FAIL；而"假 FAIL 的代价"是让人去改本来对的代码** ★★ | M4A-1.4 第一次上板 **126 passed / 1 failed**，失败项是**我自己加的** `fatbs_fat16_type` —— 我假定"用 `FM_FAT` 格式化出来就是 FAT16"。真相：`FM_FAT` 只说是 **FAT12/16 族**，子类型由 FatFs **按簇数自己选**（`ff.cpp:6718` 附近的重试逻辑），8MB 的卷上实测选到 **FAT12**（8 扇区/簇 ⇒ 2043 簇；FAT 占 7 扇区，而 FAT12 需要 6、FAT16 需要 8 —— **算术就能定**）。<BR>★ 同一批还查出**宿主脚本自己的**一个判据 bug：把 510/511 的 `55 AA` 按小端 u16 比较（`(bs[510]<<8)|bs[511] == 0xAA55`），于是对**正确**的卷报了 FAIL。<BR>⇒ 教训两条：① 判据只能断言**被测系统的契约**，不能断言"我以为它会怎么选"；能由产物**算出来**的东西就现场算（现在板子只判族标签 `'FAT'`，子类型由宿主机用算术反推）；② 出现 FAIL 时先怀疑判据 —— 这次两条都是判据错，而被测代码是**对的** |
 #### 0.5.5b ★★ 第 24/26/27/28 条是同一类错误 —— 单独列出来 ★★
 
 
@@ -367,7 +373,27 @@ M4-8 里我推出一个"纯协作式调度器到不了 idle"的死结，并准�
 > 因为 `vfs.h` 整个文件没有 `extern "C"` ⇒ VFS 是 C++ 链接），
 > **判据在移植侧 C**（`arch/arm32/src/vfs_check.c`），交界线由
 > `tests/test_arm32_vfs.py` 钉住。
-> ⇒ **下一步：M4A-1.3（块设备 + `diskio`）与 1.4（FATFS，先接 RAM 盘）。**
+> ⇒ ~~**下一步：M4A-1.3（块设备 + `diskio`）与 1.4（FATFS，先接 RAM 盘）。**~~
+> 
+> ★★ **M4A-1.4 也已完成（2026-09-19）：板上 127/0。** 验收判据"**挂载 + 读写文件 +
+> 与主机侧比对**"三条都上了板。★ 动手前的一个发现省掉了整个块驱动:
+> **这个 OS 的块层就是 VFS** —— `diskio.cpp` 把 `disk_read()` 落成
+> `vfs_read(node, buff, sector*512, count*512)`,没有独立的块设备 API ⇒
+> **RAM 盘 = 一个 8MB 的 tmpfs 文件**,零新增块驱动代码,走的正是决策 3 说的那条
+> "与真实块设备完全相同"的路径。
+> 
+> ★ 5 个上游 FATFS 文件(含 2MB 的 `ffunicode.cpp`)**零修改**编过,链接缺口正好
+> **8 个符号**,全部是 **C++ 链接**(`_Z12mutex_createP5mutexb` 实测)⇒ 实现在 C++
+> 落地层、**不能**写 `extern "C"` —— ★ 与 VFS 那组**正好相反**,规则由"符号由谁调"
+> 决定。三个决策(理由见 README 的 M4A-1.4 一节):`FM_FAT` 而不是上游写死 FAT32 的
+> 辅助函数(FAT32 要 ≥ ~34MB,堆正好 32MB);互斥锁把上游对象当**不透明存储**交给
+> M4-11.1 验过的那把 mutex;`realtime_ns()` 是开机以来的纳秒数(Zynq 上没有 CMOS,记 D24)。
+> 
+> ★ **"与主机侧比对"是第三条独立证据**:板子把引导扇区原样打出来,宿主机用**自己的**
+> 解析核,并**由算术反推子类型 = FAT12**(不看任何标签)。⚠ 这一步也修掉了**两个
+> 我自己的判据 bug**(写死"必须是 FAT16"、以及把 `55 AA` 当小端比)—— 见坑表 57。
+> 
+> ⇒ **下一步:M4A-1.3(真实块设备 SD/arasan)与 M4A-1.5(`procfs`/`dev`/`pipe`/`pty`)。**
 
 **M4-8.5（无饥饿）、M4-10（SMP 调度）、M4-11（串口真锁 + 线程退出路径）都已完成并
 板上验证。板级自检 97 passed / 0 failed，八组破坏性 A/B 全部检出。**
@@ -2549,7 +2575,7 @@ M4A-4 用户态与 syscall 层          <- 2026-09-18 新增(合流决策 D4);�
 | ~~**M4A-1.2a**~~ | ~~C++ 规则 + 第一个上游 `.cpp` 编进 ARM 内核~~ | — ✅ | ✅ **已完成（`60789b3` + `03ed5cf`）**：`kernel/id_alloc.cpp` 真的编进来了，移植侧那份 C 副本**删除**；板上 **100/0**（设备管理器的 id 分配现在走 **C++ 对象**，链接约定或结构体布局错了往返就会失败）。<BR>★ 顺带立下**一条边界规矩**：上游头文件在 C 里编不过（`int8_t` / `NULL` / `typeof(nullptr)` / `static memmove` 四处实测证据）⇒ **移植侧 C 看不到上游头文件；上游 C++ 看不到移植侧头文件**，两边唯一的交界是"C++ 导出 C 链接符号 + 移植侧给出 C 声明"，由 `tests/test_arm32_device.py` 的契约比对钉住。<BR>⚠ `60789b3` **单独一个提交是编不过的**（那条 `git add` 因路径已被 `git rm` 而整体失效，只提交了删除），bisect 要跳过它 |
 | **M4A-1.2b** | **VFS 核心 + `tmpfs`** | 1.2a ✅ | **第一个完整切片**：建/读/写/列目录全在内存，不需要块设备。<BR>⚠ 动手前已实测上游 `driver/fs/**` 的耦合面，**结论是"搬 + 薄适配"而不是重写**：`tmpfs.cpp` **0** 耦合、FATFS `ff.cpp` **0**、`vfs.cpp` **31**（`get_current_task` 8 + PCB 字段 14 + `device_t` 9，集中在 cwd / fd 表 / tty / pid）、`procfs.cpp` **43**（进程信息 fs，天然要 PCB）。<BR>**进度：**<BR>✅ **1.2b-1 已完成（`5d9ebba`）**：`include/fs/vfs/vfs.h` 与 `include/fs/vfs/list.h` 的 `proto.hpp` 过度包含去掉（`list.h` 那条经 `mm/memory.h` → `efi/efi.h`，而 efi.h 用 `ms_abi`（MSVC/x86 调用约定），ARM 直接报 `'ms_abi' attribute directive ignored [-Werror=attributes]`）；`dnsfs/nmfs` 补上显式 `proto.hpp`（它们用 `snprintf`，而那个声明**就在 proto.hpp 里** —— 用预处理定位过）。结果：**ARM 的 C++ 能包含 `<fs/vfs/vfs.h>` 了**（探针 TU rc=0）。<BR>✅ **架构覆盖层已落地（`7582e3b`）**：`arch/arm32/include/upstream/cpu/lock.h`（上游那份是纯 x86 汇编，9 个 `driver/fs` 文件包含它）+ 三处平台中立修复（`include/stdint.h` 的 `int8_t` 在 ARM 上本就是错的无符号；`NULL` 守卫；`lock_queue.h` 的**引号包含绕过 `-I` 顺序**导致两份 `spin_t` 并存）。<BR>⬜ **剩余（已逐条定位）**：<BR> ① ~~`<cpu/lock.h>` 的 x86 汇编~~ ✅ 覆盖层已解决；<BR> ② ~~指示符顺序~~ ✅ 已修（`dev.cpp` / `pipefs.cpp`，只重排、值不变）；<BR> ③ ~~缺调度器 API~~ ✅ 覆盖层补回了 `<task/scheduler.h>`（实测那个头在 ARM 上 rc=0）；<BR> ④ ~~汇编器 `strex r3,r2,[r3]`~~ ✅ **独立成一笔真 bug 修复**（`a552759`）：`arch_strex`/`arch_ldrex` 缺 early-clobber，寄存器分配是上下文相关的 ⇒ 一直是潜伏的；上板 `smp_lock_counter=40000` / `violations=0` 验证；<BR> ⑤ ~~partition/procfs/pty/socketfs 的错误提取~~ ✅ 已提取：`partition.cpp` 的 `pause` 是它自己手写的汇编（改用 `cpu_relax()`）；`procfs.cpp` 是**真正的 x86 专属文件**。<BR>✅ **`fb23303`**：`dev.cpp` / `pipefs.cpp` / `vfs.cpp` / `pty.cpp` / `socketfs.cpp` / `tmpfs.cpp` / `unixsock.cpp` / `dnsfs.cpp` / `nmfs.cpp` **全部编过**（`-c` 零错误）—— 含 **VFS 本体 `vfs.cpp`（1433 行）**。ARM 侧扫描 **16/17**，唯一编不过的是 `procfs.cpp`（`/proc/cpuinfo` 的 **CPUID 特性名表** `[0]="pni",[25]="sse",[28]="avx"`，GCC 的 C++ 不支持数组指定初始化器 ⇒ 它就是 x86 专属，不是"还差一点"）。<BR>⬜ **下一步就是链接**：把 `vfs.cpp` + `tmpfs.cpp` 加进 `ARM32_UPSTREAM_CXX` 后，编译全过、**链接缺 18 个符号**（已列在提交 `fb23303` 里）。<BR>✅ **`a8de6d2`：18 → 11**。解决的 7 个：`queue_get`/`queue_dequeue`/`queue_destroy`（★ **纯复用** `kernel/lock_queue.cpp`，实测 ARM 零错误）、`scheduler_yield`/`scheduler_sleep_ns`/`scheduler_wake_task`（★ 移植侧 `arch/sched.h` **早就有同名同形的三个函数**，只差前缀）、`disable_intr`/`enable_intr`（`arch_irq_*`）。载体是新增的落地层 `arch/arm32/src/upstream_api.cpp` —— **移植侧唯一的 C++ 文件**，理由：上游 `task/scheduler.h:10-12` 的声明没有 `extern "C"`，C 实现给不出对应符号（实测报 `undefined reference to 'scheduler_yield()'`）。它**只转发不写逻辑**。<BR>★ 由它打出来一条**通用规则**（已写进头部注释）：**移植侧的头文件只要会被 C++ 翻译单元看到，就必须声明 C 链接** —— `arch/sched.h`（实测）、上游 `include/device.h`（`regist_device(char const*, _device)` 链不上）、`arch/device.h`、`krlibc.h` 都已照办；对照 `arch_irq_disable()` 是 `static inline`，不产生符号所以没这个问题。<BR>⬜ **剩余 11 个**（实测）：`get_current_task` / `kernel_group` / `get_current_directory` → **进程层最小切片**；`sprintf` / `write_serial_fmt` → 格式化器（上游在 x86 串口驱动 `driver/serial/serial_port.cpp`，ARM 编不了；移植侧 `console.c` 那个只往串口写、不往缓冲区写）；`get_random_bytes` → rng（上游 `kernel/rng.cpp` 用 x86 指令）；`free_frames` / `page_map_range_to_random` → **x86 页层的 mmap 路径**（ARM 的 vmap/page 模型不同，要单独想清楚）；`get_keyboard_input` / `p_xapi_output_kernel` / `pathacat` → 逐个查。<BR>⚠ 它们**没有**被加进构建图 —— 加了内核会链不上，而拿空壳假装兼容正是本计划 §4.4 警告的事。清单在 `tools/gen_ninja.py` 的 `ARM32_UPSTREAM_CXX` 旁边也写了一份。<BR>✅ **★★ 2026-09-19：缺口清零（11 → 2 → 0），`vfs.cpp` + `tmpfs.cpp` 已永久进构建图 ★★**。<BR>① **11 → 2**（落地层补齐，与 ② 同一笔提交）：`get_current_task`/`kernel_group`/`get_current_directory` = **进程层最小切片**（一个静态 `pcb_t` + `extern pcb_t kernel_group`，全部内核线程共用它 —— 正是源 OS `kernel/task/pcb.cpp:2726` 的模型）；`get_random_bytes` = xorshift32，种子取 333MHz 全局定时器；`free_frames` **不需要实现** —— 真因是上游 `include/proto.hpp` 里 `free_frame()` **没有 `inline`**（头文件里的普通函数定义 ⇒ 每个包含它的 TU 都生成符号、并且拖着 `free_frames`，哪怕一次都没调用过；`nm -u tmpfs.o` 实证）。加 `inline` 后引用消失（平台中立修复，与 `fb23303` 那批同类）。<BR>② **2 → 0**：`sprintf` / `write_serial_fmt` —— 把 console.c 原来"只往串口写"的格式化循环抽成**带输出汇（sink）的核心** `format_core`，三个入口共用同一个核心（`console_printf` 走控制台汇、`console_vprintf`/`console_vsprintf` 是 v 形式；换行转换从循环挪进汇，于是 `%c` 的 `'\n'` 也被补 CR）。<BR>★ **两次都只有工具能看出来的东西**（源码上完全看不出，已各进坑表一条）：<BR>  (a) **符号形状**：`include/proto.hpp:38,42` 把这两条声明写在 `extern "C"` **之外** ⇒ 上游调用点要的是**名字修饰过**的 `_Z7sprintfPcPKcz` / `_Z16write_serial_fmtPKcz`（`arm-none-eabi-nm vfs.o` 实证）。第一版在 C 里定义未修饰的 `sprintf`，链接器照样报 `undefined reference to 'sprintf(char*, char const*, ...)'` —— **同名、不同符号**。⇒ 定义移到 C++ 落地层转发（实现仍只有一份在 console.c）。<BR>  (b) **`-Wl,-z,muldefs`**：`include/fs/vfs/list.h` 在头里**直接定义**了 `list_delete` 一族（非 `inline`、非 `static`）。上游 x86 侧只有 `vfs.cpp` 一个 TU 包含它，所以从没暴露；ARM 侧 `vfs.cpp` + 落地层两个 TU ⇒ multiple definition。**源 OS 自己的内核链接就带 `-z muldefs`** ⇒ 与之对齐，而不是去改公共 ABI 头。<BR>★ **宿主单测在这一次抓到一个会打到板子上的真 bug**：`take_unsigned`/`take_signed` 收 `va_list` **传值** ⇒ 子函数里推进的游标**在返回时丢掉**，第二次转换起全部读同一个槽位（`console_printf("%d|%s", 42, "ok")` **访问违例**；`"%llx|%d"` 打出 `1432778632` = 那个 64 位量的低半部分）。**ARM EABI 的 `va_list` 是结构体、Windows x64 是 `char *`，两种 ABI 下传值都丢** ⇒ 这个写法在**目标板**上同样会打出错值。改成 `va_list *` 后 8 组用例全对。<BR>**验收状态**：`ninja -f build-arm.ninja arm32` = **39/39、0 个未定义符号**，ELF 里 `_Z8vfs_initv` / `_Z9vfs_mountPKcP8vfs_node` / `tmpfs_*` 全在；板上 **100/0**、八组破坏性 A/B 全部检出（`verify_board.py --load --seconds 75` **退出码 0**）。宿主 `tests/test_arm32_console.py`：**7 条 + 10 子判据**（长度修饰符 / 精度 / `*` 宽度 / `%#x` 前缀次序 / `%n` 空操作 / 空指针 / 三个入口的换行差异 + 4 条契约），全套 99 passed（9 条既有失败与本次无关）。<BR>✅ **★★ 1.2b 的验收项已完成（2026-09-19）：上游 VFS 在板上真的跑起来了 ★★**。<BR>`vfs_init()` + `tmpfs_setup()` 已接进启动路径（`arm_vfs_bringup()`：进程上下文 → `vfs_init()` → `tmpfs_setup()` → 根目录填进 cwd，顺序照源 OS `kernel/main.cpp:457` 与 `:558`）。板上 **110 passed / 0 failed**、八组 A/B 全检出（退出码 0），十条新判据：<BR>`vfs_bringup=1` / `vfs_tmpfs_mounted=1` / `vfs_create=1` / **`vfs_write=32`** / **`vfs_read=32`** / **`vfs_roundtrip=1`** / `vfs_list_delta=1`（`vfs_list_before=0`，之后 ≥ 2）/ `vfs_cwd_root=1` / `vfs_negative_ok=1`。<BR>★ **判据分三层,而且第三层不是装饰**（见 `arch/vfs_check.h` 文件头）：① 32 字节模式**写进去读回来逐字节相同**；② **`/tmp` 的 `fsid` 必须不同于 `/`** —— 那才是"挂载真的发生"的证据（`tmpfs.cpp:111` 的 `node->fsid = tmpfs_id`；没挂上就只是根 fs 的普通目录）；③ **反面控制：在根 fs 上做同样的往返必须不成立**。第三层的必要性来自一个**上游的实现细节**：给未挂载节点的回调是 `static void empty_func() {}` —— **返回 void 却被塞进 `size_t (*)(...)` 的槽**，于是"调用成功"本身**不携带信息**（返回值未定义）。只看前两层，"建文件成功"完全可能是假通过（坑 43 的同型）。<BR>★ 一处**结构决定**:`include/fs/vfs/vfs.h` **整个文件没有 `extern "C"`** ⇒ VFS 的公开函数全是 C++ 链接（`_Z8vfs_initv` 实测）⇒ 移植侧 C 调不了。于是分成"**调用在 C++ 落地层、判据在移植侧 C**"（`arch/arm32/src/vfs_check.c`），落地层的七个 `arm_vfs_*` 全是 `extern "C"` 的纯转发。由 `tests/test_arm32_vfs.py`（**9 条 + 27 子判据**）钉住这条交界线：声明/定义同形、必须带 `extern "C"`、上游函数必须真在上游头里有声明、`TMPFS_REGISTER_ID` 与 `tmpfs_mount()` 的判据必须同一个数、以及"`vfs.h` 仍然没有 `extern "C"`"（这条是整组断言的前提，上游变了它就该失败）。<BR>⬜ **1.2b 之后**：M4A-1.3（块设备 + `diskio`）与 1.4（FATFS，先接 RAM 盘） |
 | **M4A-1.3** | 块设备（SD/arasan）+ `diskio` | 独立，可并行 | 读写扇区 + 写回读 |
-| **M4A-1.4** | **FATFS** | M4A-1.2 + M4A-1.3 | 挂载 + 读写文件 + 与主机侧比对 |
+| ~~**M4A-1.4**~~ | ~~**FATFS**~~ | M4A-1.2 ✅ | ✅ **已完成（2026-09-19）：板上 127/0、八组 A/B 全检出**。验收判据"**挂载 + 读写文件 + 与主机侧比对**"三条都上了板。<BR>★ **关键发现:这个 OS 的块层就是 VFS** —— `diskio.cpp` 把 `disk_read()` 落成 `vfs_read(node, buff, sector*512, count*512)`,**没有独立的块设备 API** ⇒ **RAM 盘 = 一个 8MB 的 tmpfs 文件**,零新增块驱动代码,而且走的正是**决策 3** 说的"与真实块设备完全相同"的那条 `diskio` 路径(M4A-1.3 的真实块设备接上后,`diskio` 一行都不用改)。<BR>★ 5 个上游文件(含 2MB 的 `ffunicode.cpp`)全部**零修改**编过,链接缺口正好 **8 个符号**:`mutex_create/lock/unlock`、`mktime`、`realtime_ns`、`ahci_is_qemu_environment`(×2)、`alloc_frames`、`phys_to_virt`。**全部是 C++ 链接**(`_Z12mutex_createP5mutexb` 实测)⇒ 实现在 C++ 落地层、**不能**写 `extern "C"` —— ★ **与 VFS 那组正好相反**(那边要求 `extern "C"`,因为调用方是移植侧 C);规则由"符号由谁调"决定。<BR>三条决策(各有完整理由,见 README 的 M4A-1.4 一节):① **`FM_FAT` 而不是上游写死 FAT32 的 `fatfs_format_node()`** —— FAT32 要 ≥ ~34MB,内核堆**正好 32MB**;(另:`alloc_number()` 是 `fatfs.cpp` 的 `static`,落地层拿不到)② **互斥锁**把上游 `mutex_t` 对象当**不透明存储**(移植侧只占前 16 字节)交给 M4-11.1 验过的那把 mutex,移植侧加三个 `arm_mutex_*` **换名字**入口(同名 + 两种链接在 C++ 里非法),两侧各一条静态断言钉住 16 字节;③ **`realtime_ns()` 是开机以来的纳秒数**(Zynq 上没有 CMOS —— 那份实现不是"没搬"而是"搬来也没硬件",记 D24)。<BR>★ **"与主机侧比对"是第三条独立证据**:板子把引导扇区原样打一行 `FATBS:<1024 hex>`,宿主机用**自己的**解析核(`tmp-test/verify_fat_bootsector.py`),并由"FAT 占 7 扇区 / 2043 簇"**用算术反推子类型 = FAT12**(不看任何标签)。<BR>⬜ **本步之外**:M4A-1.3 的真实块设备(SD/arasan)仍未开始 —— 今天验的是"卷是内存文件"这条路径 |
 | **M4A-1.5** | `procfs` / `dev` / `pipe` / `pty` | M4A-1.2 | 逐项 |
 
 **决策 3：M4A-1.4 先接 RAM 盘。**

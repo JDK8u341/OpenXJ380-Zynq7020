@@ -2132,6 +2132,8 @@ switched=30 preempted=27 invalid=0
 | D20 | ★ **偏离（不是退化）：未知格式符原样吐出，源 OS 是直接结束** ★ | `src/console.c` 的 `format_core` default 分支 | 源 OS 的 `wfmt_arg` 遇到不认识的转换符 `return 0`（`serial_port.cpp:382-384`）—— **后面全都不打了**。移植侧选择"原样吐出来"（`%q` 打 `%q`），因为格式串写错时"看得见"比"静默截断"好查 | 不打算改。判据钉在 `tests/test_arm32_console.py`（`unknown verb`）。★ 代价是"打错了会多打几个字符"，不是"打错值" |
 | D21 | **`+` 与空格标志被接受但不生效** | 同上（标志解析循环里显式吃掉） | 源 OS 认这两个标志（`serial_port.cpp:265-266`），但移植侧至今没有一处需要"强制正号"。**必须吃掉**的理由不是美观：不吃掉就会被当成未知格式符 ⇒ **实参不取走** ⇒ 后面全部错位 | 需要时再实现（一处 `out_number` 加一个 bool）。判据已有：`%+d|%d` 必须打出 `5|42`（钉住"吃掉了且没错位"） |
 | D22 | ★ **落地层有四个"响亮拒绝"式实现**（不是空壳）★ | `src/upstream_api.cpp` | 上游要符号，而 ARM 对应物**不存在**：`get_current_directory()`→`NULL`（内核线程没有"当前目录"这个概念，源 OS 里它读 `get_current_task()->cwd`，而我们的 tcb 与上游 tcb_t 不是同一个类型）；`page_map_range_to_random()` 与 `scheduler_wake_task()`→**打印一行 + 计数**（`arm_page_map_unsupported_count()`），因为它们要么依赖用户地址空间（M7）、要么参数类型是上游 `tcb_t`；`get_keyboard_input()`→`0`（PS/2 键盘在 ARM 上不存在；★ `0` 在这里是**正确**答案不是占位 —— `vfs.cpp:1368` 拿它当"有没有按键"，而"没有按键"就是 0） | 逐个随阶段消掉：`get_current_directory` 待 D18 的每进程 `cwd`（M7）；`page_map_range_to_random` 待用户地址空间（M7）；`scheduler_wake_task` 待两边 `tcb_t` 统一（M7）；键盘待某个真输入源接进 tty（M4A-1.5 或之后）。⚠ **"响亮拒绝"是有意的选择**：静默返回成功会让调用点拿到假结果，而那种 bug 会跑到很远才发作 |
+| D23 | ★ **x86 预读路径的两个符号是"响亮拒绝 + 计数"，而不是实现** ★ | `src/upstream_api.cpp` 的 `alloc_frames` / `phys_to_virt` / `ahci_is_qemu_environment` | `diskio.cpp` 有一条 **QEMU/AHCI 专用**的预读优化：`ahci_is_qemu_environment()` → `alloc_frames()` + `phys_to_virt()`。Zynq 上**没有 AHCI 器件** ⇒ 第一个如实返回 `false`、整条路不可达。后面两个按本项目的规矩返回**调用方已经处理**的失败值（`0` / `NULL`）并计数 | **不打算实现**：ARM 的页模型是 palloc/vmap，没有 x86 那个 HHDM 直映射窗口，编一个假的 `phys_to_virt` 只会把错误推到更远。★ 而"不可达"是**可判的**：板上自检 `fatfs_x86_path`（计数必须 0）就是证据 —— M4A-1.4 实测 0 |
+| D24 | ★ **没有墙钟：`realtime_ns()` 返回的是开机以来的纳秒数** ★ | `src/upstream_api.cpp` 的 `realtime_ns()`（转发到移植侧的 `timer_read_ns()`） | 上游的实现在 `driver/rtc.cpp`，读的是 PC 的 **CMOS**（0x70/0x71 端口）—— Zynq 上**不存在这个器件** ⇒ 那份实现不是"还没搬"，是"搬过来也没有硬件"。FATFS 拿它当挂载时刻与文件 mtime 用 | 出现墙钟源时替换：Zynq PS RTC（`0xF8006000`）驱动，或由控制台设一次时间。★ 它**不是常量**（单调递增），所以"后写的文件更新"这类判断仍然成立；但文件日期是"1970 + 启动秒数"，不是真实日期。★ 同一批里 `mktime()` 是**逐行照搬**上游那份纯算术（含它两处非 ISO 语义），并有宿主机逐日期比对（`tests/test_arm32_fatfs.py`） |
 
 #### ★ 与源 OS **一致**、别当成缺功能的几处（M4A-1.2b 核对过）★
 
@@ -2986,6 +2988,101 @@ SELF-TEST: 110 passed, 0 failed
 
 `vfs_list_delta` 判的是"**相对基线多出两个子项**"（`list_before=0`），
 不是"之后 ≥ 2" —— 后者一个恒返回大数的假实现也能过。
+
+---
+
+### M4A-1.4：FATFS 在 RAM 盘上跑起来了（已完成，板上 127/0）
+
+验收判据是计划里的"**挂载 + 读写文件 + 与主机侧比对**"。
+
+#### 关键发现：这个 OS 的**块层就是 VFS**
+
+读 `diskio.cpp` 之前我准备写一个 RAM 盘块驱动。读完发现不需要：
+
+```
+disk_read(pdrv, buff, sector, count)
+   → fatfs_get_node_by_number(pdrv)          // 一个 **vfs_node_t**
+   → vfs_read(node, buff, sector*512, count*512)
+```
+
+**没有独立的块设备 API** —— `disk_*` 全部落成"按字节偏移读写一个 VFS 节点"。
+而 tmpfs 文件本来就能按偏移读写（M4A-1.2b 已在板上验过）⇒
+
+    RAM 盘 = 一个 8MB 的 tmpfs 文件（零新增块驱动代码）
+
+而且它走的正是计划**决策 3** 说的那条"与真实块设备完全相同"的 `diskio` 路径。
+
+#### 三个决策与理由
+
+1. **卷用 `FM_FAT`（FAT12/16 族）格式化，而不是上游那个写死 FAT32 的辅助函数。**
+   `fatfs_format_node()` 把 `opt.fmt` 写死成 `FM_FAT32`（`fatfs.cpp:57`），
+   而 FAT32 要求卷内 ≥ ~65525 簇（512B 簇 ⇒ **≥ 34MB**）；RAM 盘要装在内核堆里，
+   堆是**正好 32MB**（`HEAP_PAGES = 8192`）⇒ 装不下。
+   ⇒ 不往上堆内存（那是拿"改大内存"掩盖设计），改用 `f_mkfs()` 的
+   `FM_FAT | FM_SFD` —— **同一个上游 API**，只换格式化参数。
+   ⚠ 另一条更本质的理由：`fatfs_format_node()` 内部走 `alloc_number()`，
+   那是 `fatfs.cpp` 的 **`static`** 函数，落地层拿不到。
+
+2. **子类型（FAT12/16）不由我们指定 —— FatFs 按簇数自己选，8MB 上实测选到 FAT12。**
+   实测数据：8 扇区/簇（4KB）⇒ 2043 簇 ⇒ FAT 占 **7 扇区**
+   （2043 簇的 FAT12 需要 6 扇区、FAT16 需要 8 扇区）。
+   ★ 这条**我原先写错了**：移植侧写死"必须是 FAT16"，于是对一个**正确**的卷
+   报了假 FAIL（第一次上板：126 passed / 1 failed）。修正分两处：
+   板子只判**族标签**（`'FAT'`，那才是 `f_mkfs` 真正写下的），
+   子类型交给宿主机用**算术**独立推。
+
+3. **8 个符号全部由 C++ 落地层给出，且都**不能**写 `extern "C"`。**
+   实测目标文件里是修饰名（`_Z12mutex_createP5mutexb`、`_Z6mktimeP2tm` …）。
+   ⚠ 与 VFS 那组**正好相反**（那边要求 `extern "C"`）——
+   规则由"符号由谁调"决定：VFS 是移植侧 C 要调，FATFS 是上游 C++ 要调。
+
+   其中互斥锁那条有个结构性难点：两边 `mutex_t` **布局不同**
+   （上游多了 `spin_t lock` 与 `wait_queue`），不能 reinterpret。做法是把上游
+   那个对象当**不透明存储**（移植侧只占前 16 字节）交给 M4-11.1 验过的那把
+   mutex；移植侧提供 `arm_mutex_*` 三个**换名字**入口，因为同名 + 两种链接
+   在 C++ 里是非法声明。两侧各一条静态断言钉住"16 字节"这个前提。
+
+#### 与主机侧比对（第三条判据）
+
+板子把卷的**引导扇区原样**打一行 `FATBS:<1024 个十六进制字符>`，
+宿主机用自己的解析独立核（`tmp-test/verify_fat_bootsector.py`）：
+
+```
+signature                55 AA      == 55 AA        PASS
+bytes/sector               512      == 512          PASS
+sectors/cluster              8      是 2 的幂       PASS
+reserved sectors             1      >= 1            PASS
+num FATs                     1      == 1            PASS
+root entries               512      > 0             PASS
+FAT size (16)                7      > 0             PASS
+total sectors            16384      == 16384        PASS
+fs type label            'FAT'      以 FAT 开头     PASS
+clusters (derived)        2043      自洽            PASS
+subtype (from FAT size)  FAT12      算术自洽        PASS
+```
+
+★ `subtype` 那一行**不看任何标签**：由"FAT 占 7 扇区 / 2043 簇"反推每个表项
+是 12 位还是 16 位。板子自说自话不算数 —— 这一条是"让另一个系统去读同一个产物"。
+
+⚠ 这一路也修掉了**两个我自己的判据 bug**：宿主脚本把 510/511 的 `55 AA`
+当小端 u16 比较（对正确的卷报 FAIL），以及上面那条 FAT16 假设。两条都记进坑表。
+
+#### 上板原文
+
+```
+fatfs_init         1   fatfs_ramdisk      1     fatfs_ramdisk_size 8388608
+fatfs_format       1   fatfs_mount        1     fatfs_create       1
+fatfs_write       32   fatfs_read        32     fatfs_roundtrip    1
+fatfs_list         1   fatfs_volume_fsid  1     fatfs_x86_path     0
+fatbs_read       512   fatbs_signature    1     fatbs_bytes_per_sector 512
+fatbs_total_sectors 16384  fatbs_fat_family 1
+SELF-TEST: 127 passed, 0 failed
+```
+
+`fatfs_volume_fsid` 要求 **三个 fsid 两两不同**（根 / tmpfs / fatfs 三个文件系统
+实例同时在场）—— 只判"fsid >= 0"没有区分度：挂载失败时 `/mnt` 会退回成根的
+普通目录，fsid 照样 ≥ 0。
+`fatfs_x86_path` 是 D23 的判据：x86 预读路径的计数必须 **0**。
 
 ---
 
