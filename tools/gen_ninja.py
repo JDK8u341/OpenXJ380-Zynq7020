@@ -637,6 +637,19 @@ ARM32_UPSTREAM_CXX = (
     "driver/fs/fatfs/ffsystem.cpp",
     "driver/fs/fatfs/diskio.cpp",
     "driver/fs/fatfs/fatfs.cpp",
+    #
+    # ✅ **M4A-1.5:`dev.cpp`(上游 devfs)+ `pipefs.cpp`(管道)**。
+    #    两个都**零修改**编过;加上它们之后的链接缺口只有 4 个符号,
+    #    而且其中 3 个是"同名不同符号"那一类(坑表 55):
+    #      dev.cpp    disk_size(int)   → 移植侧有 C 版,但上游要**修饰名**
+    #                 write_serial_string / blk_device_read / blk_device_write
+    #    ⚠ ⚠ 这一笔**同时**把移植侧那份 devfs **骨架**送走了:
+    #      骨架与上游 dev.cpp **都定义** `devfs_register` / `devfs_delete`
+    #      (C 链接、同名),而内核链接带 `-z muldefs` ⇒ ld 会**静默挑一个**,
+    #      谁生效取决于命令行顺序。那种"看起来能跑"的重复定义必须显式二选一;
+    #      选上游(源 OS 优先)顺带把"devfs 骨架"那条退化项消掉。
+    "driver/fs/vfs/dev.cpp",
+    "driver/fs/vfs/pipefs.cpp",
 )
 
 # 移植侧的 C++ 源文件(**只有落地层**)。

@@ -46,6 +46,7 @@
 
 #include <fs/fatfs/fatfs.h> /* fatfs_init / FATFS 的格式化与挂载(M4A-1.4) */
 #include <fs/fatfs/ff.h>     /* f_mkfs / MKFS_PARM / FM_FAT / FF_MAX_SS */
+#include <fs/vfs/devfs.h>    /* devfs_setup()(M4A-1.5:改用上游那份 devfs)*/
 #include <fs/vfs/vfs.h>
 #include <krlibc.h>
 #include <lock_queue.h>
@@ -994,4 +995,144 @@ extern "C" int arm_fatfs_read_raw(const char *path, void *buf, unsigned int len)
         return -1;
     }
     return (int)vfs_read(node, buf, 0u, (size_t)len);
+}
+
+/* ====================================================================
+ * ★★ devfs 与块层(M4A-1.5)★★
+ * ====================================================================
+ *
+ * ## 移植侧那份 devfs **骨架退场**,改用上游那份
+ *
+ * M4A-1.1b 时移植侧写了一个"只登记不建节点"的 devfs 骨架(记在 README 的
+ * 退化清单里,计划 §4.4 第 4 条也点名过它是 B5-b 退化形态)。
+ * M4A-1.5 把它换掉,**但不是"顺手换"** —— 是链接期强制的:
+ * 骨架与上游 `dev.cpp` **都定义** `devfs_register` / `devfs_delete`
+ * (C 链接、同名),而本项目的内核链接带 `-Wl,-z,muldefs`
+ * (源 OS 自己就带,见 `tools/gen_ninja.py` 里那段说明)⇒
+ * **ld 会静默挑一个**,谁生效取决于命令行顺序。
+ * 那种"看起来能跑"的重复定义正是本项目最忌讳的东西,所以必须显式二选一。
+ * 选上游(源 OS 优先)的额外好处:骨架的退化项就此消掉,`/dev` 下是真的
+ * VFS 节点,`by-name` 从"一张私表"变成"`vfs_open("/dev/xxx")`"。
+ *
+ * ## 三个符号的形状:又是"同名不同符号"
+ *
+ * `driver/fs/vfs/dev.cpp` 是 C++ 翻译单元,它要的是**修饰名**:
+ *
+ *     $ arm-none-eabi-nm out/arm32/upstream/driver/fs/vfs/dev.o | grep ' U '
+ *     U _Z9disk_sizei                    ← 上游 device.h:59 的 disk_size(int)
+ *     U _Z15blk_device_readiPvjj
+ *     U _Z16blk_device_write8_device_tPKvjj
+ *     U _Z18write_serial_stringPKc
+ *
+ * ⚠ `disk_size` 这条尤其值得记:移植侧的 `src/device.c` **已经有**一份
+ *   C 链接的 `disk_size(int)`(kmain 的设备自检就在用它),
+ *   但那是**未修饰**符号,与 dev.cpp 要的 `_Z9disk_sizei` 不是同一个
+ *   (与 `sprintf` 那次完全同型,坑表 55)。
+ *
+ * ⚠ 那为什么不去把上游 `include/device.h:59` 的声明改成 `extern "C"`?
+ *   因为上游 x86 侧**同时**有两个 `disk_size`:
+ *     `driver/device.cpp:216`  `size_t disk_size(int)`
+ *     `driver/fs/fatfs/diskio.cpp:181` `u32 disk_size(byte)`
+ *   给前者加 C 链接就会与后者**在 C 里撞名**(C 没有重载)⇒
+ *   **直接弄坏 x86 构建**。⇒ 由落地层给出那个 C++ 名、转发到移植侧实现,
+ *   实现仍然只有一份(`arm_disk_size`,与 `arm_mutex_*` 同型)。
+ */
+
+extern "C" size_t arm_disk_size(int drive);
+
+size_t disk_size(int drive)
+{
+    return arm_disk_size(drive);
+}
+
+/*
+ * `write_serial_string` ← `driver/serial/serial_port.cpp`。
+ * 移植侧的输出通道就是 PS UART 串口 ⇒ 转发到 console(与 `write_serial_fmt`
+ * 同一处理,只是不带格式化)。
+ */
+void write_serial_string(const char *str)
+{
+    if (str != NULL) {
+        console_puts(str);
+    }
+}
+
+/*
+ * ---- 块层:`blk_device_read` / `blk_device_write` ----
+ *
+ * 上游实现在 `driver/device.cpp`(216/318/415 行),而那个文件**还没进 ARM 图**
+ * —— 它卡在分区层与进程层上(计划把它归到 M4A-3/B5)。
+ *
+ * 而 ARM 侧今天**根本没有块设备**:`sdhci0` 在描述表里,但驱动一行没写
+ * (M4A-1.3 的活)。所以这两个函数在当前构建里是**不可达**的
+ * (`devfs_read`/`devfs_write` 只在节点挂的是块设备时才会走到它们)。
+ *
+ * ⇒ 按本项目的规矩做**响亮拒绝**:返回 0(调用方按"读到 0 字节"处理)
+ *   并计数。★ "不可达"是**可判的**:计数必须恒为 0
+ *   (`arm_blk_device_calls()`),由板上自检读。
+ *   替换条件写进 README 的退化清单(D25):M4A-1.3 接上真实块设备、
+ *   并把 `driver/device.cpp` 的块层搬进来时。
+ */
+static unsigned int g_blk_device_calls;
+
+size_t blk_device_read(int drive, void *buffer, size_t offset, size_t length)
+{
+    (void)drive;
+    (void)buffer;
+    (void)offset;
+    (void)length;
+    g_blk_device_calls++;
+    return 0u;
+}
+
+size_t blk_device_write(device_t device, const void *buffer, size_t offset, size_t length)
+{
+    (void)device;
+    (void)buffer;
+    (void)offset;
+    (void)length;
+    g_blk_device_calls++;
+    return 0u;
+}
+
+extern "C" unsigned int arm_blk_device_calls(void)
+{
+    return g_blk_device_calls;
+}
+
+/*
+ * ---- 挂 `/dev` ----
+ *
+ * ← `devfs.h:17` 的 `void devfs_setup();`(C++ 链接 `_Z11devfs_setupv`)。
+ * 内部 = `vfs_regist("devfs", …)` + `vfs_mkdir("/dev")` + `vfs_mount(/dev)`
+ * + `vfs_mkdir("/dev/ptx")`。
+ *
+ * ⚠ 必须在 **VFS 起搏之后**调:`vfs_mkdir` / `vfs_open` 都要根目录先在。
+ *   而在它**之前**注册的设备**不会**有节点 —— 上游 `devfs_register` 自己
+ *   就是 `if (devfs_root == NULL) { return EOK; }`(dev.cpp:345)。
+ *   ★ 这一点正是新 A/B 的一侧:**上游语义天然给出"挂载前无名、挂载后有名"**,
+ *   不需要移植侧再造一个开关(旧的 `devfs_ab_set_disabled` 已随骨架删除)。
+ */
+extern "C" void arm_devfs_setup(void)
+{
+    devfs_setup();
+}
+
+/*
+ * "`/dev` 下这个节点存在吗" —— 给移植侧 C 用的探针。
+ *
+ * 为什么需要它:节点是不是真的建出来了,唯一可信的观测点是
+ * `vfs_open("/dev/xxx")`(那正是上游 `devfs_register0()` 建节点的方式)。
+ * 而 `vfs_node_t` 是**上游类型**,移植侧 C 看不到(合流纪律 #4)⇒
+ * 由落地层做这一次打开/关闭,只把"成不成"这一位交回去。
+ */
+extern "C" int arm_devfs_node_exists(const char *path)
+{
+    vfs_node_t node = vfs_open(path);
+
+    if (node == NULL) {
+        return 0;
+    }
+    vfs_close(node);
+    return 1;
 }

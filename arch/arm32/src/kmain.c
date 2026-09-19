@@ -1427,6 +1427,10 @@ static u32 g_palloc_smoke;
 static u32 g_heap_selftest;
 static u32 g_heap_smoke;
 static u32 g_heap_bind_ab;
+/* 落地层转发(M4A-1.5;VFS 的 API 是 C++ 链接的,理由见 upstream_api.cpp) */
+extern void arm_devfs_setup(void);
+extern int  arm_devfs_node_exists(const char *path);
+
 static u32 g_device_roundtrip;
 static u32 g_device_devfs_ab;
 
@@ -2428,17 +2432,16 @@ void kmain(void)
         }
     }
 
-    /* ---- 9.45 设备管理器 + devfs 骨架(M4A-1.1b)---- */
+    /* ---- 9.45 设备管理器(设备表;devfs 的节点部分见 9.45d)---- */
     /*
      * 位置:必须在**堆之后** —— `devfs_register` 会把注册路径 strdup 一份
-     * 存进设备表(上游 dev.cpp:322 就是这么做的),而 strdup 要堆。
+     * 存进设备表(上游 dev.cpp:344 就是这么做的),而 strdup 要堆。
      *
-     * 判据是**往返**:注册 → 按 id 取回 → 按名字取回 → 注销 → 都取不到。
-     *
-     * ⚠ 两个观测点都要有,不能只看 get_device:
-     *   `devfs_lookup()` 是**独立于设备表**的那一个 —— 只查设备表的话,
-     *   devfs 什么都不做也会通过(那正是计划 §4.4 警告的"只登记不建节点"
-     *   的假兼容,下面的破坏性 A/B 就是专门去证明这件事的)。
+     * ⚠ **本段的判据只覆盖"设备表"这一半**(注册 → 按 id 取回 → 注销)。
+     *   `by-name` 那半边在 M4A-1.5 之后**属于 VFS**(上游 devfs 在 `/dev` 下
+     *   建真正的节点,按名字找 = `vfs_open("/dev/xxx")`),而 VFS 要到 9.45b
+     *   才起搏 ⇒ 那一半挪到 9.45d,见那里的说明。
+     *   旧的移植侧骨架有 `devfs_lookup()`(一张私表),它随骨架一起退场了。
      */
     g_device_roundtrip = 0u;
     g_device_devfs_ab  = 0u;
@@ -2467,6 +2470,12 @@ void kmain(void)
          * ⚠ 这里刻意传非 NULL 的 path 而不是 NULL:
          *   NULL 那条分支下 device_ctl[id].path 本来就是 NULL,
          *   "路径被复制了没有""注销时释放了没有"这两件事都**看不出来**。
+         *
+         * ⚠ 传 "/blk" 在**上游语义**下意味着"这个设备挂在 /dev/blk 这个
+         *   **子目录**下"(dev.cpp:37 的 `sprintf(buf, "/dev/%s", path)`)。
+         *   那个目录不存在 ⇒ `vfs_open` 失败 ⇒ **不建节点**(但设备表登记
+         *   照样成功,`.path` 照样是副本)。这正是本段要验的那两件事,
+         *   而"节点"那件事由 9.45d 用 path=NULL 的设备去验。
          */
         if (ok != 0u) {
             id_a = regist_device("/blk", dev);
@@ -2490,9 +2499,6 @@ void kmain(void)
                 else if (device_ctl[id_a].path == (const char *)"/blk") { ok = 0u; }
                 else if (strcmp(device_ctl[id_a].path, "/blk") != 0) { ok = 0u; }
             }
-
-            /* ★ 独立观测点 */
-            if (ok != 0u && devfs_lookup("rt0") != id_a) { ok = 0u; }
         }
 
         /* 第二个设备:id 不重复、名字各归各 */
@@ -2500,61 +2506,20 @@ void kmain(void)
             strcpy(dev.drive_name, "rt1");
             id_b = regist_device(NULL, dev);
             if (id_b < 0 || id_b == id_a) { ok = 0u; }
-            else if (devfs_lookup("rt1") != id_b) { ok = 0u; }
-            else if (devfs_node_count() != 2u) { ok = 0u; }
         }
 
-        /* 注销 a:它两个方向都要消失,而 b 不受影响 */
+        /* 注销 a:设备表里两个方向都要消失,而 b 不受影响 */
         if (ok != 0u) {
             delete_device(id_a);
-            if (devfs_lookup("rt0") != -1) { ok = 0u; }
             if (device_ctl[id_a].path != NULL) { ok = 0u; } /* 路径副本要释放掉 */
-            if (devfs_lookup("rt1") != id_b) { ok = 0u; }
-            if (devfs_node_count() != 1u) { ok = 0u; }
+            if (get_device((size_t)id_a) != NULL) { ok = 0u; }
+            if (get_device((size_t)id_b) == NULL) { ok = 0u; }
             delete_device(id_b);
-            if (devfs_node_count() != 0u) { ok = 0u; }
         }
 
         g_device_roundtrip = ok;
-        console_printf(" Device rt   : regist/get/get-by-name/delete round trip = %s\n",
+        console_printf(" Device rt   : regist/get/path-copy/delete round trip = %s\n",
                        ok != 0u ? "PASS" : "FAIL");
-
-        /*
-         * ★ 破坏性 A/B(M4A-1.1b):把 devfs 关掉,只登记不建节点。
-         *
-         * 这就是计划 §4.4 第 4 条点名的 **B5-b 退化形态**("先做只登记、
-         * 不建节点的退化实现")。要证的是:上面那条往返**确实**依赖 devfs ——
-         * 关掉之后 `get_device` 照样成功,而 `devfs_lookup` 必须找不到。
-         *
-         * 两侧缺一不可:只报"找不到"的话,可能是注册本身就失败了;
-         * 只报"取得到"的话,那正是没有区分能力的假通过(坑 43)。
-         */
-        if (ok != 0u) {
-            device_t dev2;
-            int      id_c;
-            u32      by_id_ok;
-            u32      by_name_missing;
-
-            memset(&dev2, 0, sizeof(dev2));
-            dev2.flag = 1;
-            dev2.type = DEVICE_STREAM;
-            strcpy(dev2.drive_name, "ab0");
-
-            devfs_ab_set_disabled(1u);
-            id_c = regist_device(NULL, dev2);
-            devfs_ab_set_disabled(0u);
-
-            by_id_ok        = (id_c >= 0 && get_device((size_t)id_c) != NULL) ? 1u : 0u;
-            by_name_missing = (devfs_lookup("ab0") == -1) ? 1u : 0u;
-
-            if (id_c >= 0) {
-                delete_device(id_c);
-            }
-
-            g_device_devfs_ab = (by_id_ok != 0u && by_name_missing != 0u) ? 1u : 0u;
-            console_printf(" Device A/B  : devfs-off -> by_id=%u by_name_missing=%u\n",
-                           (u32)by_id_ok, (u32)by_name_missing);
-        }
     }
 
     /* ---- 9.45b ★ VFS 起搏 + tmpfs 验收(M4A-1.2b 的验收项)★ ---- */
@@ -2576,6 +2541,90 @@ void kmain(void)
         const vfs_check_t *vfs = vfs_check_run();
 
         g_vfs = *vfs;
+    }
+
+    /* ---- 9.45d ★ devfs(上游那份)与它的 A/B(M4A-1.5)★ ---- */
+    /*
+     * 位置:必须在 **VFS 起搏之后**(`devfs_setup()` 要 `vfs_mkdir("/dev")`
+     * 与 `vfs_open("/dev")`)。
+     *
+     * ## 换掉了什么
+     *
+     * M4A-1.1b 时移植侧写过一个 devfs **骨架**(一张"名字 → id"私表,
+     * `/dev` 下**没有**节点)。M4A-1.5 换成上游 `driver/fs/vfs/dev.cpp`。
+     * 这不是"顺手换":骨架与上游 dev.cpp **都定义** `devfs_register` /
+     * `devfs_delete`(C 链接),而内核链接带 `-Wl,-z,muldefs` ⇒
+     * ld 会**静默挑一个**。必须显式二选一;选上游就是"源 OS 优先",
+     * 顺带把那条退化项消掉。
+     *
+     * ## 判据(两条,合成一组 A/B)
+     *
+     * 上游 `devfs_register()` 的第一句就是
+     *     `if (devfs_root == NULL) { return EOK; }`   (`dev.cpp:345`)
+     * 也就是"`/dev` 还没挂 ⇒ 登记成功但**不建节点**"。
+     * ★ 这给了我们一个**不依赖移植侧开关**的 A/B(旧的
+     *   `devfs_ab_set_disabled()` 随骨架一起删了):
+     *     ① 挂载**前**注册的设备:**按名字找不到**
+     *        —— 而且 `get_device(id)` 照样成功(证明设备表这一半是好的);
+     *     ② 挂载**后**注册的设备:**按名字找得到**;
+     *     ③ 注销之后:又找不到(证明 `devfs_delete` 真的摘了节点)。
+     *   ①与②缺一不可:只报①可能是注册本身就坏了;只报②则没有区分能力(坑 43)。
+     *
+     * ⚠ "按名字找"在 M4A-1.5 之后**就是** `vfs_open("/dev/<drive_name>")`
+     *   —— 节点名取的是 `device->drive_name`(`dev.cpp:68`),而 `path` 参数
+     *   指的是 `/dev` 下的**子目录**(`dev.cpp:37`)。所以这里注册时传 NULL。
+     */
+    if (g_heap.inited) {
+        device_t pre, post;
+        int      id_pre  = -1;
+        int      id_post = -1;
+        u32      pre_missing = 0u;
+        u32      post_found  = 0u;
+        u32      gone_after  = 0u;
+        u32      ab_ok       = 0u;
+
+        memset(&pre, 0, sizeof(pre));
+        pre.flag = 1;
+        pre.type = DEVICE_STREAM;
+        strcpy(pre.drive_name, "pre0");
+
+        memset(&post, 0, sizeof(post));
+        post.flag = 1;
+        post.type = DEVICE_STREAM;
+        strcpy(post.drive_name, "post0");
+
+        /* ① 挂载前注册(path=NULL ⇒ 目标就是 /dev 本身,但那时它还没挂)*/
+        id_pre = regist_device(NULL, pre);
+        if (id_pre >= 0) {
+            /* ⚠ 观测点必须走落地层:`vfs_node_t` 是上游类型,移植侧 C 看不到 */
+            pre_missing = arm_devfs_node_exists("/dev/pre0") ? 0u : 1u;
+        }
+
+        /* 挂 /dev */
+        arm_devfs_setup();
+
+        /* ② 挂载后注册 —— 这一次必须建出节点 */
+        id_post = regist_device(NULL, post);
+        if (id_post >= 0) {
+            post_found = arm_devfs_node_exists("/dev/post0") ? 1u : 0u;
+        }
+
+        /* ③ 注销之后节点要消失 */
+        if (id_post >= 0) {
+            delete_device(id_post);
+            gone_after = arm_devfs_node_exists("/dev/post0") ? 0u : 1u;
+        }
+
+        if (id_pre >= 0) {
+            delete_device(id_pre);
+        }
+
+        /* 设备表那一半也要成立 —— 与 9.45 的两个方向互补 */
+        ab_ok = (pre_missing != 0u && post_found != 0u && gone_after != 0u) ? 1u : 0u;
+        g_device_devfs_ab = ab_ok;
+
+        console_printf(" Device A/B  : pre-mount=%u post-mount=%u after-delete=%u\n",
+                       (u32)pre_missing, (u32)post_found, (u32)gone_after);
     }
 
     /* ---- 9.45c ★ FATFS 起搏 + RAM 盘验收(M4A-1.4)★ ---- */

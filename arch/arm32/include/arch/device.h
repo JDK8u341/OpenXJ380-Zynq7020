@@ -183,50 +183,55 @@ bool have_vdisk(int drive);
 /* 设备容量;槽位空返回 0 */
 size_t disk_size(int drive);
 
-/* ---- devfs 骨架 ---- */
+/*
+ * ★ 落地层入口:只换名字、不换语义(M4A-1.5,与 `arm_mutex_*` 同型)★
+ *
+ * 为什么需要:上游 `include/device.h:59` 声明 `size_t disk_size(int drive);`,
+ * 而 `driver/fs/vfs/dev.cpp` 是 **C++** 翻译单元 ⇒ 它要的是**修饰名**
+ * (`_Z9disk_sizei`)。移植侧这份实现是 C(未修饰的 `disk_size`),
+ * 两者**不是同一个符号** —— 这与 `sprintf` 那次(坑表 55)是同一个坑。
+ *
+ * ⚠ 那为什么不直接把上游声明改成 `extern "C"`?因为上游 x86 侧**同时**有
+ *   两个 `disk_size`:`driver/device.cpp:216` 的 `size_t disk_size(int)` 与
+ *   `driver/fs/fatfs/diskio.cpp:181` 的 `u32 disk_size(byte)`。给前者加
+ *   C 链接就会与后者**在 C 里撞名**(C 没有重载)⇒ 直接**弄坏 x86 构建**。
+ *   ⇒ 所以由落地层给出那个 C++ 名,转发到这里;实现仍然只有一份。
+ */
+size_t arm_disk_size(int drive);
+
+/* ---- devfs ---- */
 
 /*
- * 上游的 devfs 是**真的 VFS**(driver/fs/vfs/dev.cpp:在 /dev 下建节点、
- * 挂 device_handle、支持 open/read/write)。这里只有一张"名字 → id"的
- * 节点表,够 `regist_device` 有真实语义(注册后能被名字找到)。
+ * 上游的 devfs 是**真的 VFS**(`driver/fs/vfs/dev.cpp`:`/dev` 下建节点、
+ * 挂 `device_handle`、支持 open/read/write)。
  *
- * ⚠ 这是**骨架,不是完成态**:`/dev` 下并没有节点,也没有文件操作。
- *   计划 §4.4 第 4 条明写"不允许把'只登记不建节点'当成完成态" ——
- *   真正的 devfs 随 M4A-1.2 的 VFS 一起来。
+ * ★ M4A-1.5:**移植侧那份"骨架"已经退场,M4A-1.1b 起共用的就是上游那一份**。
+ *   理由不是"顺手换掉",而是**链接期强制**的:骨架与上游 dev.cpp
+ *   **都定义** `devfs_register` / `devfs_delete`(C 链接,同名),而本项目
+ *   的内核链接带 `-Wl,-z,muldefs` ⇒ ld 会**静默挑一个**,谁生效取决于
+ *   命令行顺序。那种"看起来能跑"的重复定义正是要避免的。
  *
  * 语义照抄上游的两个可观察点:
  *   - `devfs_register` 会把 path **复制一份**存进 `device_ctl[id].path`
  *     (上游 `dev.cpp:322` 的 `strdup`),`delete_device` 负责 free;
  *   - path 传 NULL 表示"注册到 /dev 根下",此时 `.path` 为 NULL。
+ *
+ * ⚠ 上游的 `devfs_setup()`(挂 `/dev`)是 **C++ 链接**的
+ *   (`_Z11devfs_setupv`),所以调用它的入口在落地层:
+ *   `arm_devfs_setup()`(见 `src/upstream_api.cpp`)。
  */
 errno_t devfs_register(const char *path, size_t id);
 errno_t devfs_delete(const char *path);
 
 /*
- * 按名字找设备 id(骨架特有,上游没有 —— 上游靠 `vfs_open("/dev/xxx")`)。
- * 找不到返回 -1。
+ * 挂 `/dev`(落地层转发到上游 `devfs_setup()`)。
  *
- * 它的存在是为了让"注册→取回"这条往返有一个**独立于设备表**的观测点:
- * 只查 `get_device(id)` 的话,即使 devfs 什么都没做也会通过。
+ * ⚠ 必须在 VFS 起搏**之后**调(`vfs_init()` 建根目录、`vfs_mkdir("/dev")`
+ *   要能用),而设备管理器**可以**在它之前初始化 —— 那时 `regist_device`
+ *   里的 `devfs_register` 会因为打不开 `/dev` 而登记失败,但按上游语义
+ *   **仍然返回 id**(设备表本身是好的)。这一条恰好就是新 A/B 的一侧。
  */
-int devfs_lookup(const char *name);
-
-/* 当前已注册的 devfs 节点数(自检用) */
-size_t devfs_node_count(void);
-
-/* 清空节点表(重复自检用;上游没有对应物) */
-void devfs_reset(void);
-
-/*
- * ★ 破坏性 A/B 开关(仅自检用):置 1 时 `devfs_register` **只登记不建节点**。
- *
- * 这正是计划 §4.4 第 4 条点名的 **B5-b 退化形态**。它的用处是证明
- * "注册→取回"那条往返**确实**依赖 devfs:关掉之后 `get_device` 照样成功、
- * 而 `devfs_lookup` 必须找不到 —— 少了任何一侧,判据就没有区分能力。
- *
- * 与本项目其它几组 A/B 同样的性质:**预期它坏**。
- */
-void devfs_ab_set_disabled(u32 on);
+void arm_devfs_setup(void);
 
 #ifdef __cplusplus
 } /* extern "C" */

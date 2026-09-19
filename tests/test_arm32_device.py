@@ -13,7 +13,7 @@
     是子集 —— 块层那几个函数本阶段刻意不声明)。
 
 二、**往返语义**(宿主编译运行)
-    被测代码是 src/device.c + src/devfs.c + src/id_alloc.c。它们不含 MMIO/CP15,
+    被测代码是 src/device.c + src/id_alloc.c。它们不含 MMIO/CP15,
     所以宿主能直接编。跑的是"M4A-1.1b 的判据":注册 → 按 id 取回 →
     按**名字**取回 → 注销 → 两个方向都消失。
 
@@ -24,7 +24,7 @@
 
 参考:
   arch/arm32/include/arch/device.h(适配记录:与上游的每处差异及理由)
-  arch/arm32/src/devfs.c(devfs_delete 参数语义的考证)
+  ★ M4A-1.5 起**真 devfs 是上游 driver/fs/vfs/dev.cpp**(骨架已退场)⇒ 这里只给一个\n  语义桩(见 harness 里的说明);/dev 下节点的证据在**板上**(device_devfs_ab)
   driver/device.cpp、driver/fs/vfs/dev.cpp(上游对应物)
 """
 
@@ -236,10 +236,9 @@ class DeviceShapeContractTests(unittest.TestCase):
 
         missing = []
         for proto in sorted(ours):
-            # devfs_lookup / devfs_node_count / devfs_reset / devfs_ab_set_disabled
+            # 移植侧专有的入口(上游没有对应物):内核侧 A/B 与落地层转发
             # 是骨架特有的(上游靠 vfs_open 做这件事),不在比对范围内
-            if proto.startswith(("int devfs_lookup", "size_t devfs_node_count",
-                                 "void devfs_reset", "void devfs_ab_set_disabled")):
+            if proto.startswith(("size_t arm_disk_size", "void arm_devfs_setup")):
                 continue
             if proto not in theirs:
                 missing.append(proto)
@@ -302,6 +301,31 @@ static heap_t h_heap;
         }                                                                                          \
     } while (0)
 
+/* ------------------------------------------------------------------ */
+/* devfs 桩(M4A-1.5 起真 devfs 是上游 driver/fs/vfs/dev.cpp,宿主编不了) */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 语义照上游 `dev.cpp:341-347`:
+ *     device->path = path != NULL ? strdup(path) : NULL;
+ *     if (devfs_root == NULL) { return EOK; }     // 没挂载 ⇒ 不建节点
+ * 宿主上永远"没挂载",所以只要做 strdup 那一步。
+ * ⚠ 上游**不**先释放旧 path(重复注册会泄漏);骨架当年会释放。
+ *   这一条不影响 device.c 的判据,但记在这里免得被误读成"我们照抄了"。
+ */
+errno_t devfs_register(const char *path, size_t id)
+{
+    device_ctl[id].path = path != NULL ? strdup(path) : NULL;
+    return EOK;
+}
+
+/* 上游会 `vfs_open("/dev/<name>")` 再 unlink;宿主没有 VFS ⇒ no-op */
+errno_t devfs_delete(const char *path)
+{
+    (void)path;
+    return EOK;
+}
+
 static void make_dev(device_t *dev, const char *name, device_flag_t type, size_t size)
 {
     memset(dev, 0, sizeof(*dev));
@@ -327,7 +351,6 @@ int main(void)
 
     /* ---- 1. 建表 ---- */
     CHECK(device_manager_init() == 0);
-    CHECK(devfs_node_count() == 0u);
 
     /* 空槽位与越界都要取不到。★ 越界检查是移植侧加的(上游会读越界内存) */
     CHECK(get_device(5u) == NULL);
@@ -354,8 +377,6 @@ int main(void)
     CHECK(have_vdisk(id0) == true);
     CHECK(disk_size(id0) == 4096u);
     CHECK(device_ctl[id0].path == NULL);       /* path 传 NULL ⇒ .path 就是 NULL */
-    CHECK(devfs_lookup("d0") == id0);          /* ★ 独立观测点 */
-    CHECK(devfs_node_count() == 1u);
 
     /* ---- 3. 注册(带路径):路径必须是**副本** ---- */
     /*
@@ -373,8 +394,6 @@ int main(void)
         CHECK(device_ctl[id1].path != path_lit);            /* 不是同一个指针 ⇒ 是副本 */
         CHECK(strcmp(device_ctl[id1].path, path_lit) == 0); /* 但内容相同 */
     }
-    CHECK(devfs_lookup("d1") == id1);
-    CHECK(devfs_node_count() == 2u);
 
     /* ---- 4. 空名字:注册仍返回 id(上游语义),但 devfs 登记失败并记一行 ---- */
     make_dev(&dev, "", DEVICE_STREAM, 8u);
@@ -384,45 +403,45 @@ int main(void)
         CHECK(id3 >= 0);                       /* ⚠ 失败仍返回 id —— 与上游一致 */
         CHECK(log_lines == before + 1);        /* 但要**报出来**,不能静默 */
         CHECK(get_device((size_t)id3) != NULL);
-        CHECK(devfs_node_count() == 2u);       /* 没建节点 */
     }
 
     /* ---- 5. 注销:两个方向都消失,别的设备不受影响 ---- */
     delete_device(id1);
-    CHECK(devfs_lookup("d1") == -1);           /* devfs 节点没了 */
     if (id1 >= 0) {
         CHECK(device_ctl[id1].path == NULL);   /* 路径副本被释放并清空 */
     }
-    CHECK(devfs_node_count() == 1u);
-    CHECK(devfs_lookup("d0") == id0);          /* d0 不受影响 */
     CHECK(get_device((size_t)id0) != NULL);
 
     /*
-     * ⚠ 这里**故意断言"注销后按 id 仍能取到"** —— 那是上游的行为:
-     *   delete_device 改的是**局部拷贝**(device.cpp:193 `device_t dev = device_ctl[vdiskid];`),
-     *   设备表那条的 flag 没被清。我们的实现照抄了这一点。
-     *   把它写进判据,是为了让"如果哪天改成清 flag"变成一个**有意识的决定**,
-     *   而不是悄悄变了没人知道。
+     * ★★ 槽位必须真的清掉 —— M4A-1.5 的**有意识决定**(旧注释等的就是这一刻)★★
+     *
+     * 上游 `delete_device()`(`driver/device.cpp:183-211`)结尾写的是
+     *     device_t dev = device_ctl[vdiskid];               // 局部**拷贝**
+     *     dev.path = NULL; dev.flag = 0; dev.vdiskid = 0;   // 改的是拷贝
+     * ⇒ 意图清清楚楚(槽位标空闲 + 清三个字段),但那三句**一点没落到表上**。
+     * 后果是"幽灵设备":删掉之后 `get_device(id)` 仍非 NULL(且 path 已释放)、
+     * `have_vdisk(id)` 仍为真。上游没发作,只因为四个调用方删完就不再用。
+     *
+     * ⇒ 按**写出来的意图**修(与 D16 那条同型),判据就是下面这一行。
+     *   (旧版本这里断言的是 `!= NULL`,即照字面抄;那段注释写明"哪天改成
+     *    清 flag,要是一个有意识的决定" —— 现在就是。)
      */
     delete_device(id0);
-    CHECK(get_device((size_t)id0) != NULL);    /* ← 上游语义,见上 */
-    CHECK(devfs_lookup("d0") == -1);
-    CHECK(devfs_node_count() == 0u);
+    CHECK(get_device((size_t)id0) == NULL);    /* ← 槽位真的空了 */
+    CHECK(have_vdisk(id0) == false);           /* 连带:不再是"有盘" */
+    CHECK(device_ctl[id0].path == NULL);       /* 路径副本也清了 */
+    CHECK(device_ctl[id0].flag == 0);
 
     /* 越界注销必须是 no-op,不能写坏内存 */
     delete_device(-1);
     delete_device((int)DEVICE_TABLE_SIZE + 7);
-    CHECK(devfs_node_count() == 0u);
+    CHECK(get_device(0u) == NULL);             /* 越界注销不能碰别人的槽位 */
 
     /* ---- 6. ★ 破坏性对照:关掉 devfs 之后,只有 get_device 还成立 ---- */
     make_dev(&dev, "ab0", DEVICE_STREAM, 16u);
-    devfs_ab_set_disabled(1u);
     id2 = regist_device(NULL, dev);
-    devfs_ab_set_disabled(0u);
     CHECK(id2 >= 0);
     CHECK(get_device((size_t)id2) != NULL);    /* 表里有 */
-    CHECK(devfs_lookup("ab0") == -1);          /* devfs 里没有 —— 这就是 B5-b 的假兼容 */
-    CHECK(devfs_node_count() == 0u);
     delete_device(id2);
 
     /* ---- 7. 同名重复注册:覆盖 id,节点数不涨(上游会建出两个同名孩子) ---- */
@@ -432,8 +451,6 @@ int main(void)
     {
         int second = regist_device(NULL, dev);
         CHECK(second >= 0);
-        CHECK(devfs_node_count() == 1u);
-        CHECK(devfs_lookup("dup") == second);
     }
 
     /* ---- 8. id 分配器的边界(设备表满时会用到这条路径) ---- */
@@ -515,7 +532,6 @@ class DeviceRoundTripTests(unittest.TestCase):
                 *defines,
                 str(harness),
                 str(ROOT / "arch/arm32/src/device.c"),
-                str(ROOT / "arch/arm32/src/devfs.c"),
                 str(ROOT / "arch/arm32/src/kmalloc.c"),
                 str(ROOT / "arch/arm32/src/heap.c"),
                 str(ROOT / "arch/arm32/src/krlibc.c"),

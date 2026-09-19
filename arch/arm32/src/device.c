@@ -119,6 +119,32 @@ void delete_device(int vdiskid)
         device_ctl[vdiskid].path = NULL;
     }
 
+    /*
+     * ★★ 槽位必须**真的**清掉 —— 这一条是 M4A-1.5 上板时被自检抓出来的 ★★
+     *
+     * 上游 `delete_device()`(`driver/device.cpp:183-211`)结尾写的是:
+     *
+     *     device_t dev = device_ctl[vdiskid];   // ← 局部**拷贝**
+     *     dev.path = NULL; dev.flag = 0; dev.vdiskid = 0;   // ← 改的是拷贝
+     *
+     * 也就是说:**上游的意图清清楚楚**(把槽位标成空闲、清掉 path/vdiskid),
+     * 但那三句写在了拷贝上,设备表那一条**一点没变**。
+     *
+     * 后果是"幽灵设备":`delete_device(id)` 之后
+     *   - `get_device(id)` 仍然返回**非 NULL**(flag 还是 1)——
+     *     里面 `path` 指向已释放内存;
+     *   - `have_vdisk(id)` 仍然为真,`disk_size(id)` 照旧给数;
+     *   ⇒ 任何"删掉之后还会被查到"的路径(分区扫描、块层)都会拿到一个
+     *     已经失效的句柄。上游自己没发作,是因为四个调用方删完就不再用。
+     *
+     * ⇒ 按**上游写出来的意图**修(与本文件其它几处"照意图不照字面"一致,
+     *   也与 D16 那条同型):把这三个字段真的清在设备表上。
+     *   判据在板上:设备自检里 `delete_device(id_a)` 之后
+     *   `get_device(id_a)` **必须**是 NULL(`device_roundtrip`)。
+     */
+    device_ctl[vdiskid].flag    = 0;
+    device_ctl[vdiskid].vdiskid = 0;
+
     if (g_dev_allocator != NULL) {
         (void)id_free(g_dev_allocator, (uint32_t)vdiskid);
     }
@@ -160,4 +186,20 @@ size_t disk_size(int drive)
     }
 
     return device_ctl[drive].size;
+}
+
+/*
+ * ★ 落地层入口:只换名字、不换语义(M4A-1.5)★
+ *
+ * 上游 `driver/fs/vfs/dev.cpp` 是 C++ 翻译单元,它要的是**修饰名**
+ * `_Z9disk_sizei`;而这份实现是 C(未修饰的 `disk_size`)—— 两者不是同一个
+ * 符号(与 `sprintf` 那次同型,坑表 55)。
+ * 为什么不让上游声明变 `extern "C"`:上游 x86 侧同时有 `size_t disk_size(int)`
+ * (`driver/device.cpp:216`)与 `u32 disk_size(byte)`(`diskio.cpp:181`),
+ * 给前者加 C 链接会在 C 里撞名(C 没有重载)、直接弄坏 x86 构建。
+ * ⇒ 由落地层给出 C++ 名并转发到这里;实现仍然只有一份。
+ */
+size_t arm_disk_size(int drive)
+{
+    return disk_size(drive);
 }
