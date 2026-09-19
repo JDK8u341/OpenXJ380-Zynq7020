@@ -2127,6 +2127,21 @@ switched=30 preempted=27 invalid=0
 | ~~★ D15 ★~~ | ~~★ **新线程的 vruntime 漏了 `- WAKEUP_CREDIT`** ★~~ | `src/sched.c` 的 `sched_entity_init()` | — | **已结案(M4-10.1,`ccb7156`)**。源 OS 是 `base > CREDIT ? base - CREDIT : 0`(`scheduler.cpp:294`),M4-8 写成了 `= base`(把参数当成了"当前时刻")⇒ 新线程比源 OS 晚 4ms 才被优先考虑。<br>★ **宿主单测当时是"跟着实现一起写错的"**:它断言 `vruntime == base`,所以一路全绿。改正时把判据**对着源 OS 逐值重写**(含 `base<credit`、`base==credit` 两个边界) |
 | D16 | ★ **偏离(不是退化)：idle 的 `task_level` 我们显式设成 `TASK_IDLE_LEVEL`，源 OS 的 BSP idle 实际是 0** ★ | `src/sched_kern.c` 的 `sched_register_boot_idle` / `sched_register_ap_idle` | 源 OS 里 AP idle 显式设 `TASK_IDLE_LEVEL(1)`（`smp.cpp:154`），而 **BSP idle 从不赋 `task_level`**（`main.cpp:520-541`，memset 后保持 **0 = `TASK_KERNEL_LEVEL`**）| **不打算"照抄"这个 0**（已按意图实现）。理由：level 0 会让 BSP idle 变成**可调度候选**（`is_task_schedulable` 只排除 level 1），而它 `context0.rip == 0` ⇒ 被选中时 `timer_handle` **放弃这次切换**（白做一次派发）、并且被 EEVDF 计费。这显然是**漏赋值**而不是设计 ⇒ 我们两个 idle 都设 1，与源 OS 的**意图**（idle 不可停、不作候选）一致。★ 细节与向作者确认的问题见 `docs/PTASK.md` §2.4/§4.2 |
 | ~~D3~~ | ~~内核用硬浮点编译~~ | — | — | **已结案：不是退化，是照源 OS 的设计。** 见下方「FP 上下文」一节 |
+| D18 | ★ **内核只有一个静态进程上下文：所有内核线程共享它** ★ | `src/upstream_api.cpp` 的 `g_kernel_pcb` + `kernel_group` | 上游把内核线程挂在 `kernel_group` 上（`kernel/task/pcb.cpp:2726` 的 `kernel_group = kernel_pcb`）——**模型是一样的**，只是我们只有一个。ARM 侧今天没有"创建进程"这件事（`pcb_t` 由 C++ 落地层补），而 VFS 要读的只有 `cwd` / `file_open`（fd 表）/ `pid` / `tty` | **M7（用户态）**。那时每个用户进程一份 `pcb_t`，`file_open` 必须**每进程独立**，否则两个进程会共用同一张 fd 表 |
+| D19 | **`get_random_bytes()` 不是密码学安全的** | `src/upstream_api.cpp`（xorshift32，种子取 333MHz 全局定时器低 32 位） | 上游是 `kernel/rng.cpp` 的 RDRAND/RDSEED（x86 指令，ARM 没有）。本阶段唯一用途是给 `/dev/urandom` 填字节（`vfs.cpp:1553`） | 需要真随机时（TLS/密钥，M6 之后）。★ 它**不是返回常量** —— 每次调用都掺定时器，所以"两个请求拿到同一串"这种退化形态不会出现 |
+| D20 | ★ **偏离（不是退化）：未知格式符原样吐出，源 OS 是直接结束** ★ | `src/console.c` 的 `format_core` default 分支 | 源 OS 的 `wfmt_arg` 遇到不认识的转换符 `return 0`（`serial_port.cpp:382-384`）—— **后面全都不打了**。移植侧选择"原样吐出来"（`%q` 打 `%q`），因为格式串写错时"看得见"比"静默截断"好查 | 不打算改。判据钉在 `tests/test_arm32_console.py`（`unknown verb`）。★ 代价是"打错了会多打几个字符"，不是"打错值" |
+| D21 | **`+` 与空格标志被接受但不生效** | 同上（标志解析循环里显式吃掉） | 源 OS 认这两个标志（`serial_port.cpp:265-266`），但移植侧至今没有一处需要"强制正号"。**必须吃掉**的理由不是美观：不吃掉就会被当成未知格式符 ⇒ **实参不取走** ⇒ 后面全部错位 | 需要时再实现（一处 `out_number` 加一个 bool）。判据已有：`%+d|%d` 必须打出 `5|42`（钉住"吃掉了且没错位"） |
+| D22 | ★ **落地层有四个"响亮拒绝"式实现**（不是空壳）★ | `src/upstream_api.cpp` | 上游要符号，而 ARM 对应物**不存在**：`get_current_directory()`→`NULL`（内核线程没有"当前目录"这个概念，源 OS 里它读 `get_current_task()->cwd`，而我们的 tcb 与上游 tcb_t 不是同一个类型）；`page_map_range_to_random()` 与 `scheduler_wake_task()`→**打印一行 + 计数**（`arm_page_map_unsupported_count()`），因为它们要么依赖用户地址空间（M7）、要么参数类型是上游 `tcb_t`；`get_keyboard_input()`→`0`（PS/2 键盘在 ARM 上不存在；★ `0` 在这里是**正确**答案不是占位 —— `vfs.cpp:1368` 拿它当"有没有按键"，而"没有按键"就是 0） | 逐个随阶段消掉：`get_current_directory` 待 D18 的每进程 `cwd`（M7）；`page_map_range_to_random` 待用户地址空间（M7）；`scheduler_wake_task` 待两边 `tcb_t` 统一（M7）；键盘待某个真输入源接进 tty（M4A-1.5 或之后）。⚠ **"响亮拒绝"是有意的选择**：静默返回成功会让调用点拿到假结果，而那种 bug 会跑到很远才发作 |
+
+#### ★ 与源 OS **一致**、别当成缺功能的几处（M4A-1.2b 核对过）★
+
+| 项 | 源 OS | 移植侧 | 备注 |
+|---|---|---|---|
+| `%f` 浮点 | **不支持**（`wfmt_arg` 的转换符表里没有 `f`） | 不支持 | ⇒ 这不是退化。写 `%f` 时源 OS 直接停、我们原样吐出（D20） |
+| `%n` | **空操作**：只把指针取走、不写回（`serial_port.cpp:380`） | 同样空操作 | ⚠ **绝不能**实现成 glibc 的"写回已输出字符数" |
+| `%p` | `0x` + 按**指针宽度**零填充（`serial_port.cpp:367-373`：`special`+`zeropad`+`size=16`，那个 16 是 x86_64 的宽度） | `0x` + **8** 位（32 位 ARM 的指针宽度） | 形状一致、位数随架构。判据：`0x1234` ⇒ `0x00001234` |
+| `write_serial_fmt` 返回值 | 恒 `0`（不返回字符数） | 恒 `0` | 上游大量调用点当过程用、不看返回值 |
+| `sprintf` 返回值 | `vwprintf` 的字符数（不含结尾 NUL） | 同 | 缓冲区汇**不做**换行转换（与上游 `UnsafeBufWriter` 一致）—— 上游拿它拼路径，塞进 CR 就是 bug |
 
 
 #### FP 上下文：已按源 OS 对齐（D3 结案）
