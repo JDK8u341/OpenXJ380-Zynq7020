@@ -250,6 +250,10 @@ void arm_kernel_process_set_cwd(vfs_node_t root)
  *
  * 编一个假的 `page_directory_t` 只会把失败推到一个更远、更难查的地方。
  * 今天唯一的调用点是 `general_map()`,它在 ARM 上本来就不该被走到。
+ *
+ * 解开条件:移植侧页层改用**上游同名服务**(`page_directory_t` +
+ *   `page_map_range`/`translate_address`),即宪章 P2「上游原文编译化」。
+ *   在那之前本函数恒返回 NULL —— 这是**登记的退化**,不是实现。
  */
 page_directory_t *get_current_directory(void)
 {
@@ -343,6 +347,9 @@ char *pathacat(char *p1, char *p2)
  *   调用点 `vfs.cpp:1368` 拿它当"有没有按键"用,0 表示没有。
  *   真要在 ARM 上支持控制台输入,那是把 shell 的字符源接进 tty ——
  *   属 M4A-1.5(`dev`/`pty`)或之后。
+ *
+ * 解开条件:PS UART 的 RX 接进 tty/stdin(或用户态 shell 起来后走
+ *   `/dev/stdio`)。在那之前恒返回 0 = "没有按键",这是**登记的缺失**。
  */
 uint8_t get_keyboard_input(void)
 {
@@ -789,6 +796,11 @@ uint64_t realtime_ns()
  * ★ 而"不可达"这件事是**可判的**,不是嘴上说的:
  *   两个函数各自计数,计数必须**恒为 0** —— 板上自检读它
  *   (`arm_fatfs_x86_path_calls`)。这就是"预读确实没跑"的证据。
+ *
+ * 解开条件:三者一起解 —— 上游 FATFS 不再用 AHCI/QEMU 判断来开关预读,
+ *   或移植侧自己实现预读(届时 `alloc_frames`/`phys_to_virt` 要有真实现,
+ *   即宪章 P2 的「补齐上游同名页层服务」)。在那之前这三个都是**登记的退化**,
+ *   计数恒 0 就是它们没被走到的证据。
  */
 static unsigned int g_fatfs_x86_path_calls;
 
