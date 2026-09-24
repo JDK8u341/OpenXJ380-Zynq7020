@@ -38,8 +38,14 @@
 
 | 度量 | 含义 | 当前基线 |
 |---|---|---|
-| **M1（主指标）** | 上游原文在 ARM 上运行的代码行 / 上游适用代码行 | **3,343 / 30,942 = 10.8%** |
-| **M2（反指标）** | 移植侧自有代码行 / 内核内发明物行数 | **12,625 / ≈1,799+** |
+| **M1（主指标）** | 上游原文在 ARM 上运行的代码行 / 上游适用代码行 | **3,343 / 32,454 = 10.3%** |
+| **M2（反指标）** | 移植侧自有代码行 / 内核内发明物行数 | **12,625 / 1,711** |
+
+> 口径（两个数字都由 `tmp-test/port_metrics.py` 复现，不靠人手数）：
+> 目录取 `kernel/ driver/ lib/ include/ boot/ user/` 的 `.c/.cpp`，代码行 = 非空非注释；
+> M1 分母再减去 vendored FatFs（`driver/fs/fatfs/*`，5 个文件）。
+> M2 的"内核内发明物"= §八 点名的 25 个文件 + `kmain.c` 的自检段；
+> `kmain.c` 其余启动/主循环约 1,800 行**未计入**，所以 M2 是**低估**。
 
 > M1 上升、M2 不涨，才叫移植在推进。M1 不涨而 M2 猛涨，就是漂移。
 
@@ -113,9 +119,9 @@ python3 tmp-test/port_metrics.py                  # M1/M2 与不变式体检（P
 | 改动行去向 | `arch/arm32` 33,471（59.9%）· `tests`+`tmp-test` 14,760（26.4%）· `docs` 5,505 · `tools` 1,048 · 根文件 767 · **上游 330（0.6%）** |
 | 移植侧体量 | 84 文件 / 29,826 行 / 注释 45.5% / **代码 12,625 行** |
 | 上游在跑 | 12 文件 / 28,524 代码行（其中 vendored FatFs 25,181 = **100%**） |
-| **M1** | 源 OS 自有代码 **3,343 / 30,942 = 10.8%** |
+| **M1** | 源 OS 自有代码 **3,343 / 32,454 = 10.3%**（在跑的上游文件 12 / 97） |
 | **M2** | 移植侧自有代码 12,625（≈3.8 × 跑起来的源 OS 代码） |
-| 内核内发明 | 描述层 477 + shell 190 + 故障注入 150 + 验收程序 303 + `selftest.c` 28 + 自检段 651（148 判据）+ 心跳区 |
+| 内核内发明 | **1,711 行**（工具口径：§八 点名 25 文件 + `kmain.c` 自检段 216 行）；其中描述层框架 477 · shell 305 · 故障注入 172 · 验收程序 303 · `selftest` 73 · 自检段 216 |
 
 ### 5.2 漂移趋势（arch/arm32 代码新增行分类）
 
@@ -142,7 +148,7 @@ python3 tmp-test/port_metrics.py                  # M1/M2 与不变式体检（P
 | 阶段 | 内容 | 判据（板上 + 宿主） | 度量预期 |
 |---|---|---|---|
 | **P0 立宪与度量** | 提交本文；落地 `tmp-test/port_metrics.py`（M1/M2 + I1–I5 体检，一条命令出报告）；把现有实现逐项登记进 §四 表 | 工具能复现 §五 的每个数字；跑一次即出"违例清单" | 不改内核 |
-| **P1 去发明** | ①描述层框架删掉 → 改成"生成常量头 + 上游风格 `xxx_setup()` 序列"；②内核态 shell 删掉（等 P4 的上游用户态 shell）；③148 判据搬出内核 → 内核只用 `write_serial_*` 打印事实，**判定由主机脚本做**；④`fault_test` 移到 JTAG 工具侧；⑤心跳区逐槽改成串口日志 | 板子照常启动；串口日志含全部关键事实；主机脚本复现原有**全部**判据；`M2` 下降 ≥1,700 行 | M2 ↓，I2/I4 ✅ |
+| **P1 去发明** | ①描述层框架删掉 → 改成"生成常量头 + 上游风格 `xxx_setup()` 序列"；②内核态 shell 删掉（等 P4 的上游用户态 shell）；③148 判据搬出内核 → 内核只用 `write_serial_*` 打印事实，**判定由主机脚本做**；④`fault_test` 移到 JTAG 工具侧；⑤心跳区逐槽改成串口日志 | 板子照常启动；串口日志含全部关键事实；主机脚本复现原有**全部**判据；`port_metrics.py` 的 **I2 归零**（1,711 行） | I2/I4 归零 |
 | **P2 上游原文编译化** | 补齐**同名**平台服务（`alloc_frames/free_frames/page_map_range/unmap_page_range/phys_to_virt/driver_phys_to_virt/driver_virt_to_phys/get_current_directory/page_virt_to_phys/translate_address/lazy_tryalloc`），把实测可编的 5 个上游文件编进镜像（`netdev.cpp` −3 符号、`task/mutex.cpp` −6、`rtc.cpp` −8、`driver/device.cpp` −28、`fs/partition.cpp` −34）；**删掉 `device.c`** | 上游文件在 `ARM32_UPSTREAM_CXX` 且**零修改**；`device.c` 不存在；块层行为与今天逐项相同（宿主单测 + 板上 A/B） | **M1 ↑ 至 ~14%**，M2 ↓ |
 | **P3 进程与调度原文** | 原样编译 `kernel/task/pcb.cpp` + `scheduler.cpp`（先处置 §七 第 2 条的 9 处内联汇编，逐处登记）；移植侧 `sched*.c`/`kstack*.c` 退场 | 调度器行为与今天逐项相同（八组破坏性 A/B 全过）；`pcb.cpp`/`scheduler.cpp` 出现在构建图 | M1 ↑ 显著 |
 | **P4 用户态与 XAPI 原文** | 原样编译 `kernel/syscall/*`、`user/xapi/*`、`dlinker.cpp`；跑起源 OS 的 `user/cli_shell.cpp` | **源 OS 自己的用户程序在板上跑起来并交互** —— 这是"移植完成"的硬判据 | M1 ↑↑ |
@@ -198,12 +204,14 @@ CMOS RTC / UEFI / MSR / GS base / 端口 I/O —— **板上全都不存在**，
 
 | 撤销对象 | 行数 | 处置 | 替代（源 OS 对应角色） |
 |---|---|---|---|
-| `plat_device.[ch]` `board.[ch]` `board_devices.[ch]` `axi_gpio.[ch]` `led.[ch]`（描述层 + probe 框架 + PL 覆盖表） | ~477 | **删** | 生成常量头 + 上游风格 `xxx_setup()` 序列（对应 `main.cpp:466-508`） |
-| 内核态 `shell.c` | 190 | **删** | 源 OS 的 shell 是用户态 `user/cli_shell.cpp`（P4） |
-| 内核自检框架 + 148 判据 + `selftest.c` | ~679 | **搬出内核** | 内核用 `write_serial_*` 打印事实；判定在主机脚本 |
-| `fault_test.c` | 150 | **移到 JTAG 工具侧** | 源 OS 无故障注入 |
+| `plat_device.[ch]` `board.[ch]` `board_devices.[ch]` `axi_gpio.[ch]` `led.[ch]`（描述层 + probe 框架 + PL 覆盖表） | 555 | **删** | 生成常量头 + 上游风格 `xxx_setup()` 序列（对应 `main.cpp:466-508`） |
+| 内核态 `shell.[ch]` | 305 | **删** | 源 OS 的 shell 是用户态 `user/cli_shell.cpp`（P4） |
+| `*_check.[ch]`（vfs/fatfs/pipe/pty 验收程序） | 390 | **并入主机侧断言** | 宿主单测 + 串口日志 |
+| `fault_test.[ch]` | 172 | **移到 JTAG 工具侧** | 源 OS 无故障注入 |
+| `selftest.[ch]` | 73 | **搬出内核** | 内核用 `write_serial_*` 打印事实；判定在主机脚本 |
+| `kmain.c` 自检段（148 个 `selftest_report()`） | 216 | **搬出内核** | 同上 |
+| **I2 合计** | **1,711** | | |
 | OCM 心跳区 | — | **逐槽改为串口日志**（保留 JTAG 只读用途作为辅助） | 源 OS 的观测通道就是串口 |
-| `*_check.c`（vfs/fatfs/pipe/pty 验收程序） | 303 | **合并进主机侧断言** | 宿主单测 + 串口日志 |
 | `device.c` + 落地层的块层 | 236 | **删，换上游 `driver/device.cpp` 原文** | 上游 `driver/device.cpp` |
 | `sched*.c` `kstack*.c` | ~1,660 | **最终退场**，换上游 `pcb.cpp`/`scheduler.cpp` | 上游 `kernel/task/*.cpp` |
 | `vmap_*`/`palloc_*` API | — | **改名/改造成上游同名服务** | `page_map_range`/`alloc_frames`/`phys_to_virt` |

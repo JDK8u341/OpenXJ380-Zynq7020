@@ -174,6 +174,14 @@ powershell -ExecutionPolicy Bypass -File tmp-test/notify_user.ps1 `
 
 python -m pytest tests/ -q
 
+# ★ 移植度量与不变式体检(宪章 docs/ZYNQ7020_PORT_CHARTER.md 的 I1–I5 / M1–M2)
+#   只读、不碰硬件 —— 每完成一步都跑一次,用来发现"慢性漂移"。
+#   报告里的"待处理违例项"就是当前该干的事。
+python tmp-test/port_metrics.py --verbose
+
+# 上游文件"离能原样编译还有多远"(用 -c,不用 -fsyntax-only)
+python tmp-test/measure_arm_cxx.py driver/device.cpp driver/fs/partition.cpp
+
 # 上板:全部自检 + 退出码即判定
 #   ★ --seconds 必须给够:默认 8 秒会截断在半行,报"找不到 SELF-TEST BEGIN",
 #     看着像内核坏了,其实只是抓取窗口太短(完整报告要 50 秒以上)★
